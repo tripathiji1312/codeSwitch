@@ -1,0 +1,44 @@
+# Virtual environments
+.venv/
+.venv
+venv/
+env/
+ENV/
+
+# Local experiment symlinks
+Movio-2
+
+# Prior experiment sub-repositories (tracked in movio-tts and movio_new)
+movio/
+movio-2/
+
+# Python byte-code & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Audio outputs (keep folder structure via .gitkeep)
+output_audio/*.wav
+output_audio/*.mp3
+output_audio/*.flac
+*.wav
+*.mp3
+*.flac
+
+# Model weights & downloaded checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+checkpoints/
+
+# IDE & OS temporary files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+*.log
