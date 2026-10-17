@@ -389,3 +389,151 @@ def test_module_arg_parsers_exist():
     assert train_args.num_sentences == 300
     assert train_args.target_source == "auto"
     assert train_args.dry_run is False
+
+
+# ===========================================================================
+# Audio-encoder decode robustness
+#
+# Regression cover for two Kaggle failures on indic-parler-tts:
+#   * the teacher's audio encoder is ``transformers.models.dac.modeling_dac
+#     .DacModel``, whose ``decode`` takes 3-D ``(batch, K, T)`` codes; the old
+#     code only tried the parler-wrapper 4-D layout, so every decode returned
+#     ``None`` (capture validation "MISMATCH" + fallback everywhere);
+#   * ``DacModel.encode`` runs in fp16 while the teacher waveform is float32,
+#     raising "Input type (float) and bias type (c10::Half) should be the same".
+# ===========================================================================
+class _FakeDecodeOut:
+    def __init__(self, audio_values):
+        self.audio_values = audio_values
+
+
+class _TransformersStyleDecoder:
+    """3-D ``(batch, K, T)`` codes, ``audio_scales`` keyword rejected."""
+
+    def __init__(self):
+        self.shapes: list[tuple] = []
+
+    def decode(self, audio_codes, audio_scales=None):
+        import torch
+
+        if audio_scales is not None:
+            raise TypeError("unexpected keyword argument 'audio_scales'")
+        if audio_codes.dim() != 3:
+            raise ValueError(f"expected 3-D audio_codes, got {tuple(audio_codes.shape)}")
+        self.shapes.append(tuple(audio_codes.shape))
+        t = audio_codes.shape[2]
+        return _FakeDecodeOut(torch.full((1, 1, t * 4), 0.25))
+
+
+class _ParlerWrapperStyleDecoder:
+    """4-D ``(chunk, batch, K, T)`` codes, requires ``audio_scales``."""
+
+    def __init__(self):
+        self.shapes: list[tuple] = []
+
+    def decode(self, audio_codes, audio_scales):
+        import torch
+
+        if not audio_scales:
+            raise ValueError("audio_scales required")
+        if audio_codes.dim() != 4:
+            raise ValueError(f"expected 4-D audio_codes, got {tuple(audio_codes.shape)}")
+        self.shapes.append(tuple(audio_codes.shape))
+        t = audio_codes.shape[3]
+        return _FakeDecodeOut(torch.full((1, 1, t * 4), 0.5))
+
+
+def test_decode_codes_handles_transformers_dac_layout():
+    import torch
+
+    dec = _TransformersStyleDecoder()
+    wave = R._decode_codes(dec, torch.zeros(9, 12, dtype=torch.long))
+    assert wave is not None and wave.size == 12 * 4
+    assert dec.shapes == [(1, 9, 12)]
+
+
+def test_decode_codes_handles_parler_wrapper_layout():
+    import torch
+
+    dec = _ParlerWrapperStyleDecoder()
+    wave = R._decode_codes(dec, torch.zeros(9, 7, dtype=torch.long))
+    assert wave is not None and wave.size == 7 * 4
+    assert dec.shapes == [(1, 1, 9, 7)]
+
+
+def test_capture_validation_decode_returns_error_on_total_failure():
+    import torch
+
+    class _AlwaysFails:
+        def decode(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    import train_draft_distill as T
+
+    wave, err = T._decode_codes_for_validation(_AlwaysFails(), torch.zeros(9, 5, dtype=torch.long))
+    assert wave is None
+    assert "boom" in err  # error text surfaces in the teacher validation log
+
+
+def test_zero_lag_corr_detects_identical_and_uncorrelated_signals():
+    import train_draft_distill as T
+
+    rng = np.random.RandomState(0)
+    a = rng.randn(2048)
+    assert T._zero_lag_corr(a, a.copy()) == pytest.approx(1.0, abs=1e-9)
+    assert abs(T._zero_lag_corr(a, rng.randn(2048))) < 0.1
+    # constant input -> undefined correlation rather than a crash
+    assert T._zero_lag_corr(np.ones(64), a[:64]) is None
+
+
+def test_trim_valid_frames_keeps_interior_clean_columns():
+    """Mirrors generate(): columns with any EOS/pad token are dropped, not the
+    whole tail after the first bad column."""
+    import train_draft_distill as T
+
+    collector = T.TeacherCollector.__new__(T.TeacherCollector)
+    collector.max_frames = 100
+    codes = np.array([
+        [1, 2, 1024, 4, 5],
+        [1, 2, 3, 4, 5],
+    ], dtype=np.int64)
+    trimmed = collector._trim_valid_frames(codes, codebook_size=1024)
+    assert trimmed.tolist() == [[1, 2, 4, 5], [1, 2, 4, 5]]
+
+
+def test_codec_reencode_casts_waveform_to_encoder_dtype():
+    """Regression: fp16 teacher + float32 waveform raised
+    'Input type (float) and bias type (c10::Half) should be the same'."""
+    import torch
+
+    import train_draft_distill as T
+
+    class _EncodeOut:
+        audio_codes = torch.zeros(1, 9, 5, dtype=torch.long)
+
+    class _Encoder:
+        def __init__(self):
+            self.weight = torch.nn.Parameter(torch.zeros(2, dtype=torch.float16))
+            self.seen_shape: tuple | None = None
+
+        def parameters(self):
+            return iter([self.weight])
+
+        def encode(self, wave):
+            if wave.dtype != torch.float16:
+                raise RuntimeError(
+                    "Input type (float) and bias type (c10::Half) should be the same"
+                )
+            self.seen_shape = tuple(wave.shape)
+            return _EncodeOut()
+
+    enc = _Encoder()
+    collector = T.TeacherCollector.__new__(T.TeacherCollector)
+    collector.engine = type("Eng", (), {"device": torch.device("cpu")})()
+    collector.engine.ar_model = type("Ar", (), {"audio_encoder": enc})()
+    collector.verbose = True
+
+    codes = collector._codec_reencode(np.zeros(4096, dtype=np.float32))
+    assert codes is not None and codes.shape == (9, 5)
+    assert enc.seen_shape == (1, 1, 4096)
+

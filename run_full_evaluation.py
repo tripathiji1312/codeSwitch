@@ -471,21 +471,46 @@ class ChunkTelemetry:
     accept_synth: Optional[float]
 
 
+_DECODE_WARNED = False
+
+
 def _decode_codes(audio_encoder, codes: torch.Tensor) -> Optional[np.ndarray]:
-    """Decodes (9, T) DAC codes through the Parler DAC wrapper."""
-    try:
-        inp = codes[None, None].long().to(audio_encoder.device)
-        out = audio_encoder.decode(audio_codes=inp, audio_scales=[None])
-        audio = out.audio_values
-        return audio.detach().float().cpu().numpy().reshape(-1)
-    except Exception:
-        try:
-            inp = codes[None, None].long().to(audio_encoder.device)
-            out = audio_encoder.decode(inp)
-            audio = out.audio_values if hasattr(out, "audio_values") else out[0]
-            return audio.detach().float().cpu().numpy().reshape(-1)
-        except Exception:
-            return None
+    """Decodes ``(K, T)`` DAC codes through the Parler audio encoder.
+
+    Tries the 3-D ``(batch, K, T)`` layout used by ``generate`` plus the
+    optional ``audio_scales`` argument, then the 4-D ``(chunk, batch, K, T)``
+    parler-wrapper layout — the encoder class (transformers ``DacModel`` vs.
+    the parler-tts wrapper) differs across releases.  Returns ``None`` only
+    when every signature fails (callers then use the DAC fallback decoder).
+    """
+    global _DECODE_WARNED
+    last_err = "no decode signature succeeded"
+    flat = codes.detach().long()
+    device = getattr(audio_encoder, "device", None)
+    for shape_name, inp in (("3d", flat[None]), ("4d", flat[None, None])):
+        if device is not None:
+            inp = inp.to(device)
+        for use_scales in (True, False):
+            try:
+                kwargs: Dict[str, Any] = {"audio_codes": inp}
+                if use_scales:
+                    kwargs["audio_scales"] = [None]
+                with torch.inference_mode():
+                    out = audio_encoder.decode(**kwargs)
+                audio = out.audio_values if hasattr(out, "audio_values") else out[0]
+                return audio.detach().float().cpu().numpy().reshape(-1)
+            except Exception as exc:
+                last_err = (
+                    f"{shape_name}{'+scales' if use_scales else ''} -> "
+                    f"{type(exc).__name__}: {exc}"
+                )
+    if not _DECODE_WARNED:
+        _DECODE_WARNED = True
+        print(
+            f"[Decode] teacher DAC decode failed on all signatures ({last_err}); "
+            "falling back to the bundled DAC decoder"
+        )
+    return None
 
 
 class EvalSynthesizer:
@@ -1109,21 +1134,34 @@ def figure1_latency_quality(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Op
     x = np.arange(len(configs))
     width = 0.36
 
-    def _p50(cfg, key):
+    def _warm_p50(cfg, key):
+        warm = agg[cfg].get(key + "_warm") or {}
+        if warm.get("n"):
+            return warm.get("p50")
         return agg[cfg].get(key, {}).get("p50")
 
-    compute = [_p50(c, "ttfa_compute") for c in configs]
-    e2e = [_p50(c, "ttfa_e2e") for c in configs]
+    compute = [_warm_p50(c, "ttfa_compute") for c in configs]
+    e2e = [_warm_p50(c, "ttfa_e2e") for c in configs]
+    cold_c = [agg[c].get("ttfa_compute_cold") for c in configs]
+    cold_e = [agg[c].get("ttfa_e2e_cold") for c in configs]
     xs = x
     bars1 = axes[0].bar(xs - width / 2, [np.nan if v is None else v for v in compute], width,
-                        label="Component compute (p50)", color="#9467bd", alpha=0.9)
+                        label="Component compute (warm p50)", color="#9467bd", alpha=0.9)
     bars2 = axes[0].bar(xs + width / 2, [np.nan if v is None else v for v in e2e], width,
-                        label="End-to-end streamer (p50)", color="#1f77b4", alpha=0.9)
+                        label="End-to-end streamer (warm p50)", color="#1f77b4", alpha=0.9)
+    has_cold = False
+    for xv, val in list(zip(xs - width / 2, cold_c)) + list(zip(xs + width / 2, cold_e)):
+        if val is None:
+            continue
+        axes[0].scatter([xv], [val], marker="x", s=22, color="black", zorder=5)
+        has_cold = True
+    if has_cold:
+        axes[0].scatter([], [], marker="x", s=22, color="black", label="cold (first utterance)")
     axes[0].set_xticks(xs)
     axes[0].set_xticklabels([CONFIG_LABELS[c].split(" (")[0].replace("Pure ", "") for c in configs])
     axes[0].set_ylabel("TTFA (ms)")
     axes[0].set_title("(a) Time-to-first-audio")
-    valid = [v for v in compute + e2e if v is not None and v > 0]
+    valid = [v for v in compute + e2e + cold_c + cold_e if v is not None and v > 0]
     if valid:
         if max(valid) / max(min(valid), 1.0) > 15:
             axes[0].set_yscale("log")
@@ -1135,7 +1173,8 @@ def figure1_latency_quality(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Op
                 continue
             axes[0].annotate(f"{val:.0f}", (rect.get_x() + rect.get_width() / 2, val),
                              textcoords="offset points", xytext=(0, 3), ha="center", fontsize=8)
-    axes[0].legend(loc="upper right", frameon=False)
+    axes[0].legend(loc="upper center", bbox_to_anchor=(0.5, -0.20), ncol=3,
+                   frameon=False, fontsize=7.5, handletextpad=0.4, columnspacing=1.0)
 
     cer_means = [agg[c].get("cer", {}).get("mean") for c in configs]
     cer_stds = [agg[c].get("cer", {}).get("std") or 0.0 for c in configs]
@@ -1343,26 +1382,33 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         "hybrid on the 60-utterance Tanglish benchmark (Kaggle T4, fp16). "
         "TTFA-c: component compute latency; TTFA-e2e: wall-clock to first audio buffer.}",
         "\\label{tab:comparison}",
-        "\\begin{tabular}{lcccccccc}",
+        "\\begin{tabular}{lccccccccc}",
         "\\toprule",
-        "Architecture & TTFA-c p50 (ms) & TTFA-c p90 (ms) & TTFA-e2e p50 (ms) & Total (s) & RTF "
-        "& CER (\\%) & CB0 acc. true (\\%) & CB0 acc. synth (\\%) \\\\",
+        "Architecture & TTFA-c cold (ms) & TTFA-c warm p50 (ms) & TTFA-c warm p90 (ms) "
+        "& TTFA-e2e warm p50 (ms) & Total (s) & RTF & CER (\\%) "
+        "& CB0 acc. true (\\%) & CB0 acc. synth (\\%) \\\\",
         "\\midrule",
     ]
     for cfg in ("A", "B", "C"):
         a = agg.get(cfg) or {}
         if not a.get("n"):
             continue
-        ttfa_c = a.get("ttfa_compute") or {}
-        ttfa_e = a.get("ttfa_e2e") or {}
+
+        def _stat(key: str, stat: str, entry: Dict[str, Any] = a):
+            warm_entry = entry.get(key + "_warm") or {}
+            if warm_entry.get("n"):
+                return warm_entry.get(stat)
+            return (entry.get(key) or {}).get(stat)
+
         total = (a.get("total") or {}).get("mean")
         cer_stat = a.get("cer") or {}
         cer_pct = None if cer_stat.get("mean") is None else float(cer_stat["mean"]) * 100.0
         cells = [
             CONFIG_LABELS[cfg],
-            _tex(ttfa_c.get("p50"), 0),
-            _tex(ttfa_c.get("p90"), 0),
-            _tex(ttfa_e.get("p50"), 0),
+            _tex(a.get("ttfa_compute_cold"), 0),
+            _tex(_stat("ttfa_compute", "p50"), 0),
+            _tex(_stat("ttfa_compute", "p90"), 0),
+            _tex(_stat("ttfa_e2e", "p50"), 0),
             _tex(None if total is None else total / 1000.0, 2),
             _tex((a.get("rtf") or {}).get("mean"), 2),
             _tex(cer_pct, 1),
@@ -1374,9 +1420,12 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         "\\bottomrule",
         "\\end{tabular}",
         "\\vspace{2pt}",
-        "\\footnotesize{True = teacher-forced Parler target; synth = synthetic-target telemetry. "
-        "Config A has no draft/verification stage (acc. n/a); its TTFA-c is the time from decoder "
-        "start to the first decoded audio buffer. CER reference: normalised Tamil-script text.}",
+        "\\footnotesize{cold = first utterance per configuration (CUDA kernels, allocator and "
+        "description cache warming); warm = remaining utterances (cold-start overhead excluded, "
+        "per-utterance seeds and texts identical). True = teacher-forced Parler target; synth = "
+        "synthetic-target telemetry. Config A has no draft/verification stage (acc. n/a); its "
+        "TTFA-c is the time from decoder start to the first decoded audio buffer. CER reference: "
+        "normalised Tamil-script text.}",
         "\\end{table*}",
     ]
     return "\n".join(lines)

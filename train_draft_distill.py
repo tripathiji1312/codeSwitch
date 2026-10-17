@@ -282,21 +282,54 @@ class _CodeCaptureStreamer:
             return None
 
 
-def _decode_codes_for_validation(audio_encoder, codes: torch.Tensor) -> Optional[np.ndarray]:
-    """Decodes (9, T) codes through the Parler DAC wrapper for sanity checks."""
-    try:
-        inp = codes[None, None].long().to(audio_encoder.device)
-        out = audio_encoder.decode(audio_codes=inp, audio_scales=[None])
-        audio = out.audio_values
-        return audio.detach().float().cpu().numpy().reshape(-1)
-    except Exception:
-        try:
-            inp = codes[None, None].long().to(audio_encoder.device)
-            out = audio_encoder.decode(inp)
-            audio = out.audio_values if hasattr(out, "audio_values") else out[0]
-            return audio.detach().float().cpu().numpy().reshape(-1)
-        except Exception:
-            return None
+def _decode_codes_for_validation(
+    audio_encoder, codes: torch.Tensor
+) -> Tuple[Optional[np.ndarray], str]:
+    """Decodes ``(K, T)`` codes through the audio encoder for sanity checks.
+
+    Returns ``(waveform, error)``; the waveform is ``None`` when every decode
+    signature failed and ``error`` then holds the last exception.  Both the
+    3-D ``(batch, K, T)`` layout used by ``ParlerTTSForCausalLM.generate`` and
+    the 4-D ``(chunk, batch, K, T)`` layout are attempted, with and without
+    the optional ``audio_scales`` argument, because the audio encoder class
+    (transformers ``DacModel`` vs. the parler-tts wrapper) differs per release.
+    """
+    last_err = "no decode signature succeeded"
+    flat = codes.long()
+    device = getattr(audio_encoder, "device", None)
+    for shape_name, inp in (("3d", flat[None]), ("4d", flat[None, None])):
+        if device is not None:
+            inp = inp.to(device)
+        for use_scales in (True, False):
+            try:
+                kwargs: Dict[str, Any] = {"audio_codes": inp}
+                if use_scales:
+                    kwargs["audio_scales"] = [None]
+                with torch.inference_mode():
+                    out = audio_encoder.decode(**kwargs)
+                audio = out.audio_values if hasattr(out, "audio_values") else out[0]
+                return audio.detach().float().cpu().numpy().reshape(-1), ""
+            except Exception as exc:
+                last_err = (
+                    f"{shape_name}{'+scales' if use_scales else ''} -> "
+                    f"{type(exc).__name__}: {exc}"
+                )
+    return None, last_err
+
+
+def _zero_lag_corr(a: np.ndarray, b: np.ndarray) -> Optional[float]:
+    """Normalised zero-lag correlation; ``None`` when either side is constant."""
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    n = int(min(a.size, b.size))
+    if n < 2:
+        return None
+    a = a[:n] - a[:n].mean()
+    b = b[:n] - b[:n].mean()
+    denom = float(np.sqrt((a * a).sum()) * np.sqrt((b * b).sum()))
+    if denom <= 1e-12:
+        return None
+    return float((a * b).sum() / denom)
 
 
 class TeacherCollector:
@@ -332,12 +365,17 @@ class TeacherCollector:
         return text, prompt_clean
 
     def _trim_valid_frames(self, codes: np.ndarray, codebook_size: int) -> np.ndarray:
-        """Drops trailing frames containing EOS/pad artifacts and applies cap."""
+        """Drops frames holding EOS/BOS/pad artefacts and applies the frame cap.
+
+        Mirrors ``ParlerTTSForCausalLM.generate``: the returned audio is decoded
+        from the columns in which *every* codebook holds a valid token
+        (``sample_mask``), so the same columns are kept here (a trailing
+        diagonal of forced-EOS tokens would otherwise inflate the length).
+        """
         if codes.size == 0:
             return codes
         valid = (codes < codebook_size).all(axis=0)
-        first_invalid = np.argmin(valid) if not valid.all() else valid.shape[0]
-        codes = codes[:, :first_invalid]
+        codes = codes[:, valid]
         return codes[:, : self.max_frames]
 
     def _generate_and_capture(self, prompt_clean: str, index: int):
@@ -385,42 +423,70 @@ class TeacherCollector:
         lm_codes: Optional[np.ndarray] = None
         if streamer is not None:
             lm_codes = streamer.extract_codes()
-            if lm_codes is not None and self._lm_capture_ok is None:
-                # Validate once: the captured codes (after dropping the EOS/pad
-                # tail frames) must decode back to audio of consistent length.
-                # Otherwise the capture layout differs from this parler-tts
-                # build -> fall back to DAC re-encoding for the whole corpus.
-                hop = int(np.prod(getattr(ar.audio_encoder.config, "upsampling_ratios", [8, 8, 4, 2])))
-                codebook_size = int(ar.audio_encoder.config.codebook_size)
-                trimmed = self._trim_valid_frames(lm_codes[:9], codebook_size)
-                decoded = _decode_codes_for_validation(
-                    ar.audio_encoder, torch.from_numpy(trimmed)
+        if lm_codes is not None and self._lm_capture_ok is None:
+            # Validate once: the captured codes must decode back to the same
+            # waveform the teacher returned.  Both sides run the identical
+            # canonical post-processing, so lengths must agree within 10%
+            # and the overlapping audio must correlate (>0.9).  Otherwise
+            # the capture layout differs from this parler-tts build -> fall
+            # back to DAC re-encoding for the whole corpus.
+            hop = int(np.prod(getattr(ar.audio_encoder.config, "upsampling_ratios", [8, 8, 4, 2])))
+            codebook_size = int(ar.audio_encoder.config.codebook_size)
+            trimmed = self._trim_valid_frames(lm_codes[:9], codebook_size)
+            decoded, decode_err = _decode_codes_for_validation(
+                ar.audio_encoder, torch.from_numpy(trimmed)
+            )
+            n_teacher = int(len(audio))
+            if decoded is None:
+                consistent = False
+                detail = f"decode failed ({decode_err})"
+            else:
+                n = int(min(len(decoded), n_teacher))
+                len_ratio = n / max(len(decoded), n_teacher, 1)
+                corr = _zero_lag_corr(decoded[:n], audio[:n]) if n else None
+                consistent = trimmed.shape[1] > 0 and len_ratio >= 0.90 and (
+                    corr is None or corr >= 0.90
                 )
-                expected = trimmed.shape[1] * hop
-                consistent = (
-                    decoded is not None
-                    and trimmed.shape[1] > 0
-                    and abs(len(decoded) - len(audio)) <= 4 * hop
-                    and abs(expected - len(audio)) <= 4 * hop
+                detail = (
+                    f"frames={trimmed.shape[1]} frame_samples={trimmed.shape[1] * hop} "
+                    f"decoded={len(decoded)} teacher={n_teacher} "
+                    f"len_ratio={len_ratio:.3f} "
+                    f"corr={'n/a' if corr is None else f'{corr:.3f}'}"
                 )
-                self._lm_capture_ok = bool(consistent)
-                if self.verbose:
-                    print(
-                        f"[Teacher] LM token capture validation: "
-                        f"{'OK' if consistent else 'MISMATCH -> DAC re-encode fallback'}"
-                    )
+            self._lm_capture_ok = bool(consistent)
+            if self.verbose:
+                print(
+                    f"[Teacher] LM token capture validation: "
+                    f"{'OK' if consistent else 'MISMATCH -> DAC re-encode fallback'} "
+                    f"({detail})"
+                )
 
         return audio, lm_codes
 
     def _codec_reencode(self, audio: np.ndarray) -> Optional[np.ndarray]:
         ar = self.engine.ar_model
         try:
-            wave = torch.from_numpy(audio).float().to(self.engine.device).view(1, 1, -1)
+            wave = torch.from_numpy(np.asarray(audio, dtype=np.float32)).reshape(1, 1, -1)
+            # The teacher may run in fp16 while the waveform arrives as float32;
+            # the DAC encoder rejects mixed dtypes ("Input type (float) and bias
+            # type (c10::Half) should be the same"), so follow the module dtype.
+            try:
+                param = next(ar.audio_encoder.parameters())
+                wave = wave.to(device=param.device, dtype=param.dtype)
+            except StopIteration:
+                wave = wave.to(self.engine.device)
             with torch.inference_mode():
-                enc = ar.audio_encoder.encode(wave, return_dict=True)
-            codes = enc.audio_codes
-            if isinstance(codes, (list, tuple)):
-                codes = codes[0]
+                try:
+                    enc = ar.audio_encoder.encode(wave)
+                except AttributeError:  # encoder exposes only forward()
+                    enc = ar.audio_encoder(wave)
+            codes = getattr(enc, "audio_codes", None)
+            if codes is None and isinstance(enc, (list, tuple)):
+                codes = enc[0]
+            if codes is None:
+                raise RuntimeError(
+                    f"encoder output has no audio_codes ({type(enc).__name__})"
+                )
             codes = codes.detach().cpu().long()
             if codes.dim() == 4:  # (chunks=1, batch=1, K, T)
                 codes = codes[0, 0]
@@ -429,7 +495,7 @@ class TeacherCollector:
             return codes.numpy().astype(np.int64)
         except Exception as exc:
             if self.verbose:
-                print(f"[Teacher] DAC re-encode failed: {exc}")
+                print(f"[Teacher] DAC re-encode failed: {type(exc).__name__}: {exc}")
             return None
 
     # -- main loop -----------------------------------------------------------
@@ -1128,7 +1194,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
                 res_out = residual(cb0_tokens=draft_out.tokens, sample=True)
                 audio_enc = engine.ar_model.audio_encoder
-                wave = _decode_codes_for_validation(audio_enc, res_out.full_codebooks[0])
+                wave, decode_err = _decode_codes_for_validation(
+                    audio_enc, res_out.full_codebooks[0]
+                )
+                if wave is None:
+                    print(f"[Sanity] decode failed: {decode_err}")
             if wave is not None:
                 import soundfile as sf
 

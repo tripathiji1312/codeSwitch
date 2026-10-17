@@ -109,6 +109,27 @@ def run_benchmark():
     output_dir = Path("output_audio")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Warm-up pass: the first synthesis on a fresh process pays one-off CUDA
+    # kernel / allocator / description-cache costs (measured on a T4: ~0.9 s
+    # TTFA for the first utterance vs ~45 ms once warm - which previously made
+    # the first benchmarked category look ~20x slower than the others).  Two
+    # throwaway utterances, including a long code-mixed one so the DAC decoder
+    # is sized for the worst case, are synthesised with timing discarded.
+    print(" [2.5/4] Warm-up pass (CUDA kernels, allocator, DAC, description cache)...")
+    if pipeline.speech_available:
+        for warm_text in (
+            "இது ஒரு வெப்பநிலை சோதனை, முடிவுகளில் சேர்க்கத் தேவையில்லை.",
+            "Warm-up only: driver-ku OTP 1234 sollunga, total fare Rs. 500, vehicle TN 09 AB 1234.",
+        ):
+            try:
+                pipeline.synthesize(warm_text)
+            except Exception as exc:
+                print(f"     [warmup] skipped: {type(exc).__name__}: {exc}")
+        print("   ✓ warm-up complete (timings discarded)")
+    else:
+        print("   ⚠ speech backend unavailable - skipping warm-up")
+    print("-" * 80)
+
     print(" [3/4] Executing Streaming Synthesis & Benchmarking...")
     results: list[PipelineBenchmarkResult] = []
 
@@ -166,18 +187,33 @@ def run_benchmark():
         print(row)
     print("-" * 80)
 
-    # Architectural Comparison with Standard Autoregressive Baseline
-    print("\n ARCHITECTURAL LATENCY COMPARISON (Target vs Baseline on T4 GPU):")
+    ttfas = [res.ttfa_ms for res in results]
+    if len(ttfas) >= 2:
+        warm = ttfas[1:]
+        print(
+            f" TTFA breakdown: first measured utterance = {ttfas[0]:.1f} ms | "
+            f"warm mean = {sum(warm) / len(warm):.1f} ms | warm min = {min(warm):.1f} ms"
+        )
+        print(" (one-off cold-start overhead is absorbed by the warm-up pass above)")
+        print("-" * 80)
+
+    # Architectural comparison with the standard AR baseline.
+    # NOTE: every value printed below is a design target from the project plan,
+    # NOT a measurement - measured values are the table above (and
+    # run_full_evaluation.py is the script that produces the paper numbers).
+    print("\n ARCHITECTURAL LATENCY COMPARISON - DESIGN TARGETS (not measured):")
     print(" ┌───────────────────────────────────────┬──────────────────┬──────────────────┐")
     print(" │ Metric                                │ AR Baseline      │ CodeSwitch-TTS   │")
     print(" ├───────────────────────────────────────┼──────────────────┼──────────────────┤")
     print(" │ First Chunk TTFA                      │ ~3,200 ms        │ ~230 - 260 ms    │")
     print(" │ Speculative Decoding Codebook Target  │ All 9 CBs (Fails)│ Codebook 0 Only  │")
-    print(" │ Codebook Rejection Collapse Risk      │ High (>77% rej.) │ Avoided (<18%)   │")
+    print(" │ Codebook Rejection Collapse Risk      │ High (>77% rej.) │ Target: low rej. │")
     print(" │ Residual Codebook 1-8 Generation      │ Sequential AR    │ Parallel NAR     │")
-    print(" │ Real-Time Factor (RTF)                │ ~1.20 (Lagging)  │ ~0.24 (Streamed) │")
+    print(" │ Real-Time Factor (RTF)                │ ~1.20 (Lagging)  │ ~0.24 (target)   │")
     print(" │ TTFA Latency Reduction Target         │ Baseline (1.0x)  │ >92% (13.6x fast)│")
     print(" └───────────────────────────────────────┴──────────────────┴──────────────────┘")
+    print(" \u26a0 The targets above are plan values; report the measured CB0 acceptance")
+    print("   and TTFA from the table above (or codeswitch_ckpt/results.jsonl) instead.")
     print("\n[CodeSwitch-TTS] Benchmark execution successfully completed.")
     print("All audio files are saved in: ./output_audio/")
 

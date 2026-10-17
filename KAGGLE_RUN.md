@@ -105,10 +105,14 @@ print("✓ Setup complete. Work from:", CLONE_DIR)
   `--skip-teacher` reuses the cache entirely; `--skip-draft` / `--skip-residual` skip a stage.
   The teacher loop prints an ETA every 10 sentences — Ctrl-C stops cleanly and a re-run
   resumes from the last cached sentence (use `--num-sentences 400` for a ~25% larger corpus).
-* **Teacher targets**: `--target-source auto` (default) tries LM-token capture once and
-  validates it by decoding the captured codes and comparing waveform length; if the
-  validation fails it silently falls back to DAC re-encoding of the teacher waveform
-  (`--target-source lm|codec` to force either).
+* **Teacher targets**: `--target-source auto` (default) captures the LM tokens once and
+  validates them by decoding the captured codes and comparing the waveform against the
+  teacher's returned audio; the validation line now prints the evidence, e.g.
+  `frames=241 frame_samples=123392 decoded=123392 teacher=123392 len_ratio=1.000 corr=0.999`.
+  Both the length ratio (≥ 0.90) and the zero-lag correlation (≥ 0.90) must pass; otherwise
+  it falls back to DAC re-encoding of the teacher waveform (`--target-source lm|codec` to
+  force either). A `MISMATCH` line with `decode failed (...)` included usually means the
+  audio encoder's `decode` signature differs — the error text tells you which layout failed.
 * **Budgets**: draft training ≤ 12 min, residual ≤ 6 min (wall-clock caps, `--max-minutes*`).
 * **Smoke test** (no GPU, ~30 s): `!python train_draft_distill.py --dry-run`
 * **Custom corpus**: `--corpus-json my_sentences.json` (list of strings or one per line);
@@ -170,6 +174,12 @@ Kaggle unless you want to archive them too.)
   number) and *TTFA-e2e* (wall-clock to the first audio buffer — for Config A it is measured
   through the real `ParlerTTSStreamer` in a background thread, which is why it is larger than
   the NAR configs).
+* **Cold vs. warm TTFA**: the *first* utterance of every configuration pays one-off CUDA
+  kernel/allocator/description-cache costs (on a T4 that is ~4.3 s vs ~0.7 s compute for the
+  NAR configs — a ~6x outlier). Table I therefore reports the cold value as its own column and
+  uses the median/p90 of the remaining 59 utterances (warm) everywhere else; Fig. 1 draws warm
+  p50 bars with a black x marker for the cold value. Report warm numbers in the paper text and
+  cite the cold column when discussing streaming start-up latency.
 * **Acceptance** is reported twice: *true* (teacher-forced Parler probabilities) and *synth*
   (theoretical upper-bound telemetry). A distilled draft should give `0 < acc_true < acc_synth`;
   that gap is the honest speculative-decoding trade-off story.
@@ -191,6 +201,9 @@ Kaggle unless you want to archive them too.)
 | Config A/TTFA-c missing | `ParlerTTSStreamer` import failed; the run falls back to full generation and marks the row with a `note`. |
 | Generation error per row | the row records `error` and is retried on the next run; the rest of the benchmark continues. |
 | CUDA OOM during ASR | re-run with `--skip-asr` (everything except CER/WER still runs). |
+| `TTFA` much larger for the first category/register | cold start (first synthesis in the session). `kaggle_demo.py` now runs a discarded warm-up pass first; `run_full_evaluation.py` always reports cold and warm separately. |
+| `[Teacher] DAC re-encode failed: Input type (float) and bias type (c10::Half)...` | fixed — the waveform is now cast to the audio encoder's dtype before `encode()`. Pull the latest repo before re-running. |
+| `[Teacher] LM token capture validation: MISMATCH` | the printed `len_ratio`/`corr` say why; the codec fallback takes over automatically. Capture and decode both try the 3-D and 4-D code layouts now, so a mismatch with `corr ≈ 1` means the trim differs, and `decode failed` means no layout matched. |
 | Session dies mid-run | re-run the same command(s): teacher shards and evaluated rows are resumed. |
 
 ## 7) Where the knobs live
@@ -199,4 +212,4 @@ Kaggle unless you want to archive them too.)
   Tanglish / 20 transit code-mixed utterances; `build_training_corpus(n, seed)`).
 * Synthesis/timing/acceptance/zone logic + figures + tables: `run_full_evaluation.py`.
 * Teacher collection + distillation + checkpoints: `train_draft_distill.py`.
-* Local test suite: `python -m pytest tests/ -q` (33 tests, no GPU needed).
+* Local test suite: `python -m pytest tests/ -q` (39 tests, no GPU needed).
