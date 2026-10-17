@@ -7,7 +7,7 @@ One-command Kaggle workflow (after the notebook environment is set up):
 What it does
 ------------
 1. TEACHER PASS — Indic Parler-TTS synthesizes a bootstrap Tanglish/Tamil
-   corpus (``codeswitch_benchmark_data.build_training_corpus``, 400 sentences
+   corpus (``codeswitch_benchmark_data.build_training_corpus``, 300 sentences
    by default, disjoint from the 60-utterance evaluation set).  For every
    sentence the 9-codebook DAC token stream is captured and cached in
    ``teacher_cache/`` (re-runs reuse the cache).
@@ -964,7 +964,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Run the full training path on fabricated data (no Parler/GPU needed).")
     p.add_argument("--corpus-json", type=str, default=None,
                    help="Optional external training corpus (one sentence per line or JSON list).")
-    p.add_argument("--num-sentences", type=int, default=400,
+    p.add_argument("--num-sentences", type=int, default=300,
                    help="Number of training sentences (bootstrap corpus size).")
     p.add_argument("--target-source", choices=["auto", "lm", "codec"], default="auto",
                    help="Teacher token target: LM-sampled captures, DAC re-encode, or auto.")

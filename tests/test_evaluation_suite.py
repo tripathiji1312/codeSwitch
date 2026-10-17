@@ -386,6 +386,6 @@ def test_module_arg_parsers_exist():
     import train_draft_distill as T
 
     train_args = T.build_arg_parser().parse_args([])
-    assert train_args.num_sentences == 400
+    assert train_args.num_sentences == 300
     assert train_args.target_source == "auto"
     assert train_args.dry_run is False

@@ -6,7 +6,7 @@ between cells except the one-time dependency install.
 | Step | Command | Wall-clock (T4) | Artifacts |
 |------|---------|-----------------|-----------|
 | 1 | setup cell (below) | 4–8 min + 1 restart | — |
-| 2 | `python train_draft_distill.py` | 25–40 min | `teacher_cache/shard_*.npz`, `codeswitch_ckpt/{draft_cb0.pt,residual_cb1_8.pt,meta.json}` |
+| 2 | `python train_draft_distill.py` | 35–55 min | `teacher_cache/shard_*.npz`, `codeswitch_ckpt/{draft_cb0.pt,residual_cb1_8.pt,meta.json}` |
 | 3 | `python run_full_evaluation.py --ckpt codeswitch_ckpt` | 25–40 min | `eval_results/{raw_results.jsonl,run_meta.json}`, `paper_figures/{fig1,fig2,fig3}.{png,pdf}`, `paper_figures/{tables.tex,summary.json}`, `eval_audio/{A,B,C}/*.wav` |
 
 ---
@@ -97,12 +97,14 @@ print("✓ Setup complete. Work from:", CLONE_DIR)
 
 ```python
 %cd /kaggle/working/codeSwitch
-!python train_draft_distill.py --num-sentences 400 --ckpt-dir codeswitch_ckpt
+!python train_draft_distill.py --num-sentences 300 --ckpt-dir codeswitch_ckpt
 ```
 
 * **Resume**: safe to re-run at any time. Teacher shards are cached per sentence in
   `teacher_cache/shard_XXXX.npz`, so a second run only collects what is missing.
   `--skip-teacher` reuses the cache entirely; `--skip-draft` / `--skip-residual` skip a stage.
+  The teacher loop prints an ETA every 10 sentences — Ctrl-C stops cleanly and a re-run
+  resumes from the last cached sentence (use `--num-sentences 400` for a ~25% larger corpus).
 * **Teacher targets**: `--target-source auto` (default) tries LM-token capture once and
   validates it by decoding the captured codes and comparing waveform length; if the
   validation fails it silently falls back to DAC re-encoding of the teacher waveform
