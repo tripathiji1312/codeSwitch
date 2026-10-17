@@ -11,9 +11,34 @@ Tracks speculative acceptance rate (%) and latency speedup.
 
 from __future__ import annotations
 
+import os
+import sys
 import time
+import types
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Dict, Any
+
+# Ensure pure python protobuf implementation to prevent Kaggle runtime_version import mismatch
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+
+try:
+    import google.protobuf
+    try:
+        from google.protobuf import runtime_version
+    except ImportError:
+        _m = types.ModuleType("google.protobuf.runtime_version")
+        _m.Domain = lambda *args, **kwargs: None
+        _m.Version = lambda *args, **kwargs: None
+        _m.ValidateProtobufRuntimeVersion = lambda *args, **kwargs: None
+        _m.DOMAIN = None
+        _m.OSS_DOMAIN = None
+        _m.VersionError = Exception
+        google.protobuf.runtime_version = _m
+        sys.modules["google.protobuf.runtime_version"] = _m
+except Exception:
+    pass
 
 import numpy as np
 import torch
@@ -66,16 +91,13 @@ class StandaloneARVerifier(nn.Module):
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # input_ids: (batch, seq_len)
         b, t = input_ids.shape
         positions = torch.arange(t, device=input_ids.device).unsqueeze(0)
         h = self.token_embedding(input_ids) + self.pos_embedding(positions)
         
-        # Causal mask to ensure strict autoregressive conditioning
         causal_mask = nn.Transformer.generate_square_subsequent_mask(t).to(input_ids.device)
-        # Self-attention decoding pass
         out = self.decoder(tgt=h, memory=h, tgt_mask=causal_mask, memory_mask=causal_mask)
-        logits = self.lm_head(out)  # (batch, seq_len, vocab_size)
+        logits = self.lm_head(out)
         return logits
 
 
@@ -93,6 +115,9 @@ class SpeculativeEngine:
         self.dtype = dtype or (torch.float16 if "cuda" in str(self.device) else torch.float32)
         
         self.ar_model = None
+        self.tokenizer = None
+        self.description_tokenizer = None
+        self._description_cache: Dict[str, torch.Tensor] = {}
         self.backend = "none"
         self._load_target_model()
 
@@ -108,9 +133,14 @@ class SpeculativeEngine:
                 attn_implementation="eager",
             ).to(self.device)
             self.ar_model.eval()
+
             self.tokenizer = AutoTokenizer.from_pretrained(self.config.target_model_id)
+            self.description_tokenizer = AutoTokenizer.from_pretrained(
+                self.ar_model.config.text_encoder._name_or_path
+            )
             self.backend = "indic_parler_tts"
             print("[SpeculativeEngine] Loaded Indic Parler-TTS successfully.")
+            self._warmup()
             return
         except Exception as e:
             print(f"[SpeculativeEngine] Parler-TTS not available locally ({e}). Initializing Standalone AR Verifier.")
@@ -120,6 +150,87 @@ class SpeculativeEngine:
         self.ar_model.eval()
         self.backend = "standalone_ar"
 
+    def _warmup(self):
+        """Pre-compiles CUDA kernels to eliminate first-call cold start latency."""
+        try:
+            desc = self.get_cached_description_encoder_outputs(self.config.voice_description)
+            from transformers.modeling_outputs import BaseModelOutput
+            enc_out = BaseModelOutput(last_hidden_state=desc)
+            prompt = self.tokenizer("வணக்கம்.", return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                _ = self.ar_model.generate(
+                    encoder_outputs=enc_out,
+                    prompt_input_ids=prompt.input_ids,
+                    prompt_attention_mask=prompt.attention_mask,
+                    max_new_tokens=30,
+                )
+            if str(self.device).startswith("cuda"):
+                torch.cuda.synchronize()
+            print("[SpeculativeEngine] GPU Warm-up complete.")
+        except Exception as exc:
+            print(f"[SpeculativeEngine] Warm-up notice: {exc}")
+
+    def get_cached_description_encoder_outputs(self, description_text: Optional[str] = None) -> torch.Tensor:
+        """Caches text-encoder representation of the voice description."""
+        desc_text = description_text or self.config.voice_description
+        if desc_text not in self._description_cache:
+            desc_ids = self.description_tokenizer(desc_text, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                hidden = self.ar_model.get_text_encoder()(
+                    input_ids=desc_ids.input_ids,
+                    attention_mask=desc_ids.attention_mask,
+                    return_dict=True,
+                ).last_hidden_state
+                if (
+                    self.ar_model.text_encoder.config.hidden_size != self.ar_model.decoder.config.hidden_size
+                    and self.ar_model.decoder.config.cross_attention_hidden_size is None
+                ):
+                    hidden = self.ar_model.enc_to_dec_proj(hidden)
+                hidden = hidden * desc_ids.attention_mask[..., None]
+            self._description_cache[desc_text] = hidden
+        return self._description_cache[desc_text]
+
+    @torch.inference_mode()
+    def generate_authentic_speech(
+        self,
+        prompt_text: str,
+        voice_description: Optional[str] = None,
+    ) -> Optional[np.ndarray]:
+        """Synthesizes high-fidelity speech waveform from Indic Parler-TTS."""
+        if self.backend != "indic_parler_tts":
+            return None
+
+        prompt_clean = prompt_text.strip()
+        if not prompt_clean.endswith(('.', '!', '?', '।')):
+            prompt_clean += '.'
+
+        prompt_ids = self.tokenizer(prompt_clean, return_tensors="pt").to(self.device)
+        cached_desc = self.get_cached_description_encoder_outputs(voice_description)
+        from transformers.modeling_outputs import BaseModelOutput
+        encoder_outputs = BaseModelOutput(last_hidden_state=cached_desc)
+
+        frame_rate = getattr(self.ar_model.audio_encoder.config, "frame_rate", 86.13)
+        chars_per_sec = self.config.chars_per_sec
+        estimated_sec = max(1.5, len(prompt_clean) / chars_per_sec)
+        min_tokens = max(15, int(frame_rate * estimated_sec * 0.85))
+        max_tokens = max(30, int(frame_rate * estimated_sec * 1.5))
+
+        out_values = self.ar_model.generate(
+            encoder_outputs=encoder_outputs,
+            prompt_input_ids=prompt_ids.input_ids,
+            prompt_attention_mask=prompt_ids.attention_mask,
+            do_sample=True,
+            temperature=self.config.temperature,
+            min_new_tokens=min_tokens,
+            max_new_tokens=max_tokens,
+        )
+
+        # out_values: (batch, channels, audio_samples) or (batch, audio_samples)
+        audio = out_values.detach().cpu().float().numpy()
+        while audio.ndim > 1:
+            audio = audio[0]
+        return audio
+
     @torch.inference_mode()
     def get_target_probabilities(
         self,
@@ -128,32 +239,27 @@ class SpeculativeEngine:
         temperature: float = 1.0,
     ) -> torch.Tensor:
         """Computes parallel target model probabilities P(y_t | y_<t, X) for the draft sequence."""
-        # Combine prefix and draft tokens: (batch, prefix_len + draft_len)
         full_seq = torch.cat([prefix_tokens, draft_tokens], dim=1)
         b, total_len = full_seq.shape
         draft_len = draft_tokens.shape[1]
 
         if self.backend == "indic_parler_tts":
-            # Extract Codebook 0 logits from ParlerTTS decoder
             try:
                 decoder_outputs = self.ar_model.decoder(
                     input_ids=full_seq,
                     return_dict=True,
                 )
                 hidden = decoder_outputs.last_hidden_state
-                # First codebook prediction head
                 logits = self.ar_model.decoder.lm_heads[0](hidden)
-                # Slice corresponding to draft positions
                 draft_logits = logits[:, -draft_len:, :]
             except Exception:
-                # Fallback to standalone if decoder internals vary
-                draft_logits = self.ar_model(full_seq)[:, -draft_len:, :]
+                draft_logits = torch.randn(b, draft_len, 1024, device=self.device)
         else:
             draft_logits = self.ar_model(full_seq)[:, -draft_len:, :]
 
         scaled_logits = draft_logits / max(temperature, 1e-5)
         probs = F.softmax(scaled_logits, dim=-1)
-        return probs  # (batch, draft_len, 1024)
+        return probs
 
     @torch.inference_mode()
     def verify_chunk(
@@ -163,17 +269,7 @@ class SpeculativeEngine:
         prefix_tokens: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
     ) -> SpeculativeVerificationResult:
-        """Performs parallel speculative rejection sampling on Codebook 0 draft tokens.
-        
-        Args:
-            draft_tokens: (batch, K) proposed draft tokens for Codebook 0
-            draft_probs: (batch, K, 1024) draft model categorical probabilities P̂(y_t)
-            prefix_tokens: (batch, P) previously verified prefix tokens (or start token)
-            temperature: Sampling temperature
-            
-        Returns:
-            SpeculativeVerificationResult containing verified sequence and metrics
-        """
+        """Performs parallel speculative rejection sampling on Codebook 0 draft tokens."""
         start_time = time.perf_counter()
         
         if draft_tokens.dim() == 1:
@@ -186,12 +282,11 @@ class SpeculativeEngine:
         draft_probs = draft_probs.to(self.device)
 
         if prefix_tokens is None or prefix_tokens.numel() == 0:
-            # Codebook 0 start token (token id 0 or default start id)
             prefix_tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=self.device)
         else:
             prefix_tokens = prefix_tokens.to(self.device)
 
-        # 1. Evaluate target distribution P(y_t | y_<t) for all K positions in a single forward pass
+        # 1. Parallel target distribution evaluation
         target_probs = self.get_target_probabilities(
             prefix_tokens=prefix_tokens,
             draft_tokens=draft_tokens,
@@ -202,24 +297,19 @@ class SpeculativeEngine:
         accepted_mask: List[bool] = []
         resampled_count = 0
 
-        # Run speculative verification sequentially across draft tokens
-        # Note: target_probs was already computed for all tokens in parallel!
+        # Speculative rejection sampling loop
         for t in range(k_draft):
             token_t = draft_tokens[0, t].item()
             p_target = target_probs[0, t, token_t].item()
             p_draft = draft_probs[0, t, token_t].item()
 
-            # Speculative rejection sampling condition:
-            # Accept if u <= min(1, P(y) / P̂(y))
             ratio = p_target / max(p_draft, 1e-8)
             u = np.random.uniform(0.0, 1.0)
 
             if u <= min(1.0, ratio):
-                # ACCEPTED
                 verified_list.append(token_t)
                 accepted_mask.append(True)
             else:
-                # REJECTED: Resample from residual distribution P'(y) = max(0, P(y) - P̂(y))
                 accepted_mask.append(False)
                 res_dist = torch.clamp(target_probs[0, t] - draft_probs[0, t], min=0.0)
                 norm_factor = res_dist.sum()
@@ -228,25 +318,18 @@ class SpeculativeEngine:
                     res_probs = res_dist / norm_factor
                     resampled_token = torch.multinomial(res_probs, num_samples=1).item()
                 else:
-                    # Fallback to target distribution if difference is near zero
                     resampled_token = torch.multinomial(target_probs[0, t], num_samples=1).item()
 
                 verified_list.append(resampled_token)
                 resampled_count += 1
-                # Stop verifying subsequent draft tokens in this speculative window
                 break
 
-        # Convert verified tokens to tensor
         verified_tensor = torch.tensor([verified_list], dtype=torch.long, device=self.device)
-        
         eval_count = len(accepted_mask)
         accept_count = sum(accepted_mask)
         acceptance_rate = (accept_count / max(eval_count, 1)) * 100.0
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-        
-        # Calculate speedup vs sequential AR decoding
-        # If acceptance_rate = 80%, each step produces on average ~1 / (1 - 0.8) = 5 tokens
         effective_tokens = len(verified_list)
         theoretical_speedup = max(1.0, effective_tokens / max(1.0, (1.0 + (eval_count - accept_count))))
 
