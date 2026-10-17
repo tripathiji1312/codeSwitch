@@ -1,0 +1,1762 @@
+"""CodeSwitch-TTS full evaluation suite (Interspeech/ICASSP-ready).
+
+One command on a Kaggle T4 (after the notebook environment is installed and the
+distillation companion has produced checkpoints):
+
+    !pip install -q jiwer matplotlib seaborn pandas
+    !python train_draft_distill.py                # once: teacher cache + checkpoints
+    !python run_full_evaluation.py --ckpt codeswitch_ckpt
+
+What it produces
+----------------
+* 60-utterance evaluation set (20 native Tamil / 20 romanized Tanglish /
+  20 transit & commerce code-mixed) synthesised with three configurations on
+  the same GPU:
+    A. Pure AR      - Indic Parler-TTS with the real streaming streamer.
+    B. Pure NAR     - distilled draft -> residual decoder -> DAC (no verifier).
+    C. CodeSwitch   - distilled draft -> teacher-forced CB0 verification
+                      (rejection sampling) -> residual -> DAC  [proposed].
+* Per-utterance metrics (``eval_results/raw_results.jsonl``, resumable):
+  TTFA (component-compute + end-to-end wall clock), total latency, RTF, DAC
+  Codebook-0 acceptance (true teacher-forced + synthetic-target telemetry),
+  zone-split acceptance (Pure Tamil / English loanword / transit alphanumeric /
+  cross-lingual boundary), CER/WER via whisper (optional, inline).
+* Publication figures (300 dpi PNG + vector PDF, IEEE style) in
+  ``paper_figures/``: fig1 latency-quality tradeoff, fig2 zone acceptance,
+  fig3 streaming chunk + buffer timeline.
+* Copy-pasteable LaTeX for Table I & II (stdout + ``paper_figures/tables.tex``).
+
+Protocol notes (state these in the paper)
+-----------------------------------------
+* TRUE acceptance: for every drafted CB0 frame the target distribution
+  ``q_t = P_target(cb0_t | text, cb0_<t)`` is computed with a single
+  teacher-forced forward pass through the Parler decoder per chunk (delay
+  pattern row 0; other codebook channels held at their delayed null/bos
+  state -- a documented single-channel verification protocol).  Rejection
+  sampling uses the textbook ratio ``min(1, q(x)/p_hat(x))`` with residual
+  resampling ``norm(max(0, q - p_hat))``.
+* SYNTHETIC column ("upper-bound telemetry"): identical acceptance math
+  against a random-target distribution ``softmax(randn)`` -- the legacy demo
+  protocol, reported separately for transparency.  It is not a rigorous upper
+  bound; treat it as a synthetic reference.
+* TTFA modes: component-compute (draft + verify + residual + DAC of the first
+  chunk) and end-to-end wall clock until the first ~1 s audio buffer exists
+  (real streamer for A; first decoded chunk for B/C).
+* CER reference is the normalizer's Tamil-script, entity-verbalised text; a
+  shared cleaning protocol (NFC, lowercase, punctuation strip, digit runs
+  spelled digit-by-digit) is applied to reference and hypothesis.
+
+Resume behaviour: completed ``(config, utterance)`` rows in the JSONL are
+skipped (``--force`` re-runs them).  ``--replay`` rebuilds aggregates, figures
+and tables from the JSONL without synthesising anything.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import math
+import os
+import random
+import re
+import sys
+import threading
+import time
+import unicodedata
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+
+import numpy as np
+
+# codeswitch_tts installs the protobuf fallback shim at import time.
+from codeswitch_tts import (  # noqa: E402
+    CodeSwitchTTSConfig,
+    DraftTransformer,
+    ResidualDecoder,
+    TanglishNormalizer,
+)
+from codeswitch_benchmark_data import EVAL_UTTERANCES, REGISTER_LABELS  # noqa: E402
+
+try:
+    import torch
+except Exception as exc:  # pragma: no cover
+    raise SystemExit(f"PyTorch import failed: {exc}")
+
+SCHEMA_VERSION = 1
+
+# ===========================================================================
+# Zone constants
+# ===========================================================================
+ZONE_NONE = 0
+ZONE_TAMIL = 1
+ZONE_ENGLISH = 2
+ZONE_TRANSIT = 3
+ZONE_BOUNDARY = 4
+
+ZONE_NAMES: Dict[int, str] = {
+    ZONE_TAMIL: "Pure Tamil",
+    ZONE_ENGLISH: "English Loanword",
+    ZONE_TRANSIT: "Transit Alphanumeric",
+    ZONE_BOUNDARY: "Cross-Lingual Boundary",
+}
+ZONE_ORDER: List[int] = [ZONE_TAMIL, ZONE_ENGLISH, ZONE_TRANSIT, ZONE_BOUNDARY]
+
+CONFIG_LABELS = {
+    "A": "Pure AR (Parler-TTS)",
+    "B": "Pure NAR (Draft+Residual)",
+    "C": "CodeSwitch-TTS (Hybrid)",
+}
+CONFIG_COLORS = {"A": "#1f77b4", "B": "#ff7f0e", "C": "#2ca02c"}
+
+TAMIL_RE = re.compile(r"[\u0B80-\u0BFF]")
+PUNCT_RE = re.compile(r"[^\w\s\u0B80-\u0BFF]", re.UNICODE)
+DIGIT_RUN_RE = re.compile(r"\d+")
+EN_DIGIT_WORDS = ["zero", "one", "two", "three", "four", "five",
+                  "six", "seven", "eight", "nine"]
+
+
+# ===========================================================================
+# Utilities
+# ===========================================================================
+def _now() -> float:
+    return time.perf_counter()
+
+
+def fmt_time(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def cuda_sync(device) -> None:
+    try:
+        if str(device).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def package_versions() -> Dict[str, str]:
+    from importlib import metadata
+
+    versions: Dict[str, str] = {}
+    for pkg in ("torch", "transformers", "parler_tts", "protobuf", "numpy", "jiwer"):
+        try:
+            versions[pkg] = metadata.version(pkg)
+        except Exception:
+            versions[pkg] = "not-installed"
+    return versions
+
+
+def digits_to_words_digitwise(text: str) -> str:
+    def _repl(m: re.Match) -> str:
+        return " ".join(EN_DIGIT_WORDS[int(d)] for d in m.group(0))
+
+    return DIGIT_RUN_RE.sub(_repl, text)
+
+
+def clean_for_cer(text: str) -> str:
+    """Shared CER cleaning protocol (reference and hypothesis)."""
+    text = unicodedata.normalize("NFC", text).lower()
+    text = PUNCT_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return digits_to_words_digitwise(text)
+
+
+# ===========================================================================
+# Zone instrumentation (linguistic zones -> acoustic frames)
+# ===========================================================================
+def find_transit_spans(
+    normalized_text: str, replacements: Sequence[Tuple[str, str]]
+) -> List[Tuple[int, int]]:
+    """Locates verbalised transit entity spans inside the final text."""
+    spans: List[Tuple[int, int]] = []
+    cursor = 0
+    low = normalized_text.lower()
+    for _orig, spoken in replacements:
+        candidate = re.sub(r"\s+", " ", spoken.strip())
+        if not candidate:
+            continue
+        idx = low.find(candidate.lower(), cursor)
+        if idx < 0:
+            idx = low.find(candidate.lower())
+        if idx < 0:
+            first = candidate.split()[0].lower()
+            idx = low.find(first, cursor) if first else -1
+            if idx < 0:
+                continue
+            spans.append((idx, min(len(low), idx + len(first))))
+        else:
+            spans.append((idx, min(len(low), idx + len(candidate))))
+        cursor = spans[-1][1]
+    return spans
+
+
+def label_char_zones(
+    normalized_text: str, transit_spans: Sequence[Tuple[int, int]]
+) -> np.ndarray:
+    """Per-character zone ids: 1 Tamil, 2 English, 3 transit, 0 neutral."""
+    zones = np.zeros(len(normalized_text), dtype=np.int64)
+    transit = np.zeros(len(normalized_text), dtype=bool)
+    for start, end in transit_spans:
+        transit[start:end] = True
+    for i, ch in enumerate(normalized_text):
+        if TAMIL_RE.match(ch):
+            zones[i] = ZONE_TAMIL
+        elif ch.isspace() or not ch.isalnum():
+            zones[i] = ZONE_NONE
+        elif transit[i] or ch.isdigit():
+            zones[i] = ZONE_TRANSIT
+        elif ch.isalpha():
+            zones[i] = ZONE_ENGLISH
+        else:
+            zones[i] = ZONE_NONE
+    return zones
+
+
+def _language_class(zone: int) -> Optional[str]:
+    if zone == ZONE_TAMIL:
+        return "tamil"
+    if zone in (ZONE_ENGLISH, ZONE_TRANSIT):
+        return "latin"
+    return None
+
+
+def assign_frame_zones(
+    char_zones: np.ndarray, n_frames: int, boundary_frames: int = 3
+) -> Tuple[np.ndarray, int]:
+    """Monotonic character->frame alignment + boundary overlay.
+
+    Returns ``(frame_zones, n_transitions)``; boundary frames are the first
+    ``boundary_frames`` frames after each Tamil<->Latin switch.
+    """
+    frame_zones = np.zeros(max(0, n_frames), dtype=np.int64)
+    n_transitions = 0
+    if n_frames <= 0:
+        return frame_zones, n_transitions
+    mappable = [i for i, z in enumerate(char_zones) if z != ZONE_NONE]
+    if not mappable:
+        return frame_zones, n_transitions
+    m = len(mappable)
+    frame_of = [min(n_frames - 1, int(math.floor(j * n_frames / m))) for j in range(m)]
+
+    buckets: List[List[int]] = [[] for _ in range(n_frames)]
+    for j, char_idx in enumerate(mappable):
+        buckets[frame_of[j]].append(int(char_zones[char_idx]))
+    for f, bucket in enumerate(buckets):
+        if bucket:
+            frame_zones[f] = max(set(bucket), key=bucket.count)
+
+    transitions: List[int] = []
+    for j in range(1, m):
+        cls_prev = _language_class(int(char_zones[mappable[j - 1]]))
+        cls_cur = _language_class(int(char_zones[mappable[j]]))
+        if cls_prev and cls_cur and cls_prev != cls_cur:
+            transitions.append(frame_of[j])
+    for tr in transitions:
+        frame_zones[tr: min(n_frames, tr + boundary_frames)] = ZONE_BOUNDARY
+    return frame_zones, len(transitions)
+
+
+# ===========================================================================
+# Teacher-forced target scoring (true Parler probabilities)
+# ===========================================================================
+class TeacherForcedScorer:
+    """Scores drafted Codebook-0 frames against the Parler decoder distribution.
+
+    ``q_t = P_target(cb0_t | text, cb0_<t)`` from a single teacher-forced
+    forward pass per chunk; codebook rows 1..8 are held at their bos (null)
+    state (documented single-channel verification protocol).
+    """
+
+    def __init__(self, engine, verbose: bool = True):
+        self.engine = engine
+        self.verbose = verbose
+        self.available = False
+        self.reason = "not initialised"
+        self.ar = getattr(engine, "ar_model", None)
+        self.decoder = getattr(self.ar, "decoder", None) if self.ar is not None else None
+        self.num_codebooks = int(getattr(self.decoder, "num_codebooks", 9)) if self.decoder else 9
+        self.vocab = int(getattr(getattr(self.decoder, "config", None), "vocab_size", 1024))
+        gc_cfg = getattr(self.ar, "generation_config", None)
+        self.bos_id = int(
+            getattr(gc_cfg, "bos_token_id", None)
+            or getattr(gc_cfg, "decoder_start_token_id", None)
+            or 1025
+        )
+        self.fused_heads = bool(getattr(self.decoder, "use_fused_lm_heads", False))
+        self.prompt_cross_attention = bool(getattr(self.ar, "prompt_cross_attention", False))
+        self._probe()
+
+    # -- conditioning --------------------------------------------------------
+    def build_context(self, prompt_clean: str) -> Optional[Dict[str, Any]]:
+        if self.decoder is None:
+            return None
+        try:
+            ar = self.ar
+            desc = self.engine.get_cached_description_encoder_outputs(
+                self.engine.config.voice_description
+            )
+            prompt_ids = self.engine.tokenizer(prompt_clean, return_tensors="pt").to(self.engine.device)
+            ctx: Dict[str, Any] = {
+                "offset": 0,
+                "encoder_hidden_states": desc,
+                "encoder_attention_mask": None,
+            }
+            if self.prompt_cross_attention:
+                embedded = ar.embed_prompts(prompt_ids.input_ids)
+                positions = ar.embed_positions(embedded, 0)
+                prompt_hidden = (embedded + positions.to(embedded.device)).to(desc.dtype)
+                ones = torch.ones(desc.shape[:2], device=desc.device,
+                                  dtype=prompt_ids.attention_mask.dtype)
+                ctx["encoder_hidden_states"] = torch.cat([desc, prompt_hidden], dim=1)
+                ctx["encoder_attention_mask"] = torch.cat([ones, prompt_ids.attention_mask], dim=1)
+            else:
+                ctx["prompt_hidden_states"] = ar.embed_prompts(prompt_ids.input_ids).to(desc.dtype)
+                ctx["prompt_attention_mask"] = prompt_ids.attention_mask
+                ctx["offset"] = int(prompt_ids.input_ids.shape[1])
+            return ctx
+        except Exception as exc:
+            if self.verbose:
+                print(f"[Scorer] context build failed: {type(exc).__name__}: {exc}")
+            return None
+
+    # -- scoring -------------------------------------------------------------
+    def _head0(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.fused_heads:
+            logits = self.decoder.lm_heads(hidden)
+            logits = logits.view(*hidden.shape[:2], self.num_codebooks, self.vocab)
+            return logits[..., 0, :]
+        return self.decoder.lm_heads[0](hidden)
+
+    @torch.inference_mode()
+    def _forward_probs(
+        self, ctx: Dict[str, Any], prefix_cb0: np.ndarray, chunk_cb0: np.ndarray
+    ) -> Optional[np.ndarray]:
+        try:
+            tokens = np.concatenate([prefix_cb0, chunk_cb0]).astype(np.int64)
+            length = tokens.shape[0] + 1
+            ids = torch.full((self.num_codebooks, length), self.bos_id,
+                             dtype=torch.long, device=self.engine.device)
+            ids[0, 1:] = torch.from_numpy(tokens).to(self.engine.device)
+            kwargs: Dict[str, Any] = {
+                "input_ids": ids,
+                "encoder_hidden_states": ctx["encoder_hidden_states"],
+                "encoder_attention_mask": ctx.get("encoder_attention_mask"),
+                "use_cache": False,
+                "return_dict": True,
+            }
+            if not self.prompt_cross_attention and ctx.get("prompt_hidden_states") is not None:
+                kwargs["prompt_hidden_states"] = ctx["prompt_hidden_states"]
+                kwargs["prompt_attention_mask"] = ctx.get("prompt_attention_mask")
+            out = self.decoder(**kwargs)
+            logits = self._head0(out.last_hidden_state).float()
+            start = ctx.get("offset", 0) + prefix_cb0.shape[0]
+            logits = logits[start: start + chunk_cb0.shape[0]]
+            probs = torch.softmax(logits, dim=-1)
+            return probs.detach().cpu().numpy().astype(np.float32)
+        except Exception as exc:
+            if self.verbose:
+                print(f"[Scorer] forward failed: {type(exc).__name__}: {exc}")
+            self.available = False
+            self.reason = f"{type(exc).__name__}: {exc}"
+            return None
+
+    def _probe(self) -> None:
+        if self.decoder is None:
+            self.reason = "no decoder (Parler unavailable)"
+        else:
+            try:
+                ctx = self.build_context("வணக்கம்.")
+                if ctx is None:
+                    self.reason = "conditioning unavailable"
+                else:
+                    q = self._forward_probs(
+                        ctx, prefix_cb0=np.asarray([], dtype=np.int64),
+                        chunk_cb0=np.zeros(4, dtype=np.int64),
+                    )
+                    if q is not None and q.shape == (4, self.vocab):
+                        self.available = True
+                        self.reason = "ok"
+                    else:
+                        self.reason = f"unexpected probe output {None if q is None else q.shape}"
+            except Exception as exc:
+                self.reason = f"{type(exc).__name__}: {exc}"
+        if self.verbose:
+            status = "OK" if self.available else f"UNAVAILABLE ({self.reason})"
+            print(f"[Scorer] teacher-forced CB0 scoring: {status}")
+
+    def score(self, ctx: Optional[Dict[str, Any]], prefix_cb0: np.ndarray, chunk_cb0: np.ndarray) -> Optional[np.ndarray]:
+        if not self.available or ctx is None:
+            return None
+        return self._forward_probs(ctx, prefix_cb0, chunk_cb0)
+
+    @staticmethod
+    def synthetic_probs(n_frames: int, vocab: int, rng: np.random.RandomState) -> np.ndarray:
+        logits = rng.standard_normal((n_frames, vocab)).astype(np.float32)
+        logits -= logits.max(axis=-1, keepdims=True)
+        exp = np.exp(logits)
+        return (exp / exp.sum(axis=-1, keepdims=True)).astype(np.float32)
+
+
+# ===========================================================================
+# Speculative rejection sampling
+# ===========================================================================
+def rejection_sample(
+    target_probs: np.ndarray,
+    draft_probs: np.ndarray,
+    draft_tokens: np.ndarray,
+    rng: np.random.RandomState,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Per-frame rejection sampling with residual resampling."""
+    n = draft_tokens.shape[0]
+    kept = np.empty(n, dtype=np.int64)
+    accepted = np.zeros(n, dtype=bool)
+    n_resampled = 0
+    for t in range(n):
+        tok = int(draft_tokens[t])
+        q = float(target_probs[t, tok])
+        p = float(draft_probs[t, tok])
+        ratio = q / max(p, 1e-8)
+        if ratio >= 1.0 or rng.random_sample() <= ratio:
+            kept[t] = tok
+            accepted[t] = True
+        else:
+            residual = np.maximum(target_probs[t] - draft_probs[t], 0.0)
+            total = float(residual.sum())
+            if total > 1e-8:
+                kept[t] = int(rng.choice(residual.shape[0], p=residual / total))
+            else:
+                kept[t] = int(rng.choice(target_probs.shape[1], p=target_probs[t]))
+            n_resampled += 1
+    return kept, accepted, n_resampled
+
+
+def acceptance_rate(mask: Optional[np.ndarray]) -> Optional[float]:
+    if mask is None or mask.size == 0:
+        return None
+    return float(mask.mean() * 100.0)
+
+
+# ===========================================================================
+# Synthesis
+# ===========================================================================
+@dataclass
+class ChunkTelemetry:
+    idx: int
+    n_frames: int
+    verify_ms: float
+    residual_ms: float
+    dac_ms: float
+    ready_ms: float
+    accept_true: Optional[float]
+    accept_synth: Optional[float]
+
+
+def _decode_codes(audio_encoder, codes: torch.Tensor) -> Optional[np.ndarray]:
+    """Decodes (9, T) DAC codes through the Parler DAC wrapper."""
+    try:
+        inp = codes[None, None].long().to(audio_encoder.device)
+        out = audio_encoder.decode(audio_codes=inp, audio_scales=[None])
+        audio = out.audio_values
+        return audio.detach().float().cpu().numpy().reshape(-1)
+    except Exception:
+        try:
+            inp = codes[None, None].long().to(audio_encoder.device)
+            out = audio_encoder.decode(inp)
+            audio = out.audio_values if hasattr(out, "audio_values") else out[0]
+            return audio.detach().float().cpu().numpy().reshape(-1)
+        except Exception:
+            return None
+
+
+class EvalSynthesizer:
+    """Per-configuration synthesis with unified timing + acceptance telemetry."""
+
+    def __init__(self, args, config, engine, draft, residual, length_model, scorer, device,
+                 draft_trained: bool, residual_trained: bool):
+        self.args = args
+        self.config = config
+        self.engine = engine
+        self.draft = draft
+        self.residual = residual
+        self.length_model = length_model
+        self.scorer = scorer
+        self.device = device
+        self.draft_trained = draft_trained
+        self.residual_trained = residual_trained
+        self.sample_rate = config.audio.sample_rate
+        self.frames_per_chunk = int(config.audio.frames_per_chunk)
+        self.normalizer = TanglishNormalizer()
+        self._dac_fallback = None
+        self._speech_backend = bool(getattr(engine, "speech_available", False)) if engine else False
+
+    # -- shared helpers ------------------------------------------------------
+    def normalize(self, text: str) -> str:
+        return self.normalizer.normalize(text).normalized_text
+
+    def _prompt_clean(self, normalized: str) -> str:
+        s = normalized.strip()
+        if not s.endswith((".", "!", "?", "।")):
+            s += "."
+        return s
+
+    def _frames_for(self, normalized: str) -> int:
+        if self.length_model is not None:
+            return int(self.length_model.predict(normalized))
+        return int(min(430, max(30, round(len(normalized) * 86.13 / 13.0))))
+
+    def _postprocess(self, wave: np.ndarray) -> np.ndarray:
+        from codeswitch_tts.utils.audio import apply_highpass_filter, normalize_peak
+
+        wave = np.asarray(wave, dtype=np.float32).reshape(-1)
+        wave = apply_highpass_filter(
+            wave, cutoff_hz=self.config.audio.highpass_cutoff_hz, sample_rate=self.sample_rate
+        )
+        return normalize_peak(wave, target_peak=0.92)
+
+    def decode_codes(self, codes: torch.Tensor) -> np.ndarray:
+        codes = codes.detach().long().cpu()
+        if self._speech_backend:
+            audio = _decode_codes(self.engine.ar_model.audio_encoder, codes)
+            if audio is not None:
+                return audio
+        if self._dac_fallback is None:
+            from codeswitch_tts.utils.audio import AudioProcessor
+
+            self._dac_fallback = AudioProcessor(self.config.audio, dac_model=None)
+        return np.asarray(self._dac_fallback.decode_and_postprocess(codes.unsqueeze(0)), dtype=np.float32)
+
+    def _base_row(self, cfg: str, utt: Dict[str, str], utt_index: int, normalized: str) -> Dict[str, Any]:
+        return {
+            "schema": SCHEMA_VERSION,
+            "config": cfg,
+            "config_label": CONFIG_LABELS[cfg],
+            "utt_id": utt["id"],
+            "register": utt["register"],
+            "utt_index": utt_index,
+            "text": utt["text"],
+            "normalized_text": normalized,
+            "sample_rate": self.sample_rate,
+            "untrained_modules": bool(
+                (not self._speech_backend) or (not self.draft_trained) or (not self.residual_trained)
+            ),
+            "error": None,
+        }
+
+    # -- Config A: pure AR ---------------------------------------------------
+    def synth_A(self, utt: Dict[str, str], utt_index: int, seed: int) -> Tuple[Dict[str, Any], np.ndarray]:
+        normalized = self.normalize(utt["text"])
+        row = self._base_row("A", utt, utt_index, normalized)
+        if not self._speech_backend:
+            raise RuntimeError("Config A requires the Indic Parler-TTS backend.")
+
+        ar = self.engine.ar_model
+        prompt_clean = self._prompt_clean(normalized)
+        prompt_ids = self.engine.tokenizer(prompt_clean, return_tensors="pt").to(self.device)
+        from transformers.modeling_outputs import BaseModelOutput
+
+        desc = self.engine.get_cached_description_encoder_outputs(self.engine.config.voice_description)
+        encoder_outputs = BaseModelOutput(last_hidden_state=desc)
+
+        frame_rate = float(getattr(ar.audio_encoder.config, "frame_rate", 86.13))
+        est_sec = max(1.5, len(prompt_clean) / float(self.config.speculative.chars_per_sec))
+        min_tokens = max(15, int(frame_rate * est_sec * 0.85))
+        max_tokens = max(30, int(frame_rate * est_sec * 1.5))
+        set_seed(seed)
+
+        gen_kwargs = dict(
+            encoder_outputs=encoder_outputs,
+            prompt_input_ids=prompt_ids.input_ids,
+            prompt_attention_mask=prompt_ids.attention_mask,
+            do_sample=True,
+            temperature=self.config.speculative.temperature,
+            min_new_tokens=min_tokens,
+            max_new_tokens=max_tokens,
+        )
+
+        chunks: List[np.ndarray] = []
+        try:
+            from parler_tts import ParlerTTSStreamer
+        except Exception:
+            ParlerTTSStreamer = None  # type: ignore
+
+        t0 = _now()
+        ttfa_e2e_ms: Optional[float] = None
+        ttfa_compute_only_ms: Optional[float] = None
+        note = None
+        if ParlerTTSStreamer is not None:
+            class _TimedStreamer(ParlerTTSStreamer):
+                """Official streamer + timestamps for component-compute latency.
+
+                ``t_gen_start`` is stamped right before ``generate()`` runs;
+                ``t_first_decode`` right after the first in-loop DAC decode
+                (i.e. when the first audio buffer becomes available).
+                """
+
+                def __init__(self, *a, **kw):
+                    super().__init__(*a, **kw)
+                    self.t_gen_start: Optional[float] = None
+                    self.t_first_decode: Optional[float] = None
+
+                def put(self, value):
+                    super().put(value)
+                    if (self.t_first_decode is None and self.to_yield > 0
+                            and self.t_gen_start is not None):
+                        self.t_first_decode = _now()
+
+            streamer = _TimedStreamer(
+                ar, device=self.device, play_steps=int(self.args.play_steps), timeout=900
+            )
+            error_box: List[BaseException] = []
+
+            def _generate():
+                try:
+                    with torch.inference_mode():
+                        streamer.t_gen_start = _now()
+                        ar.generate(**gen_kwargs, streamer=streamer)
+                except BaseException as exc:  # pragma: no cover
+                    error_box.append(exc)
+                    try:
+                        streamer.audio_queue.put(streamer.stop_signal)
+                    except Exception:
+                        pass
+
+            thread = threading.Thread(target=_generate, daemon=True)
+            thread.start()
+            for audio_chunk in streamer:
+                if ttfa_e2e_ms is None:
+                    cuda_sync(self.device)
+                    ttfa_e2e_ms = (_now() - t0) * 1000.0
+                chunks.append(np.asarray(audio_chunk, dtype=np.float32))
+            thread.join(timeout=900)
+            total_ms = (_now() - t0) * 1000.0
+            if error_box:
+                raise RuntimeError(f"Parler streamer generation failed: {error_box[0]}")
+            if streamer.t_first_decode is not None and streamer.t_gen_start is not None:
+                ttfa_compute_only_ms = (streamer.t_first_decode - streamer.t_gen_start) * 1000.0
+        else:
+            with torch.inference_mode():
+                out = ar.generate(**gen_kwargs)
+            audio = out.detach().float().cpu().numpy()
+            while audio.ndim > 1:
+                audio = audio[0]
+            chunks = [audio]
+            total_ms = (_now() - t0) * 1000.0
+            ttfa_e2e_ms = total_ms
+            note = "ParlerTTSStreamer unavailable: full-generation fallback"
+
+        if not chunks:
+            raise RuntimeError("Parler produced no audio.")
+        wave = self._postprocess(np.concatenate(chunks))
+        audio_sec = len(wave) / self.sample_rate
+        row.update({
+            "ttfa_compute_ms": ttfa_compute_only_ms,
+            "ttfa_e2e_ms": ttfa_e2e_ms,
+            "total_ms": total_ms,
+            "audio_sec": audio_sec,
+            "rtf": (total_ms / 1000.0) / max(audio_sec, 1e-3),
+            "draft_ms": None,
+            "verify_ms_total": None,
+            "residual_ms_total": None,
+            "dac_ms_total": None,
+            "accept_true": None,
+            "accept_synth": None,
+            "n_frames": None,
+            "zone_stats": {},
+            "chunks": [],
+            "verify_mode": "none",
+            "seed": seed,
+            "note": note,
+        })
+        return row, wave
+
+    # -- Configs B & C -------------------------------------------------------
+    def _chunked_synthesis(self, utt: Dict[str, str], utt_index: int, seed: int,
+                           verify: bool) -> Tuple[Dict[str, Any], np.ndarray]:
+        cfg = "C" if verify else "B"
+        normalized = self.normalize(utt["text"])
+        row = self._base_row(cfg, utt, utt_index, normalized)
+        prompt_clean = self._prompt_clean(normalized)
+        n_frames = self._frames_for(normalized)
+
+        # Zone instrumentation
+        norm_res = self.normalizer.normalize(utt["text"])
+        transit_spans = find_transit_spans(norm_res.normalized_text, norm_res.entity_replacements)
+        char_zones = label_char_zones(norm_res.normalized_text, transit_spans)
+        frame_zones, n_transitions = assign_frame_zones(
+            char_zones, n_frames, boundary_frames=int(self.args.boundary_frames)
+        )
+
+        ctx = self.scorer.build_context(prompt_clean) if (verify and self.scorer is not None) else None
+        rng_accept = np.random.RandomState(seed)
+        seed_synth_rng = seed + 1000
+
+        t0 = _now()
+        cuda_sync(self.device)
+
+        # 1. Draft the full CB0 sequence (single NAR pass)
+        with torch.inference_mode():
+            draft_out = self.draft.generate_chunk(
+                text=normalized, num_frames=n_frames, temperature=1.0, device=self.device
+            )
+        cuda_sync(self.device)
+        draft_ms = (_now() - t0) * 1000.0
+        draft_tokens = draft_out.tokens[0].detach().cpu().numpy().astype(np.int64)
+        draft_probs_all = draft_out.probabilities[0].detach().float().cpu().numpy()
+
+        waves: List[np.ndarray] = []
+        accept_true_parts: List[np.ndarray] = []
+        accept_synth_parts: List[np.ndarray] = []
+        telemetry: List[ChunkTelemetry] = []
+        prefix = np.asarray([], dtype=np.int64)
+        verify_ms_total = 0.0
+        residual_ms_total = 0.0
+        dac_ms_total = 0.0
+        ttfa_compute_ms: Optional[float] = None
+        ttfa_e2e_ms: Optional[float] = None
+        verify_mode = "none"
+
+        for chunk_idx, chunk_start in enumerate(range(0, n_frames, self.frames_per_chunk)):
+            chunk_end = min(n_frames, chunk_start + self.frames_per_chunk)
+            chunk_tokens = draft_tokens[chunk_start:chunk_end]
+            chunk_probs = draft_probs_all[chunk_start:chunk_end]
+            c_chunk = int(chunk_tokens.shape[0])
+
+            kept = chunk_tokens
+            accepted_true: Optional[np.ndarray] = None
+            accepted_synth: Optional[np.ndarray] = None
+            verify_ms = 0.0
+
+            if verify:
+                t_v = _now()
+                cuda_sync(self.device)
+                q_true = self.scorer.score(ctx, prefix, chunk_tokens) if self.scorer is not None else None
+                if q_true is not None:
+                    kept, accepted_true, _ = rejection_sample(q_true, chunk_probs, chunk_tokens, rng_accept)
+                    verify_mode = "true"
+                else:
+                    verify_mode = "synthetic"
+                # Synthetic-target telemetry (always computed for fig2/table)
+                q_synth = TeacherForcedScorer.synthetic_probs(
+                    c_chunk, self.vocab_size, np.random.RandomState(seed_synth_rng)
+                )
+                seed_synth_rng += 1
+                _, accepted_synth, _ = rejection_sample(
+                    q_synth, chunk_probs, chunk_tokens, np.random.RandomState(seed_synth_rng)
+                )
+                seed_synth_rng += 1
+                if q_true is None:
+                    kept, _, _ = rejection_sample(
+                        q_synth, chunk_probs, chunk_tokens, np.random.RandomState(seed_synth_rng)
+                    )
+                    seed_synth_rng += 1
+                cuda_sync(self.device)
+                verify_ms = (_now() - t_v) * 1000.0
+                verify_ms_total += verify_ms
+
+            # residual + DAC (chunk-wise; matches residual training windows)
+            t_r = _now()
+            cuda_sync(self.device)
+            with torch.inference_mode():
+                res_out = self.residual(
+                    cb0_tokens=torch.from_numpy(kept).unsqueeze(0).to(self.device),
+                    temperature=1.0,
+                    sample=True,
+                )
+            cuda_sync(self.device)
+            residual_ms = (_now() - t_r) * 1000.0
+            residual_ms_total += residual_ms
+
+            t_d = _now()
+            cuda_sync(self.device)
+            wave_chunk = self.decode_codes(res_out.full_codebooks[0])
+            cuda_sync(self.device)
+            dac_ms = (_now() - t_d) * 1000.0
+            dac_ms_total += dac_ms
+
+            ready_ms = (_now() - t0) * 1000.0
+            waves.append(np.asarray(wave_chunk, dtype=np.float32))
+            if accepted_true is not None:
+                accept_true_parts.append(accepted_true)
+            if accepted_synth is not None:
+                accept_synth_parts.append(accepted_synth)
+            telemetry.append(ChunkTelemetry(
+                idx=chunk_idx,
+                n_frames=c_chunk,
+                verify_ms=verify_ms,
+                residual_ms=residual_ms,
+                dac_ms=dac_ms,
+                ready_ms=ready_ms,
+                accept_true=acceptance_rate(accepted_true),
+                accept_synth=acceptance_rate(accepted_synth),
+            ))
+            if ttfa_e2e_ms is None:
+                ttfa_e2e_ms = ready_ms
+                ttfa_compute_ms = draft_ms + telemetry[0].verify_ms + residual_ms + dac_ms
+            prefix = np.concatenate([prefix, kept])
+
+        total_ms = (_now() - t0) * 1000.0
+
+        # assemble audio
+        from codeswitch_tts.utils.audio import crossfade_chunks
+
+        if not waves:
+            wave = np.zeros(self.sample_rate, dtype=np.float32)
+        else:
+            wave = waves[0]
+            for nxt in waves[1:]:
+                wave = crossfade_chunks(wave, nxt, crossfade_samples=self.config.audio.crossfade_samples)
+        wave = self._postprocess(wave)
+        audio_sec = len(wave) / self.sample_rate
+
+        accept_true = np.concatenate(accept_true_parts) if accept_true_parts else None
+        accept_synth = np.concatenate(accept_synth_parts) if accept_synth_parts else None
+
+        row.update({
+            "ttfa_compute_ms": ttfa_compute_ms,
+            "ttfa_e2e_ms": ttfa_e2e_ms,
+            "total_ms": total_ms,
+            "audio_sec": audio_sec,
+            "rtf": (total_ms / 1000.0) / max(audio_sec, 1e-3),
+            "draft_ms": draft_ms,
+            "verify_ms_total": verify_ms_total,
+            "residual_ms_total": residual_ms_total,
+            "dac_ms_total": dac_ms_total,
+            "accept_true": acceptance_rate(accept_true),
+            "accept_synth": acceptance_rate(accept_synth),
+            "n_frames": int(n_frames),
+            "n_transitions": int(n_transitions),
+            "chunks": [asdict(t) for t in telemetry],
+            "verify_mode": verify_mode,
+            "seed": seed,
+        })
+        self._attach_zone_stats(row, frame_zones, accept_true, accept_synth)
+        return row, wave
+
+    def _attach_zone_stats(self, row, frame_zones, accept_true, accept_synth) -> None:
+        zone_stats: Dict[str, Dict[str, Any]] = {}
+        for zone in ZONE_ORDER:
+            idx = np.where(frame_zones == zone)[0]
+            entry: Dict[str, Any] = {"n_frames": int(idx.size)}
+            if accept_true is not None and idx.size:
+                entry["accept_true"] = float(accept_true[idx].mean() * 100.0)
+            if accept_synth is not None and idx.size:
+                entry["accept_synth"] = float(accept_synth[idx].mean() * 100.0)
+            zone_stats[str(zone)] = entry
+        row["zone_stats"] = zone_stats
+
+    @property
+    def vocab_size(self) -> int:
+        if self.scorer is not None and self.scorer.vocab:
+            return int(self.scorer.vocab)
+        return 1024
+
+
+# ===========================================================================
+# ASR / intelligibility
+# ===========================================================================
+class ASREvaluator:
+    def __init__(self, model_id: str, device, enabled: bool = True, verbose: bool = True):
+        self.model_id = model_id
+        self.available = False
+        self.reason = "disabled" if not enabled else "not initialised"
+        self.pipe = None
+        if not enabled:
+            if verbose:
+                print("[ASR] disabled (--skip-asr)")
+            return
+        try:
+            from transformers import pipeline
+
+            device_arg = 0 if str(device).startswith("cuda") else -1
+            pipe_kwargs: Dict[str, Any] = {}
+            if device_arg == 0:
+                # fp16 halves the transcription time on T4 (transformers 4.46 API)
+                pipe_kwargs["torch_dtype"] = torch.float16
+            self.pipe = pipeline(
+                task="automatic-speech-recognition",
+                model=model_id,
+                device=device_arg,
+                **pipe_kwargs,
+            )
+            self.available = True
+            self.reason = "ok"
+            if verbose:
+                print(f"[ASR] loaded {model_id} (device={device_arg})")
+        except Exception as exc:
+            self.reason = f"{type(exc).__name__}: {exc}"
+            if verbose:
+                print(f"[ASR] ⚠ could not load {model_id}: {self.reason}")
+                print("[ASR]   latency/acceptance metrics continue; CER/WER will be absent.")
+
+    def transcribe(self, wave: np.ndarray, sample_rate: int) -> Optional[str]:
+        if not self.available or self.pipe is None:
+            return None
+        try:
+            result = self.pipe(
+                {"array": np.asarray(wave, dtype=np.float32), "sampling_rate": sample_rate},
+                generate_kwargs={"language": "ta", "task": "transcribe"},
+            )
+            if isinstance(result, list):
+                result = result[0]
+            return str(result.get("text", "")).strip()
+        except Exception as exc:
+            print(f"[ASR] transcription failed: {type(exc).__name__}: {exc}")
+            return None
+
+    @staticmethod
+    def score(reference: str, hypothesis: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+        if hypothesis is None:
+            return None, None
+        try:
+            import jiwer
+        except Exception:
+            return None, None
+        ref = clean_for_cer(reference)
+        hyp = clean_for_cer(hypothesis)
+        if not ref:
+            return None, None
+        try:
+            cer = float(jiwer.cer(ref, hyp))
+        except Exception:
+            cer = None
+        try:
+            wer = float(jiwer.wer(ref, hyp))
+        except Exception:
+            wer = None
+        return cer, wer
+
+
+# ===========================================================================
+# Aggregation
+# ===========================================================================
+def _stats(values: Sequence[Optional[float]]) -> Dict[str, Optional[float]]:
+    v = [float(x) for x in values if x is not None and np.isfinite(x)]
+    if not v:
+        return {"n": 0, "mean": None, "std": None, "p50": None, "p90": None}
+    return {
+        "n": len(v),
+        "mean": float(np.mean(v)),
+        "std": float(np.std(v, ddof=0)),
+        "p50": float(np.percentile(v, 50)),
+        "p90": float(np.percentile(v, 90)),
+    }
+
+
+def aggregate_zones(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    for zone in ZONE_ORDER:
+        frames = 0
+        sum_true = 0.0
+        den_true = 0
+        sum_synth = 0.0
+        den_synth = 0
+        per_utt_true: List[float] = []
+        per_utt_synth: List[float] = []
+        for r in rows:
+            z = (r.get("zone_stats") or {}).get(str(zone))
+            if not z or not z.get("n_frames"):
+                continue
+            frames += int(z["n_frames"])
+            if z.get("accept_true") is not None:
+                sum_true += float(z["accept_true"]) * int(z["n_frames"])
+                den_true += int(z["n_frames"])
+                per_utt_true.append(float(z["accept_true"]))
+            if z.get("accept_synth") is not None:
+                sum_synth += float(z["accept_synth"]) * int(z["n_frames"])
+                den_synth += int(z["n_frames"])
+                per_utt_synth.append(float(z["accept_synth"]))
+        out[str(zone)] = {
+            "n_frames": frames,
+            "accept_true": (sum_true / den_true) if den_true else None,
+            "accept_true_std": float(np.std(per_utt_true, ddof=0)) if per_utt_true else None,
+            "accept_true_utts": len(per_utt_true),
+            "accept_synth": (sum_synth / den_synth) if den_synth else None,
+            "accept_synth_std": float(np.std(per_utt_synth, ddof=0)) if per_utt_synth else None,
+            "accept_synth_utts": len(per_utt_synth),
+        }
+    return out
+
+
+def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    agg: Dict[str, Dict[str, Any]] = {}
+    for cfg in configs:
+        ok = [r for r in rows if r.get("config") == cfg and not r.get("error")]
+        err = [r for r in rows if r.get("config") == cfg and r.get("error")]
+        if not ok:
+            agg[cfg] = {"n": 0, "errors": len(err)}
+            continue
+        first = min(ok, key=lambda r: r.get("utt_index", 0))
+        warm = [r for r in ok if r is not first]
+        agg[cfg] = {
+            "n": len(ok),
+            "errors": len(err),
+            "ttfa_compute": _stats([r.get("ttfa_compute_ms") for r in ok]),
+            "ttfa_e2e": _stats([r.get("ttfa_e2e_ms") for r in ok]),
+            "ttfa_compute_cold": first.get("ttfa_compute_ms"),
+            "ttfa_e2e_cold": first.get("ttfa_e2e_ms"),
+            "ttfa_compute_warm": _stats([r.get("ttfa_compute_ms") for r in warm]),
+            "ttfa_e2e_warm": _stats([r.get("ttfa_e2e_ms") for r in warm]),
+            "total": _stats([r.get("total_ms") for r in ok]),
+            "rtf": _stats([r.get("rtf") for r in ok]),
+            "audio_sec": _stats([r.get("audio_sec") for r in ok]),
+            "accept_true": _stats([r.get("accept_true") for r in ok]),
+            "accept_synth": _stats([r.get("accept_synth") for r in ok]),
+            "cer": _stats([r.get("cer") for r in ok]),
+            "wer": _stats([r.get("wer") for r in ok]),
+            "verify_modes": sorted({str(r.get("verify_mode")) for r in ok}),
+            "zones": aggregate_zones(ok),
+        }
+    return agg
+
+
+# ===========================================================================
+# Persistence
+# ===========================================================================
+def load_results(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def save_results(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+# ===========================================================================
+# Figures (IEEE style)
+# ===========================================================================
+def _ieee_style():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+        "font.size": 10,
+        "axes.labelsize": 10,
+        "axes.titlesize": 10,
+        "legend.fontsize": 8.5,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "axes.grid": True,
+        "grid.alpha": 0.35,
+        "grid.linewidth": 0.4,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.dpi": 120,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.02,
+    })
+    return plt
+
+
+def _save_fig(fig, out_dir: Path, stem: str) -> List[str]:
+    png = out_dir / f"{stem}.png"
+    pdf = out_dir / f"{stem}.pdf"
+    fig.savefig(png, dpi=300, bbox_inches="tight")
+    fig.savefig(pdf, bbox_inches="tight")
+    return [str(png), str(pdf)]
+
+
+def figure1_latency_quality(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Optional[List[str]]:
+    """Fig. 1: latency vs. quality tradeoff (TTFA + CER)."""
+    try:
+        plt = _ieee_style()
+    except Exception as exc:
+        print(f"[Figures] matplotlib unavailable: {exc}")
+        return None
+    configs = [c for c in ("A", "B", "C") if agg.get(c, {}).get("n")]
+    if not configs:
+        return None
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.7))
+    x = np.arange(len(configs))
+    width = 0.36
+
+    def _p50(cfg, key):
+        return agg[cfg].get(key, {}).get("p50")
+
+    compute = [_p50(c, "ttfa_compute") for c in configs]
+    e2e = [_p50(c, "ttfa_e2e") for c in configs]
+    xs = x
+    bars1 = axes[0].bar(xs - width / 2, [np.nan if v is None else v for v in compute], width,
+                        label="Component compute (p50)", color="#9467bd", alpha=0.9)
+    bars2 = axes[0].bar(xs + width / 2, [np.nan if v is None else v for v in e2e], width,
+                        label="End-to-end streamer (p50)", color="#1f77b4", alpha=0.9)
+    axes[0].set_xticks(xs)
+    axes[0].set_xticklabels([CONFIG_LABELS[c].split(" (")[0].replace("Pure ", "") for c in configs])
+    axes[0].set_ylabel("TTFA (ms)")
+    axes[0].set_title("(a) Time-to-first-audio")
+    valid = [v for v in compute + e2e if v is not None and v > 0]
+    if valid:
+        if max(valid) / max(min(valid), 1.0) > 15:
+            axes[0].set_yscale("log")
+            axes[0].set_ylim(min(valid) * 0.5, max(valid) * 2.2)
+        else:
+            axes[0].set_ylim(0, max(valid) * 1.35)
+        for rect, val in list(zip(bars1, compute)) + list(zip(bars2, e2e)):
+            if val is None:
+                continue
+            axes[0].annotate(f"{val:.0f}", (rect.get_x() + rect.get_width() / 2, val),
+                             textcoords="offset points", xytext=(0, 3), ha="center", fontsize=8)
+    axes[0].legend(loc="upper right", frameon=False)
+
+    cer_means = [agg[c].get("cer", {}).get("mean") for c in configs]
+    cer_stds = [agg[c].get("cer", {}).get("std") or 0.0 for c in configs]
+    cer_pct = [None if v is None else v * 100.0 for v in cer_means]
+    if any(v is not None for v in cer_pct):
+        axes[1].bar(xs, [np.nan if v is None else v for v in cer_pct], 0.55,
+                    yerr=[np.nan if v is None else s * 100.0 for v, s in zip(cer_pct, cer_stds)],
+                    capsize=3, color=[CONFIG_COLORS[c] for c in configs], alpha=0.9)
+        for xi, val in zip(xs, cer_pct):
+            if val is not None:
+                axes[1].annotate(f"{val:.1f}%", (xi, val), textcoords="offset points",
+                                 xytext=(0, 3), ha="center", fontsize=8)
+    else:
+        axes[1].text(0.5, 0.5, "ASR disabled\n(--skip-asr or model load failure)",
+                     ha="center", va="center", transform=axes[1].transAxes, fontsize=9)
+    axes[1].set_xticks(xs)
+    axes[1].set_xticklabels([CONFIG_LABELS[c].split(" (")[0].replace("Pure ", "") for c in configs])
+    axes[1].set_ylabel("CER (lower is better)")
+    axes[1].set_title("(b) Intelligibility")
+    fig.tight_layout()
+    paths = _save_fig(fig, out_dir, "fig1_latency_quality_tradeoff")
+    plt.close(fig)
+    return paths
+
+
+def figure2_zone_acceptance(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Optional[List[str]]:
+    """Fig. 2: Codebook-0 acceptance across linguistic zones (C config)."""
+    try:
+        plt = _ieee_style()
+    except Exception as exc:
+        print(f"[Figures] matplotlib unavailable: {exc}")
+        return None
+    c_agg = agg.get("C", {})
+    zones = c_agg.get("zones") or {}
+    if not zones or all((zones.get(str(z)) or {}).get("accept_true") is None for z in ZONE_ORDER):
+        return None
+    fig, ax = plt.subplots(figsize=(3.5, 2.6))
+    x = np.arange(len(ZONE_ORDER))
+    width = 0.38
+    true_vals, true_errs, synth_vals, synth_errs = [], [], [], []
+    for zone in ZONE_ORDER:
+        z = zones.get(str(zone)) or {}
+        true_vals.append(z.get("accept_true"))
+        true_errs.append(z.get("accept_true_std") or 0.0)
+        synth_vals.append(z.get("accept_synth"))
+        synth_errs.append(z.get("accept_synth_std") or 0.0)
+
+    def _plot_bars(offset, vals, errs, color, label, hatch=None):
+        ax.bar(x + offset, [np.nan if v is None else v for v in vals], width,
+               yerr=[0 if v is None else e for v, e in zip(vals, errs)], capsize=3,
+               color=color, alpha=0.9, label=label, hatch=hatch, edgecolor="black", linewidth=0.4)
+
+    _plot_bars(-width / 2, true_vals, true_errs, "#2ca02c", "True target (Parler P)", None)
+    _plot_bars(+width / 2, synth_vals, synth_errs, "#ff7f0e", "Synthetic target (UB)", "//")
+    ax.set_xticks(x)
+    ax.set_xticklabels([ZONE_NAMES[z].replace(" ", "\n") for z in ZONE_ORDER], fontsize=8)
+    ax.set_ylabel("CB0 acceptance (%)")
+    ax.set_ylim(0, 105)
+    ax.legend(loc="lower left", frameon=False, fontsize=7.5)
+    b_idx = 3  # cross-lingual boundary
+    if true_vals[b_idx] is not None:
+        base = [v for i, v in enumerate(true_vals) if v is not None and i != b_idx]
+        if base:
+            drop = true_vals[b_idx] - float(np.mean(base))
+            ax.annotate(
+                f"{drop:+.1f} pts",
+                xy=(b_idx - width / 2, true_vals[b_idx]),
+                xytext=(b_idx - 1.5, max(5.0, true_vals[b_idx] + 25)),
+                fontsize=8, arrowprops=dict(arrowstyle="->", linestyle="--", color="#d62728"),
+                color="#d62728",
+            )
+    fig.tight_layout()
+    paths = _save_fig(fig, out_dir, "fig2_boundary_acceptance_breakdown")
+    plt.close(fig)
+    return paths
+
+
+def figure3_stream_timeline(rows: List[Dict[str, Any]], out_dir: Path, target_sec: float = 3.0) -> Optional[List[str]]:
+    """Fig. 3: streaming chunk synthesis vs. playback buffer (representative C run)."""
+    try:
+        plt = _ieee_style()
+    except Exception as exc:
+        print(f"[Figures] matplotlib unavailable: {exc}")
+        return None
+    candidates = [
+        r for r in rows
+        if r.get("config") == "C" and not r.get("error") and r.get("chunks")
+        and r.get("audio_sec") and r.get("total_ms")
+    ]
+    if not candidates:
+        return None
+    rep = min(candidates, key=lambda r: abs(float(r["audio_sec"]) - target_sec))
+    chunks = rep["chunks"]
+    draft_ms = float(rep.get("draft_ms") or 0.0)
+
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=(7.0, 3.6), sharex=True, gridspec_kw={"height_ratios": [2.0, 1.0]}
+    )
+    colors = {"draft": "#7f7f7f", "verify": "#1f77b4", "residual": "#ff7f0e", "dac": "#2ca02c"}
+
+    # --- top: synthesis Gantt ---
+    for i, ch in enumerate(chunks):
+        dac_ms = float(ch.get("dac_ms") or 0.0)
+        res_ms = float(ch.get("residual_ms") or 0.0)
+        ver_ms = float(ch.get("verify_ms") or 0.0)
+        ready = float(ch.get("ready_ms") or 0.0)
+        dac_start = ready - dac_ms
+        res_start = dac_start - res_ms
+        ver_start = res_start - ver_ms
+        y = i
+        if ver_ms > 0:
+            ax_top.barh(y, ver_ms, left=ver_start, height=0.62, color=colors["verify"], edgecolor="black", linewidth=0.3)
+        ax_top.barh(y, res_ms, left=res_start, height=0.62, color=colors["residual"], edgecolor="black", linewidth=0.3)
+        ax_top.barh(y, dac_ms, left=dac_start, height=0.62, color=colors["dac"], edgecolor="black", linewidth=0.3)
+        if i == 0 and draft_ms > 0:
+            ax_top.barh(y, draft_ms, left=0.0, height=0.62, color=colors["draft"], edgecolor="black", linewidth=0.3)
+    # playback lane
+    play_lane = len(chunks)
+    play_time = None
+    for i, ch in enumerate(chunks):
+        dur_ms = float(ch.get("n_frames") or 0) / 86.1328 * 1000.0
+        ready = float(ch.get("ready_ms") or 0.0)
+        start = ready if play_time is None else max(play_time, ready)
+        ax_top.barh(play_lane, dur_ms, left=start, height=0.62, color="#c7c7c7", edgecolor="black", linewidth=0.3)
+        play_time = start + dur_ms
+    ttfa = float(rep.get("ttfa_e2e_ms") or (chunks[0].get("ready_ms") or 0.0))
+    ax_top.axvline(ttfa, color="#d62728", linestyle="--", linewidth=1.0)
+    ax_top.annotate(f"TTFA {ttfa:.0f} ms", xy=(ttfa, play_lane), xytext=(ttfa + 60, play_lane - 0.2),
+                    fontsize=8, color="#d62728")
+    ax_top.set_yticks(list(range(len(chunks) + 1)))
+    ax_top.set_yticklabels([f"Chunk {i + 1}" for i in range(len(chunks))] + ["Playback"])
+    ax_top.set_ylabel("Pipeline stage")
+    ax_top.set_ylim(-0.7, play_lane + 1.25)
+    ax_top.set_title(
+        f"Streaming synthesis vs. playback — {rep['utt_id']} "
+        f"({REGISTER_LABELS.get(rep['register'], rep['register'])}), "
+        f"{float(rep['audio_sec']):.2f}s audio"
+    )
+    from matplotlib.patches import Patch
+
+    ax_top.legend(handles=[
+        Patch(facecolor=colors["draft"], edgecolor="black", label="Draft (CB0 NAR)"),
+        Patch(facecolor=colors["verify"], edgecolor="black", label="Verify (AR)"),
+        Patch(facecolor=colors["residual"], edgecolor="black", label="Residual (CB1–8)"),
+        Patch(facecolor=colors["dac"], edgecolor="black", label="DAC decode"),
+        Patch(facecolor="#c7c7c7", edgecolor="black", label="Playback"),
+    ], loc="upper right", frameon=False, fontsize=7.5, ncol=2)
+
+    # --- bottom: buffer occupancy (ms of audio ready but unplayed) ---
+    total_ms = float(rep.get("total_ms") or 0.0)
+    horizon = max(total_ms + 1500.0, (play_time or 0.0) + 250.0)
+    ts = np.linspace(0, horizon, 600)
+    ready = np.zeros_like(ts)
+    for ch in chunks:
+        dur_ms = float(ch.get("n_frames") or 0) / 86.1328 * 1000.0
+        ready += (ts >= float(ch.get("ready_ms") or 0.0)) * dur_ms
+    played = np.clip(ts - ttfa, 0.0, play_time - ttfa if play_time else 0.0)
+    buffer_ms = ready - played
+    ax_bot.fill_between(ts, buffer_ms, 0, where=buffer_ms >= 0, color="#2ca02c", alpha=0.35)
+    ax_bot.fill_between(ts, buffer_ms, 0, where=buffer_ms < 0, color="#d62728", alpha=0.35)
+    ax_bot.axhline(0, color="black", linewidth=0.6)
+    ax_bot.set_xlabel("Wall-clock time since synthesis start (ms)")
+    ax_bot.set_ylabel("Buffer (ms)")
+    if (buffer_ms >= 0).all():
+        ax_bot.annotate("no underrun", xy=(0.99, 0.82), xycoords="axes fraction",
+                        ha="right", fontsize=8, color="#2ca02c")
+    fig.tight_layout()
+    paths = _save_fig(fig, out_dir, "fig3_streaming_chunk_timeline")
+    plt.close(fig)
+    return paths
+
+
+# ===========================================================================
+# LaTeX tables
+# ===========================================================================
+def _tex(value: Optional[float], digits: int = 1, suffix: str = "") -> str:
+    if value is None:
+        return "--"
+    return f"{value:.{digits}f}{suffix}"
+
+
+def _pm(stat: Dict[str, Optional[float]], digits: int = 1, suffix: str = "") -> str:
+    if not stat or stat.get("mean") is None:
+        return "--"
+    if stat.get("std") is None:
+        return _tex(stat["mean"], digits, suffix)
+    return f"{stat['mean']:.{digits}f}$\\pm${stat['std']:.{digits}f}{suffix}"
+
+
+def _mean_pm(entry: Dict[str, Any], key: str, digits: int = 1) -> str:
+    """Formats 'mean $\\pm$ std' for an acceptance entry (or '--')."""
+    mean = entry.get(key)
+    if mean is None:
+        return "--"
+    std = entry.get(key + "_std") or 0.0
+    return f"{mean:.{digits}f}$\\pm${std:.{digits}f}"
+
+
+def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
+    lines = [
+        "% Table I: comparative performance (mean $\\pm$ std unless p50/p90 noted)",
+        "\\begin{table*}[t]",
+        "\\centering",
+        "\\caption{Comparative evaluation of Pure AR, Pure NAR and the proposed CodeSwitch-TTS "
+        "hybrid on the 60-utterance Tanglish benchmark (Kaggle T4, fp16). "
+        "TTFA-c: component compute latency; TTFA-e2e: wall-clock to first audio buffer.}",
+        "\\label{tab:comparison}",
+        "\\begin{tabular}{lcccccccc}",
+        "\\toprule",
+        "Architecture & TTFA-c p50 (ms) & TTFA-c p90 (ms) & TTFA-e2e p50 (ms) & Total (s) & RTF "
+        "& CER (\\%) & CB0 acc. true (\\%) & CB0 acc. synth (\\%) \\\\",
+        "\\midrule",
+    ]
+    for cfg in ("A", "B", "C"):
+        a = agg.get(cfg) or {}
+        if not a.get("n"):
+            continue
+        ttfa_c = a.get("ttfa_compute") or {}
+        ttfa_e = a.get("ttfa_e2e") or {}
+        total = (a.get("total") or {}).get("mean")
+        cer_stat = a.get("cer") or {}
+        cer_pct = None if cer_stat.get("mean") is None else float(cer_stat["mean"]) * 100.0
+        cells = [
+            CONFIG_LABELS[cfg],
+            _tex(ttfa_c.get("p50"), 0),
+            _tex(ttfa_c.get("p90"), 0),
+            _tex(ttfa_e.get("p50"), 0),
+            _tex(None if total is None else total / 1000.0, 2),
+            _tex((a.get("rtf") or {}).get("mean"), 2),
+            _tex(cer_pct, 1),
+            _pm(a.get("accept_true") or {}),
+            _pm(a.get("accept_synth") or {}),
+        ]
+        lines.append(" & ".join(cells) + " \\\\")
+    lines += [
+        "\\bottomrule",
+        "\\end{tabular}",
+        "\\vspace{2pt}",
+        "\\footnotesize{True = teacher-forced Parler target; synth = synthetic-target telemetry. "
+        "Config A has no draft/verification stage (acc. n/a); its TTFA-c is the time from decoder "
+        "start to the first decoded audio buffer. CER reference: normalised Tamil-script text.}",
+        "\\end{table*}",
+    ]
+    return "\n".join(lines)
+
+
+def build_table_II(agg: Dict[str, Dict[str, Any]]) -> str:
+    zones = (agg.get("C") or {}).get("zones") or {}
+    lines = [
+        "% Table II: Codebook-0 acceptance per linguistic zone (Config C)",
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Speculative Codebook-0 acceptance by linguistic zone for CodeSwitch-TTS "
+        "(mean $\\pm$ std across utterances).}",
+        "\\label{tab:zones}",
+        "\\begin{tabular}{lcccc}",
+        "\\toprule",
+        "Linguistic zone & Frames & CB0 acc. true (\\%) & CB0 acc. synth (\\%) & $\\Delta$ true (pts) \\\\",
+        "\\midrule",
+    ]
+    base = None
+    for zone in ZONE_ORDER:
+        z = zones.get(str(zone)) or {}
+        if zone == ZONE_TAMIL:
+            base = z.get("accept_true")
+        delta = None
+        if z.get("accept_true") is not None and base is not None:
+            delta = float(z["accept_true"]) - float(base)
+        cells = [
+            ZONE_NAMES[zone],
+            str(z.get("n_frames", 0)),
+            _mean_pm(z, "accept_true"),
+            _mean_pm(z, "accept_synth"),
+            "--" if delta is None else f"{delta:+.1f}",
+        ]
+        lines.append(" & ".join(cells) + " \\\\")
+    lines += [
+        "\\bottomrule",
+        "\\end{tabular}",
+        "\\end{table}",
+    ]
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="CodeSwitch-TTS full evaluation suite (60-utterance benchmark, figures, LaTeX).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--ckpt", type=str, default="codeswitch_ckpt",
+                   help="Checkpoint directory produced by train_draft_distill.py.")
+    p.add_argument("--results", type=str, default="eval_results/raw_results.jsonl")
+    p.add_argument("--audio-dir", type=str, default="eval_audio")
+    p.add_argument("--figures-dir", type=str, default="paper_figures")
+    p.add_argument("--configs", type=str, default="A,B,C",
+                   help="Comma-separated subset of A,B,C.")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Evaluate only the first N utterances (smoke tests).")
+    p.add_argument("--force", action="store_true", help="Re-run utterances already present in the JSONL.")
+    p.add_argument("--replay", action="store_true",
+                   help="Skip synthesis; rebuild aggregates/figures/tables from the JSONL.")
+    p.add_argument("--skip-asr", action="store_true")
+    p.add_argument("--asr-model", type=str, default="openai/whisper-small")
+    p.add_argument("--allow-untrained", action="store_true",
+                   help="Permit random-weight modules (local smoke tests only).")
+    p.add_argument("--no-true-probs", action="store_true",
+                   help="Disable teacher-forced scoring (synthetic telemetry only).")
+    p.add_argument("--no-save-audio", action="store_true")
+    p.add_argument("--device", type=str, default=None)
+    p.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp16",
+                   help="Parler precision on GPU.")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--play-steps", type=int, default=12,
+                   help="Parler streamer play_steps (smaller = lower TTFA, more decode calls).")
+    p.add_argument("--boundary-frames", type=int, default=3,
+                   help="Frames after a language switch counted as boundary zone.")
+    return p
+
+
+# ===========================================================================
+# Main
+# ===========================================================================
+def _load_checkpoints(args, config, device):
+    from codeswitch_tts.config import DraftModelConfig, ResidualModelConfig
+
+    ckpt_dir = Path(args.ckpt)
+    draft_model = None
+    residual_model = None
+    draft_trained = residual_trained = False
+
+    draft_path = ckpt_dir / "draft_cb0.pt"
+    residual_path = ckpt_dir / "residual_cb1_8.pt"
+    if draft_path.exists():
+        payload = torch.load(draft_path, map_location="cpu", weights_only=False)
+        cfg = DraftModelConfig(**payload.get("config", {}))
+        draft_model = DraftTransformer(cfg).to(device)
+        draft_model.load_state_dict(payload["state_dict"])
+        draft_model.eval()
+        draft_trained = True
+        print(f"[Ckpt] draft loaded ({sum(p.numel() for p in draft_model.parameters()) / 1e6:.2f}M params)")
+    else:
+        draft_model = DraftTransformer(config.draft).to(device)
+        draft_model.eval()
+        print(f"[Ckpt] ⚠ {draft_path} not found — draft model is RANDOMLY INITIALISED")
+    if residual_path.exists():
+        payload = torch.load(residual_path, map_location="cpu", weights_only=False)
+        rcfg = ResidualModelConfig(**payload.get("config", {}))
+        residual_model = ResidualDecoder(rcfg).to(device)
+        residual_model.load_state_dict(payload["state_dict"])
+        residual_model.eval()
+        residual_trained = True
+        print(f"[Ckpt] residual loaded ({sum(p.numel() for p in residual_model.parameters()) / 1e6:.2f}M params)")
+    else:
+        residual_model = ResidualDecoder(config.residual).to(device)
+        residual_model.eval()
+        print(f"[Ckpt] ⚠ {residual_path} not found — residual decoder is RANDOMLY INITIALISED")
+
+    length_model = None
+    meta_path = ckpt_dir / "meta.json"
+    if meta_path.exists():
+        try:
+            from train_draft_distill import LengthModel
+
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("length_model"):
+                length_model = LengthModel.from_dict(meta["length_model"])
+                print(f"[Ckpt] length model loaded (MAE {length_model.mae_frames:.1f} frames over "
+                      f"{length_model.n_samples} teacher sentences)")
+        except Exception as exc:
+            print(f"[Ckpt] length model unavailable: {type(exc).__name__}: {exc}")
+    return draft_model, residual_model, length_model, draft_trained, residual_trained
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    configs = [c.strip().upper() for c in args.configs.split(",") if c.strip()]
+    unknown = [c for c in configs if c not in ("A", "B", "C")]
+    if unknown:
+        print(f"Unknown configs: {unknown}; valid: A,B,C")
+        return 2
+
+    results_path = Path(args.results)
+    audio_dir = Path(args.audio_dir)
+    figures_dir = Path(args.figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    t_all = _now()
+    print("=" * 78)
+    print("CodeSwitch-TTS · Full Evaluation Suite")
+    print(f"  configs: {configs} | utterances: {len(EVAL_UTTERANCES)}"
+          + (f" (limit {args.limit})" if args.limit else ""))
+    print(f"  results: {results_path} | figures: {figures_dir}")
+    print(f"  seed: {args.seed} | replay: {args.replay}")
+    print("=" * 78)
+
+    rows = load_results(results_path)
+    if args.replay:
+        print(f"[Replay] loaded {len(rows)} existing result rows")
+        return _finish(rows, args, configs, results_path, figures_dir, t_all)
+
+    # ---------------- environment ----------------
+    from codeswitch_tts import SpeculativeEngine
+
+    device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+    dtype = torch.float32 if device.type == "cpu" else dtype_map[args.dtype]
+
+    config = CodeSwitchTTSConfig()
+    config.system.allow_untrained_fallback = bool(args.allow_untrained)
+
+    engine = None
+    needs_engine = ("A" in configs) or ("C" in configs and not args.no_true_probs)
+    if needs_engine:
+        engine = SpeculativeEngine(config.speculative, device=device, dtype=dtype)
+        if not engine.speech_available:
+            if not args.allow_untrained and "A" in configs:
+                print("\n[Eval] ❌ Config A and true acceptance scoring require Indic Parler-TTS.")
+                print("       Fix the backend (protobuf==5.29.5 + kernel restart) and re-run,")
+                print("       or run with --configs B (NAR-only) / --allow-untrained for smoke tests.")
+                return 2
+            print("[Eval] ⚠ Parler unavailable — proceeding in reduced mode (no A / synthetic "
+                  "acceptance only).")
+
+    draft_model = residual_model = None
+    length_model = None
+    draft_trained = residual_trained = False
+    if "B" in configs or "C" in configs:
+        draft_model, residual_model, length_model, draft_trained, residual_trained = _load_checkpoints(
+            args, config, device
+        )
+        if not (draft_trained and residual_trained) and not args.allow_untrained:
+            print("\n[Eval] ❌ Trained checkpoints are missing: run `python train_draft_distill.py`")
+            print("       first, or pass --allow-untrained for a random-weight smoke test.")
+            return 2
+
+    scorer = None
+    if "C" in configs and not args.no_true_probs:
+        if engine is not None and engine.speech_available:
+            scorer = TeacherForcedScorer(engine)
+        else:
+            print("[Eval] ⚠ true acceptance disabled (no Parler backend) — synthetic telemetry only.")
+
+    synthesizer = EvalSynthesizer(
+        args, config, engine, draft_model, residual_model, length_model, scorer, device,
+        draft_trained, residual_trained,
+    )
+
+    asr = ASREvaluator(
+        args.asr_model, device,
+        enabled=(not args.skip_asr and any(c in configs for c in ("A", "B", "C"))),
+    )
+
+    run_meta = {
+        "args": vars(args),
+        "versions": package_versions(),
+        "device": str(device),
+        "dtype": str(dtype),
+        "n_utterances": len(EVAL_UTTERANCES),
+        "registers": {r: sum(1 for u in EVAL_UTTERANCES if u["register"] == r) for r in REGISTER_LABELS},
+        "checkpoint_dir": str(args.ckpt),
+        "draft_trained": draft_trained,
+        "residual_trained": residual_trained,
+        "scorer_available": bool(scorer and scorer.available),
+        "length_model": (length_model.to_dict() if length_model else None),
+    }
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    (results_path.parent / "run_meta.json").write_text(
+        json.dumps(run_meta, indent=2, default=str), encoding="utf-8"
+    )
+
+    done = {(r.get("config"), r.get("utt_id")) for r in rows if not r.get("error")}
+    utterances = EVAL_UTTERANCES[: args.limit] if args.limit else EVAL_UTTERANCES
+
+    # ---------------- synthesis loop ----------------
+    n_runs_since_gc = 0
+    for utt_index, utt in enumerate(utterances):
+        for cfg in configs:
+            if (cfg, utt["id"]) in done and not args.force:
+                continue
+            seed = args.seed * 100003 + utt_index * 7 + {"A": 0, "B": 1, "C": 2}[cfg]
+            label = f"[{cfg}][{utt['id']}]"
+            t0 = _now()
+            try:
+                if cfg == "A":
+                    row, wave = synthesizer.synth_A(utt, utt_index, seed)
+                elif cfg == "B":
+                    row, wave = synthesizer._chunked_synthesis(utt, utt_index, seed, verify=False)
+                else:
+                    row, wave = synthesizer._chunked_synthesis(utt, utt_index, seed, verify=True)
+            except Exception as exc:
+                row = synthesizer._base_row(cfg, utt, utt_index, synthesizer.normalize(utt["text"]))
+                row["error"] = f"{type(exc).__name__}: {exc}"
+                row["seed"] = seed
+                wave = None
+                print(f"{label} ❌ {row['error']}")
+
+            if row.get("error") is None and wave is not None:
+                if not args.no_save_audio:
+                    from codeswitch_tts.utils.audio import save_wav
+
+                    wav_path = audio_dir / cfg / f"{utt['id']}.wav"
+                    save_wav(wav_path, wave, sample_rate=row["sample_rate"], normalize=False)
+                    row["audio_path"] = str(wav_path)
+                if asr.available:
+                    hyp = asr.transcribe(wave, row["sample_rate"])
+                    cer, wer = ASREvaluator.score(row["normalized_text"], hyp)
+                    row["asr_text"] = hyp
+                    row["cer"] = cer
+                    row["wer"] = wer
+                else:
+                    row["cer"] = None
+                    row["wer"] = None
+                    row["asr_text"] = None
+
+            if row.get("utt_index") is None:
+                row["utt_index"] = utt_index
+
+            # replace any previous row for (cfg, utt) then persist
+            rows = [r for r in rows if not (r.get("config") == cfg and r.get("utt_id") == utt["id"])]
+            rows.append(row)
+            save_results(results_path, rows)
+            done.add((cfg, utt["id"]))
+
+            elapsed = _now() - t0
+            if row.get("error"):
+                pass
+            else:
+                print(
+                    f"{label} t_c={row.get('ttfa_compute_ms') if row.get('ttfa_compute_ms') is None else round(row['ttfa_compute_ms'])}ms "
+                    f"t_e2e={row.get('ttfa_e2e_ms') if row.get('ttfa_e2e_ms') is None else round(row['ttfa_e2e_ms'])}ms "
+                    f"total={round(row.get('total_ms') or 0)}ms rtf={row.get('rtf') if row.get('rtf') is None else round(row['rtf'], 2)} "
+                    f"acc_true={row.get('accept_true') if row.get('accept_true') is None else round(row['accept_true'], 1)} "
+                    f"acc_synth={row.get('accept_synth') if row.get('accept_synth') is None else round(row['accept_synth'], 1)} "
+                    f"cer={row.get('cer') if row.get('cer') is None else round(row['cer'], 3)} "
+                    f"[{elapsed:.1f}s]"
+                )
+            n_runs_since_gc += 1
+            if n_runs_since_gc >= 5:
+                n_runs_since_gc = 0
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    return _finish(rows, args, configs, results_path, figures_dir, t_all)
+
+
+def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: float) -> int:
+    agg = aggregate_results(rows, configs)
+    tables_tex = build_table_I(agg) + "\n\n" + build_table_II(agg)
+    (figures_dir / "tables.tex").write_text(tables_tex, encoding="utf-8")
+
+    print("\n" + "=" * 78)
+    print("AGGREGATED RESULTS")
+    print("=" * 78)
+    for cfg in configs:
+        a = agg.get(cfg) or {}
+        if not a.get("n"):
+            print(f"[{cfg}] no successful runs ({a.get('errors', 0)} errors)")
+            continue
+        tc = a.get("ttfa_compute") or {}
+        te = a.get("ttfa_e2e") or {}
+        print(
+            f"[{cfg}] n={a['n']} (errors={a['errors']}) | "
+            f"TTFA-c p50/p90={tc.get('p50') if tc.get('p50') is None else round(tc['p50'])}/"
+            f"{tc.get('p90') if tc.get('p90') is None else round(tc['p90'])}ms | "
+            f"TTFA-e2e p50={te.get('p50') if te.get('p50') is None else round(te['p50'])}ms | "
+            f"total={round((a.get('total') or {}).get('mean') or 0)}ms | "
+            f"RTF={round((a.get('rtf') or {}).get('mean') or 0, 2)} | "
+            f"CER={None if (a.get('cer') or {}).get('mean') is None else round((a['cer']['mean']) * 100, 1)}% | "
+            f"acc_true={None if (a.get('accept_true') or {}).get('mean') is None else round(a['accept_true']['mean'], 1)}% | "
+            f"acc_synth={None if (a.get('accept_synth') or {}).get('mean') is None else round(a['accept_synth']['mean'], 1)}%"
+        )
+
+    fig_paths: Dict[str, List[str]] = {}
+    for name, fn in (
+        ("fig1", figure1_latency_quality),
+        ("fig2", figure2_zone_acceptance),
+    ):
+        try:
+            paths = fn(agg, figures_dir)
+            if paths:
+                fig_paths[name] = paths
+        except Exception as exc:
+            print(f"[Figures] {name} failed: {type(exc).__name__}: {exc}")
+    try:
+        paths = figure3_stream_timeline(rows, figures_dir)
+        if paths:
+            fig_paths["fig3"] = paths
+    except Exception as exc:
+        print(f"[Figures] fig3 failed: {type(exc).__name__}: {exc}")
+
+    summary = {
+        "n_rows": len(rows),
+        "configs": configs,
+        "aggregates": agg,
+        "figures": fig_paths,
+        "tables_tex": str(figures_dir / "tables.tex"),
+    }
+    (figures_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, default=str), encoding="utf-8"
+    )
+
+    print("\n" + "-" * 78)
+    print("TABLE I (LaTeX)")
+    print("-" * 78)
+    print(build_table_I(agg))
+    print("\n" + "-" * 78)
+    print("TABLE II (LaTeX)")
+    print("-" * 78)
+    print(build_table_II(agg))
+    print("\n" + "-" * 78)
+    print(f"Artifacts: {results_path} | {figures_dir}/tables.tex | {figures_dir}/summary.json")
+    for name, paths in fig_paths.items():
+        for p in paths:
+            print(f"  {name}: {p}")
+    print(f"[Done] total {fmt_time(_now() - t_all)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
