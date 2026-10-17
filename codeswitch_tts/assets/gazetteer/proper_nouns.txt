@@ -1,0 +1,37 @@
+# Proper nouns & brand names kept in Latin script by the Tanglish router.
+# These activate the English phoneme path instead of being transliterated.
+# Format: one term per line, case-insensitive matching.
+Chennai Central
+Chennai Egmore
+Tambaram
+T. Nagar
+Adyar
+Velachery
+OMR
+ECR
+GST Road
+Koyambedu
+Anna Nagar
+Mylapore
+Guindy
+Sholinganallur
+Perungudi
+Thiruvanmiyur
+Besant Nagar
+Marina Beach
+Airport
+Uber
+Ola
+Rapido
+Google Maps
+UPI
+GPay
+PhonePe
+Paytm
+OTP
+PIN
+ID
+ETA
+AC
+km
+kg

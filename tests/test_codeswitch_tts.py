@@ -105,3 +105,37 @@ def test_end_to_end_streaming_pipeline(tmp_path):
     test_out = tmp_path / "test.wav"
     save_wav(test_out, benchmark_res.audio_waveform, sample_rate=benchmark_res.sample_rate)
     assert test_out.exists()
+
+
+def test_assets_loading():
+    """Verify voice profiles, gazetteers, and character vocabularies load from assets."""
+    from codeswitch_tts import (
+        load_voice_profiles,
+        load_proper_nouns,
+        load_character_vocab,
+        TanglishNormalizer,
+    )
+    import os
+
+    # 1. Voice profiles
+    voices = load_voice_profiles()
+    assert "ta_female_neutral" in voices
+    assert "ta_male_neutral" in voices
+    assert os.path.exists(voices["ta_female_neutral"].ref_audio_path)
+    assert len(voices["ta_female_neutral"].ref_text) > 0
+
+    # 2. Gazetteer proper nouns
+    proper_nouns = load_proper_nouns()
+    assert "chennai central" in proper_nouns or "omr" in proper_nouns
+    assert "rapido" in proper_nouns
+
+    # 3. Character vocab dictionary
+    vocab = load_character_vocab()
+    assert len(vocab) > 1000
+
+    # 4. Normalizer integration
+    norm = TanglishNormalizer()
+    res = norm.normalize("Rapido pickup at OMR, OTP 4321.")
+    assert "OTP four three two one" in res.normalized_text
+    assert "OMR" in res.normalized_text or "omr" in res.normalized_text.lower()
+

@@ -43,6 +43,13 @@ from codeswitch_tts.models.residual_decoder import ResidualDecoder
 from codeswitch_tts.engine.speculative_engine import SpeculativeEngine
 from codeswitch_tts.engine.streaming_pipeline import ChunkedStreamingPipeline
 from codeswitch_tts.utils.audio import AudioProcessor, DACWrapper
+from codeswitch_tts.utils.assets import (
+    VoiceProfile,
+    load_voice_profiles,
+    load_proper_nouns,
+    load_character_vocab,
+    get_assets_dir,
+)
 
 __all__ = [
     "CodeSwitchTTSConfig",
@@ -59,4 +66,9 @@ __all__ = [
     "ChunkedStreamingPipeline",
     "AudioProcessor",
     "DACWrapper",
+    "VoiceProfile",
+    "load_voice_profiles",
+    "load_proper_nouns",
+    "load_character_vocab",
+    "get_assets_dir",
 ]

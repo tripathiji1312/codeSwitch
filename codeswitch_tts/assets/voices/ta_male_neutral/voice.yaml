@@ -1,0 +1,9 @@
+# movio voice profile — Tamil Neutral (Male)
+# The user will supply their custom male ref.wav and ref_text.
+name: ta_male_neutral
+ref_audio: ref.wav
+ref_text: "தொண்ணூத்தொம்போது நாப்பத்திநாலு ஜீரோ அஞ்சு நானூத்திரவத்தஞ்சு மூனு  என்ற தொலைபேசி எண் மற்றும் ஏழு ஒம்பது நாலு நாலு ஓடிபி மூலம் கோவின் போர்ட்டலில் லாகின் செய்யவும்."
+gender: male
+style: neutral
+speed_factor: 1.0
+pitch_factor: 1.0

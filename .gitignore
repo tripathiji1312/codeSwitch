@@ -26,6 +26,7 @@ output_audio/*.flac
 *.wav
 *.mp3
 *.flac
+!codeswitch_tts/assets/**/*.wav
 
 # Model weights & downloaded checkpoints
 *.pt

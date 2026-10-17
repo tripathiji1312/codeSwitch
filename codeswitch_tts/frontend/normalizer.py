@@ -206,9 +206,28 @@ class NormalizationResult:
 class TanglishNormalizer:
     """3-Tier Normalizer and Transliterator for Code-Mixed Tamil-English Transit Text."""
 
-    def __init__(self):
-        self.lexicon = TANGLISH_LEXICON
-        self.loanwords = ENGLISH_TRANSIT_LOANWORDS
+    def __init__(self, gazetteer_path: Optional[str] = None):
+        self.lexicon = TANGLISH_LEXICON.copy()
+        self.loanwords = ENGLISH_TRANSIT_LOANWORDS.copy()
+
+        # Load gazetteer proper nouns (Chennai locations, ride-hailing brands) if available
+        if gazetteer_path is not None:
+            self._load_gazetteer(gazetteer_path)
+        else:
+            from pathlib import Path
+            default_gazetteer = Path(__file__).resolve().parent.parent / "assets" / "gazetteer" / "proper_nouns.txt"
+            if default_gazetteer.exists():
+                self._load_gazetteer(str(default_gazetteer))
+
+    def _load_gazetteer(self, path: str):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    w = line.strip().lower()
+                    if w and not w.startswith("#"):
+                        self.loanwords.add(w)
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # Tier 1: Language & Script Identification
