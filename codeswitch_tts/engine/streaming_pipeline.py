@@ -28,6 +28,22 @@ from codeswitch_tts.engine.speculative_engine import SpeculativeEngine, Speculat
 from codeswitch_tts.utils.audio import AudioProcessor, crossfade_chunks, normalize_peak, apply_highpass_filter
 
 
+_NO_SPEECH_BACKEND_ERROR = (
+    "CodeSwitch-TTS cannot synthesize intelligible speech in this environment.\n"
+    "  • The active backend is '{backend}': the draft transformer, verifier and residual decoder\n"
+    "    hold RANDOM weights, so decoding their tokens through the DAC codec produces noise,\n"
+    "    not speech.\n"
+    "  • Fix on Kaggle:\n"
+    "      1) !pip install -q 'protobuf==5.29.5'      # audiotools silently downgrades to 4.25.9 otherwise\n"
+    "      2) Restart the session/kernel (a stale protobuf 4.x runtime cannot be swapped in-process)\n"
+    "      3) Re-run: you should see 'Loaded Indic Parler-TTS successfully.'\n"
+    "  • To run the benchmark in telemetry-only mode with random-weight audio (never speech),\n"
+    "    build the config with allow_untrained_fallback=True:\n"
+    "      config = CodeSwitchTTSConfig()\n"
+    "      config.system.allow_untrained_fallback = True\n"
+)
+
+
 @dataclass
 class StreamedAudioChunk:
     """Represents a single 1-second streamed audio chunk with telemetry."""
@@ -90,7 +106,24 @@ class ChunkedStreamingPipeline:
         dac_model = getattr(self.speculative_engine.ar_model, "audio_encoder", None)
         self.audio_processor = AudioProcessor(self.config.audio, dac_model=dac_model)
 
+        self.speech_available = bool(self.speculative_engine.speech_available)
+        self._fallback_warned = False
+
         print(f"[ChunkedStreamingPipeline] Initialized on {self.device} ({self.dtype}).")
+        if self.speech_available:
+            print(
+                "[ChunkedStreamingPipeline] Speech backend: indic_parler_tts "
+                "(authentic Indic Parler-TTS neural speech)."
+            )
+        else:
+            print("=" * 78)
+            print("[ChunkedStreamingPipeline] ⚠ NO SPEECH BACKEND AVAILABLE")
+            print("[ChunkedStreamingPipeline]   Indic Parler-TTS weights failed to load and the")
+            print("[ChunkedStreamingPipeline]   standalone modules have random weights: synthesis")
+            print("[ChunkedStreamingPipeline]   through them would emit NOISE, not speech.")
+            print("[ChunkedStreamingPipeline]   Synthesis is disabled unless")
+            print("[ChunkedStreamingPipeline]   config.system.allow_untrained_fallback=True.")
+            print("=" * 78)
 
     def stream_synthesize(
         self,
@@ -98,9 +131,15 @@ class ChunkedStreamingPipeline:
         temperature: float = 1.0,
     ) -> Generator[StreamedAudioChunk, None, None]:
         """Generates and streams 1-second audio chunks sequentially.
-        
+
         Yields StreamedAudioChunk as each chunk finishes synthesis.
         """
+        # Step 0: refuse to emit random-weight noise pretending to be speech.
+        if not self.speech_available and not self.config.system.allow_untrained_fallback:
+            raise RuntimeError(
+                _NO_SPEECH_BACKEND_ERROR.format(backend=self.speculative_engine.backend)
+            )
+
         # Step 1: 3-tier text normalization
         norm_res = self.normalizer.normalize(text)
         pipeline_start = time.perf_counter()
@@ -174,7 +213,24 @@ class ChunkedStreamingPipeline:
                     )
                 return
 
-        # Mode B: Standalone / Offline synthetic fallback (for CPU unit testing without weights)
+            # Parler is loaded but produced no audio for this prompt. Never fall
+            # through to the random-weight path silently.
+            if not self.config.system.allow_untrained_fallback:
+                raise RuntimeError(
+                    "Indic Parler-TTS returned an empty waveform for this prompt; refusing to fall "
+                    "back to the untrained decoder (it would emit noise). Re-run the synthesis, or "
+                    "set config.system.allow_untrained_fallback=True for telemetry-only output."
+                )
+
+        # Mode B: Standalone / Offline synthetic fallback (for CPU unit testing without weights).
+        # Reached only when allow_untrained_fallback=True was set explicitly.
+        if not self._fallback_warned:
+            print(
+                "[ChunkedStreamingPipeline] ⚠ Running telemetry-only fallback: audio is produced by "
+                "randomly-initialized modules and is NOT intelligible speech."
+            )
+            self._fallback_warned = True
+
         estimated_sec = max(1.5, len(norm_res.normalized_text) / self.config.speculative.chars_per_sec)
         total_chunks = max(1, int(np.ceil(estimated_sec / self.config.audio.chunk_duration_sec)))
         prefix_tokens: Optional[torch.Tensor] = None

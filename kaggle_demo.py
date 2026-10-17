@@ -72,7 +72,14 @@ def run_benchmark():
     # 1. Initialize Pipeline
     print(" [2/4] Initializing CodeSwitch-TTS Hybrid Pipeline...")
     config = CodeSwitchTTSConfig()
+    if os.environ.get("CODESWITCH_ALLOW_UNTRAINED", "0") == "1":
+        # Telemetry-only smoke test: random-weight modules, audio is NOT speech.
+        config.system.allow_untrained_fallback = True
     pipeline = ChunkedStreamingPipeline(config=config)
+    if pipeline.speech_available:
+        print("   ✓ Indic Parler-TTS speech backend is active")
+    else:
+        print("   ⚠ Indic Parler-TTS unavailable - see the fix instructions above")
     print("   ✓ 3-Tier Tanglish Normalizer initialized")
     print("   ✓ Discrete Codebook-0 NAR Draft Transformer loaded (~65M params)")
     print("   ✓ Speculative AR Verifier loaded (Parallel Rejection Sampling on CB0)")

@@ -3,30 +3,15 @@ Verification Framework for Code-Mixed Tamil-English Speech Synthesis.
 """
 
 import os
-import sys
-import types
 
-# Ensure Protocol Buffers uses pure Python backend to avoid Kaggle C++ runtime_version mismatches
-os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
 
-try:
-    import google.protobuf
-    try:
-        from google.protobuf import runtime_version
-    except ImportError:
-        _m = types.ModuleType("google.protobuf.runtime_version")
-        _m.Domain = lambda *args, **kwargs: None
-        _m.Version = lambda *args, **kwargs: None
-        _m.ValidateProtobufRuntimeVersion = lambda *args, **kwargs: None
-        _m.DOMAIN = None
-        _m.OSS_DOMAIN = None
-        _m.VersionError = Exception
-        google.protobuf.runtime_version = _m
-        sys.modules["google.protobuf.runtime_version"] = _m
-except Exception:
-    pass
+# Ensure google.protobuf.runtime_version is available & API-correct even on
+# stale protobuf 4.x runtimes (Kaggle safety net - see codeswitch_tts/_compat.py).
+from codeswitch_tts._compat import install_protobuf_runtime_version_fallback
+
+install_protobuf_runtime_version_fallback()
 
 from codeswitch_tts.config import (
     CodeSwitchTTSConfig,

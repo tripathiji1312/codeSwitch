@@ -96,7 +96,11 @@ def test_audio_crossfade_and_filter():
 
 
 def test_end_to_end_streaming_pipeline(tmp_path):
-    pipeline = ChunkedStreamingPipeline()
+    # Local/CPU runs have no Indic Parler-TTS weights, so explicitly allow the
+    # telemetry-only fallback (its audio is random-weight noise, not speech).
+    config = CodeSwitchTTSConfig()
+    config.system.allow_untrained_fallback = True
+    pipeline = ChunkedStreamingPipeline(config=config)
     benchmark_res = pipeline.synthesize("Test streaming audio.")
     assert benchmark_res.duration_sec > 0.0
     assert benchmark_res.ttfa_ms > 0.0
@@ -138,4 +142,29 @@ def test_assets_loading():
     res = norm.normalize("Rapido pickup at OMR, OTP 4321.")
     assert "OTP four three two one" in res.normalized_text
     assert "OMR" in res.normalized_text or "omr" in res.normalized_text.lower()
+
+
+def test_protobuf_runtime_version_fallback_api():
+    """Protobuf gencode calls ``runtime_version.Domain.PUBLIC`` at import time.
+
+    The fallback shim must therefore expose ``Domain`` as a class with PUBLIC,
+    never as a function (that regressed into "'function' object has no
+    attribute 'PUBLIC'" on Kaggle and broke the Parler-TTS import).
+    """
+    from codeswitch_tts._compat import install_protobuf_runtime_version_fallback
+
+    install_protobuf_runtime_version_fallback()
+
+    from google.protobuf import runtime_version
+
+    assert hasattr(runtime_version, "Domain")
+    assert runtime_version.Domain.PUBLIC is not None
+    assert runtime_version.Domain.GOOGLE_INTERNAL is not None
+    # Must be callable with the exact signature used by modern *_pb2.py gencode.
+    assert (
+        runtime_version.ValidateProtobufRuntimeVersion(
+            runtime_version.Domain.PUBLIC, 5, 29, 5, "", "regression_pb2.py"
+        )
+        is None
+    )
 

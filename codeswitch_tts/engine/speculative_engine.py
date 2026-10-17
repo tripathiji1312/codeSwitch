@@ -11,34 +11,14 @@ Tracks speculative acceptance rate (%) and latency speedup.
 
 from __future__ import annotations
 
-import os
-import sys
 import time
-import types
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Union, Dict, Any
 
-# Ensure pure python protobuf implementation to prevent Kaggle runtime_version import mismatch
-os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
-os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("USE_FLAX", "0")
+# Keep protobuf imports working on stale Kaggle protobuf 4.x runtimes.
+from codeswitch_tts._compat import install_protobuf_runtime_version_fallback
 
-try:
-    import google.protobuf
-    try:
-        from google.protobuf import runtime_version
-    except ImportError:
-        _m = types.ModuleType("google.protobuf.runtime_version")
-        _m.Domain = lambda *args, **kwargs: None
-        _m.Version = lambda *args, **kwargs: None
-        _m.ValidateProtobufRuntimeVersion = lambda *args, **kwargs: None
-        _m.DOMAIN = None
-        _m.OSS_DOMAIN = None
-        _m.VersionError = Exception
-        google.protobuf.runtime_version = _m
-        sys.modules["google.protobuf.runtime_version"] = _m
-except Exception:
-    pass
+install_protobuf_runtime_version_fallback()
 
 import numpy as np
 import torch
@@ -119,6 +99,10 @@ class SpeculativeEngine:
         self.description_tokenizer = None
         self._description_cache: Dict[str, torch.Tensor] = {}
         self.backend = "none"
+        # True only when real (pretrained) Indic Parler-TTS weights are loaded.
+        # When False, every acoustic module holds random weights and decoding
+        # its tokens through DAC yields noise, not intelligible speech.
+        self.speech_available = False
         self._load_target_model()
 
     def _load_target_model(self):
@@ -139,16 +123,31 @@ class SpeculativeEngine:
                 self.ar_model.config.text_encoder._name_or_path
             )
             self.backend = "indic_parler_tts"
+            self.speech_available = True
             print("[SpeculativeEngine] Loaded Indic Parler-TTS successfully.")
             self._warmup()
             return
         except Exception as e:
-            print(f"[SpeculativeEngine] Parler-TTS not available locally ({e}). Initializing Standalone AR Verifier.")
+            print("[SpeculativeEngine] ⚠ Indic Parler-TTS could not be loaded:")
+            print(f"[SpeculativeEngine]     {type(e).__name__}: {e}")
+            if "PUBLIC" in str(e) or "runtime_version" in str(e):
+                print(
+                    "[SpeculativeEngine]     protobuf runtime_version failure detected. The pip-installed\n"
+                    "[SpeculativeEngine]     protobuf was likely downgraded to 4.x (or a stale 4.x copy is\n"
+                    "[SpeculativeEngine]     already imported in this kernel). Fix on Kaggle:\n"
+                    "[SpeculativeEngine]       !pip install -q 'protobuf==5.29.5'\n"
+                    "[SpeculativeEngine]     then RESTART the kernel and run again."
+                )
+            print(
+                "[SpeculativeEngine]     Falling back to the Standalone AR Verifier, whose weights are\n"
+                "[SpeculativeEngine]     RANDOMLY INITIALIZED - this path cannot produce speech, only noise."
+            )
 
         # Initialize Standalone AR causal verifier
         self.ar_model = StandaloneARVerifier(vocab_size=1024).to(self.device)
         self.ar_model.eval()
         self.backend = "standalone_ar"
+        self.speech_available = False
 
     def _warmup(self):
         """Pre-compiles CUDA kernels to eliminate first-call cold start latency."""
@@ -208,6 +207,11 @@ class SpeculativeEngine:
         cached_desc = self.get_cached_description_encoder_outputs(voice_description)
         from transformers.modeling_outputs import BaseModelOutput
         encoder_outputs = BaseModelOutput(last_hidden_state=cached_desc)
+
+        # Reproducible generations across runs (matches the standalone movio-2 engine).
+        torch.manual_seed(self.config.generation_seed)
+        if str(self.device).startswith("cuda"):
+            torch.cuda.manual_seed(self.config.generation_seed)
 
         frame_rate = getattr(self.ar_model.audio_encoder.config, "frame_rate", 86.13)
         chars_per_sec = self.config.chars_per_sec

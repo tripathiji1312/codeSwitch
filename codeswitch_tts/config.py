@@ -76,6 +76,10 @@ class SystemConfig:
     torch_dtype: torch.dtype = field(init=False)
     max_vram_gb: float = 12.0  # Fit comfortably inside 16GB T4 GPU
     output_dir: str = "output_audio"
+    # Safety switch: the standalone fallback modules have random weights, so the
+    # waveform they produce is noise, not speech. Synthesis refuses to run in
+    # that state unless this is explicitly enabled (telemetry-only runs).
+    allow_untrained_fallback: bool = False
 
     def __post_init__(self):
         if self.device.startswith("cuda"):
