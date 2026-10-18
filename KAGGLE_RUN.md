@@ -181,7 +181,7 @@ evaluation uses for frame sizing). A short sanity WAV is rendered at the end.
 * **Gate sweep**: `--gate-thresholds 0,0.6,0.75,0.9` synthesises Config C once per threshold
   (utterance-level confidence gate on the draft's mean top-1 probability, `--gate-stat
   utt_min|utt_mean`). All rows land in one JSONL, keyed by `(config, utt_id, gate_threshold)`;
-  Table I reports the un-gated hybrid (τ=0) and Fig. 5b / Table IV are the Pareto curve.
+  Table I reports the un-gated hybrid (τ=0) and Fig. 5 + Table V are the Pareto curve.
   Rows handed to AR are marked `verify_mode="ar_fallback"`, carry no acceptance numbers, and
   still count for latency and CER.
 
@@ -195,7 +195,7 @@ paper_figures/fig2_boundary_acceptance_breakdown.{png,pdf} # per-zone CB0 accept
 paper_figures/fig3_streaming_chunk_timeline.{png,pdf}   # streaming chunk pipeline + playback buffer
 paper_figures/fig4_scaling_and_registers.{png,pdf}      # latency vs audio length + CER per register
 paper_figures/fig5_gate_pareto.{png,pdf}                # confidence-gate quality/latency Pareto + fallback rate
-paper_figures/tables.tex           # Tables I (comparative) + II (zones) + III (per-register) + IV (gate sweep) + V (distance to switch)
+paper_figures/tables.tex           # Tables I (comparative) + II (zones) + III (per-register) + IV (distance to switch) + V (gate sweep)
 paper_figures/summary.json         # aggregates + gate_sweep + switch_distance + figure paths
 eval_audio/{A,B,C}/{utt_id}.wav    # listening samples
 ```
@@ -266,10 +266,10 @@ Kaggle unless you want to archive them too.)
   when the boundary-vs-Tamil difference is smaller than the per-utterance standard deviation —
   at the current draft quality the zone effect is **not** resolved, so do not claim a
   boundary penalty in the paper unless the annotation is red.
-* **Fig. 5 + Table IV (gate sweep)**: the Pareto view of the confidence gate — quality (median
+* **Fig. 5 + Table V (gate sweep)**: the Pareto view of the confidence gate — quality (median
   CER_lat) against total latency, with the fallback rate on the second panel. The gate is the
   practical answer to "your NAR is fast but bad": τ=0 is the pure hybrid, higher τ buys CER back
-  with AR latency. **Table V** is the distance-to-switch curve: per-frame CB0 acceptance as a
+  with AR latency. **Table IV** is the distance-to-switch curve: per-frame CB0 acceptance as a
   function of frames since the last language switch, with paired per-utterance bootstrap
   deltas vs the ≥ 16-frame reference bucket — the code-switching-specific science claim
   (do not read the zone buckets in Fig. 2 as a switch effect; they are not distance-resolved).
@@ -282,7 +282,7 @@ Kaggle unless you want to archive them too.)
 * If Fig. 2 is missing entirely: true acceptance was disabled (`--no-true-probs`) or the
   scorer could not initialise — see the `[Scorer]` lines in the log and
   `eval_results/run_meta.json` → `scorer_available`.
-* If Fig. 5 / Table IV are missing: no gate sweep was recorded. Re-run with
+* If Fig. 5 / Table V are missing: no gate sweep was recorded. Re-run with
   `--gate-thresholds 0,0.6,0.75,0.9` (old JSONLs contain only τ=0 rows).
 
 ## 6) Troubleshooting
