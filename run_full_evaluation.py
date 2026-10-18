@@ -1061,6 +1061,22 @@ def aggregate_zones(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 
 def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dict[str, Dict[str, Any]]:
     agg: Dict[str, Dict[str, Any]] = {}
+    # Session cold start: the very first successful synthesis of the process
+    # (configurations are interleaved per utterance, so this is the only row
+    # whose latency includes a fully cold CUDA context).
+    cfg_order = {c: i for i, c in enumerate(configs)}
+    ok_all = [r for r in rows if not r.get("error") and r.get("config") in cfg_order]
+    if ok_all:
+        first = min(
+            ok_all,
+            key=lambda r: (int(r.get("utt_index") or 0), cfg_order.get(r.get("config"), 99)),
+        )
+        agg["_session_cold"] = {
+            "config": first.get("config"),
+            "utt_id": first.get("utt_id"),
+            "ttfa_compute_ms": first.get("ttfa_compute_ms"),
+            "ttfa_e2e_ms": first.get("ttfa_e2e_ms"),
+        }
     for cfg in configs:
         ok = [r for r in rows if r.get("config") == cfg and not r.get("error")]
         err = [r for r in rows if r.get("config") == cfg and r.get("error")]
@@ -1500,6 +1516,18 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         a = agg.get(cfg) or {}
         if a.get("n"):
             fail_bits.append(f"{cfg}: {int(a.get('asr_fail') or 0)}/{a['n']}")
+    session_cold = agg.get("_session_cold") or {}
+    cold_sentence = ""
+    if session_cold:
+        cc = session_cold.get("config")
+        cold_sentence = (
+            f" Session cold start (first synthesis of the process: {cc} on "
+            f"{session_cold.get('utt_id')}) = "
+            f"{_tex(session_cold.get('ttfa_compute_ms'), 0)} ms TTFA-c; because configurations "
+            f"are interleaved per utterance, only this row is a true cold start and the "
+            f"per-configuration cold columns for the other configs reflect a partially warmed "
+            f"context (run a single configuration per process for a fully isolated measurement)."
+        )
     logq_d = (agg.get("C") or {}).get("logq_draft") or {}
     logq_k = (agg.get("C") or {}).get("logq_kept") or {}
     logq_sentence = ""
@@ -1528,7 +1556,7 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
             "(acc. n/a); its TTFA-c is the time from decoder start to the first decoded audio buffer. "
             "CER reference: normalised Tamil-script text; ASR failures with CER $>$ 200\\% "
             "(whisper-small hallucination loops) = " + ", ".join(fail_bits) + "; Table III gives "
-            "per-register numbers." + logq_sentence + "}"
+            "per-register numbers." + cold_sentence + logq_sentence + "}"
         ),
         "\\end{table*}",
     ]

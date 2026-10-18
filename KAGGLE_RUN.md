@@ -180,7 +180,11 @@ Kaggle unless you want to archive them too.)
   NAR configs — a ~6x outlier). Table I therefore reports the cold value as its own column and
   uses the median/p90 of the remaining 59 utterances (warm) everywhere else; Fig. 1 draws warm
   p50 bars with a black x marker for the cold value. Report warm numbers in the paper text and
-  cite the cold column when discussing streaming start-up latency.
+  cite the cold column when discussing streaming start-up latency. **Caveat:** configurations
+  are interleaved per utterance, so only the very first synthesis of the process (A/ta-01) is a
+  true cold start — Table I footnotes that session value and flags the others as partially
+  warmed. For a fully isolated per-configuration cold start, run one config per process,
+  e.g. `--configs B --results eval_results/cold_B.jsonl`.
 * **Acceptance** is reported twice: *true* (teacher-forced Parler probabilities) and *ref*
   (identical acceptance math against an **unrelated random target** — the legacy demo
   protocol). The ref column is a *mismatched-target baseline, not an upper bound*: a draft
