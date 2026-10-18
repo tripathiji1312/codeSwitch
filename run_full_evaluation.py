@@ -67,6 +67,7 @@ and tables from the JSONL without synthesising anything.
 from __future__ import annotations
 
 import argparse
+import base64
 import gc
 import json
 import math
@@ -260,19 +261,21 @@ def _language_class(zone: int) -> Optional[str]:
 
 def assign_frame_zones(
     char_zones: np.ndarray, n_frames: int, boundary_frames: int = 3
-) -> Tuple[np.ndarray, int]:
+) -> Tuple[np.ndarray, int, List[int]]:
     """Monotonic character->frame alignment + boundary overlay.
 
-    Returns ``(frame_zones, n_transitions)``; boundary frames are the first
-    ``boundary_frames`` frames after each Tamil<->Latin switch.
+    Returns ``(frame_zones, n_transitions, switch_frames)``; boundary frames are
+    the first ``boundary_frames`` frames after each Tamil<->Latin switch, and
+    ``switch_frames`` holds the (sorted, de-duplicated) frame indices of those
+    switches so downstream analyses can measure *distance to switch*.
     """
     frame_zones = np.zeros(max(0, n_frames), dtype=np.int64)
     n_transitions = 0
     if n_frames <= 0:
-        return frame_zones, n_transitions
+        return frame_zones, n_transitions, []
     mappable = [i for i, z in enumerate(char_zones) if z != ZONE_NONE]
     if not mappable:
-        return frame_zones, n_transitions
+        return frame_zones, n_transitions, []
     m = len(mappable)
     frame_of = [min(n_frames - 1, int(math.floor(j * n_frames / m))) for j in range(m)]
 
@@ -291,7 +294,94 @@ def assign_frame_zones(
             transitions.append(frame_of[j])
     for tr in transitions:
         frame_zones[tr: min(n_frames, tr + boundary_frames)] = ZONE_BOUNDARY
-    return frame_zones, len(transitions)
+    return frame_zones, len(transitions), sorted(set(transitions))
+
+
+# ---------------------------------------------------------------------------
+# Distance-to-switch analysis (why the zone contrast is a power problem)
+# ---------------------------------------------------------------------------
+#: ``(label, lo, hi)`` buckets of "frames since the last Tamil<->Latin switch".
+SWITCH_DIST_BUCKETS: List[Tuple[str, int, int]] = [
+    ("0-1", 0, 2), ("2-3", 2, 4), ("4-7", 4, 8), ("8-15", 8, 16), ("16+", 16, 10 ** 9),
+]
+
+
+def switch_distances(n_frames: int, switch_frames: Sequence[int]) -> np.ndarray:
+    """Frames since the most recent Tamil<->Latin switch per frame.
+
+    Frames before the first switch (or in utterances without switches) get the
+    sentinel ``n_frames``, i.e. they fall in the ``16+`` bucket.
+    """
+    n = max(0, int(n_frames))
+    dist = np.full(n, n, dtype=np.int64)
+    if n == 0:
+        return dist
+    switches = sorted({int(s) for s in (switch_frames or []) if 0 <= int(s) < n})
+    if not switches:
+        return dist
+    last = np.zeros(n, dtype=np.int64)
+    for s in switches:
+        last[s:] = s
+    dist = np.arange(n, dtype=np.int64) - last
+    dist[: switches[0]] = n
+    return dist
+
+
+def pack_u8(values: Sequence[int]) -> str:
+    return base64.b64encode(np.asarray(values, dtype=np.uint8).tobytes()).decode("ascii")
+
+
+def unpack_u8(text: str) -> np.ndarray:
+    return np.frombuffer(base64.b64decode(text.encode("ascii")), dtype=np.uint8)
+
+
+def pack_bits(flags: Sequence[bool]) -> str:
+    return pack_u8(np.packbits(np.asarray(flags, dtype=bool).astype(np.uint8)))
+
+
+def unpack_bits(text: str, n: int) -> np.ndarray:
+    return np.unpackbits(unpack_u8(text))[: max(0, int(n))].astype(bool)
+
+
+def frame_accept_arrays(row: Dict[str, Any]) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """``(accept_true, valid, distances)`` for a row with packed frame telemetry."""
+    n = int(row.get("n_frames") or 0)
+    packed = row.get("frame_accept_true_b64")
+    valid_b64 = row.get("frame_valid_b64")
+    if n <= 0 or not packed or not valid_b64:
+        return None
+    try:
+        accept = unpack_bits(packed, n)
+        valid = unpack_bits(valid_b64, n)
+    except Exception:
+        return None
+    if accept.size != n or valid.size != n:
+        return None
+    if not valid.any():
+        return None
+    return accept, valid, switch_distances(n, row.get("switch_frames") or [])
+
+
+def paired_bootstrap(
+    pairs: Sequence[Tuple[float, float]], n_boot: int = 2000, seed: int = 20261018
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Paired mean difference with bootstrap CI and two-sided p-value.
+
+    ``pairs`` are ``(a, b)`` observations on the same unit (utterance); returns
+    ``(mean_diff = mean(a) - mean(b), ci_lo, ci_hi, p)``.  Pure numpy so the
+    suite has no scipy dependency.
+    """
+    arr = np.asarray([[float(a), float(b)] for a, b in pairs], dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] < 2:
+        return None, None, None, None
+    diff = arr[:, 0] - arr[:, 1]
+    mean_diff = float(diff.mean())
+    rng = np.random.RandomState(seed)
+    idx = rng.randint(0, diff.size, size=(n_boot, diff.size))
+    boots = diff[idx].mean(axis=1)
+    ci_lo, ci_hi = (float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5)))
+    p = 2.0 * min(float((boots <= 0).mean()), float((boots >= 0).mean()))
+    return mean_diff, ci_lo, ci_hi, min(1.0, p)
 
 
 # ===========================================================================
@@ -496,6 +586,7 @@ class ChunkTelemetry:
     ready_ms: float
     accept_true: Optional[float]
     accept_synth: Optional[float]
+    confidence: Optional[float] = None
 
 
 _DECODE_WARNED = False
@@ -754,7 +845,7 @@ class EvalSynthesizer:
         norm_res = self.normalizer.normalize(utt["text"])
         transit_spans = find_transit_spans(norm_res.normalized_text, norm_res.entity_replacements)
         char_zones = label_char_zones(norm_res.normalized_text, transit_spans)
-        frame_zones, n_transitions = assign_frame_zones(
+        frame_zones, n_transitions, switch_frames = assign_frame_zones(
             char_zones, n_frames, boundary_frames=int(self.args.boundary_frames)
         )
 
@@ -765,7 +856,9 @@ class EvalSynthesizer:
         t0 = _now()
         cuda_sync(self.device)
 
-        # 1. Draft the full CB0 sequence (single NAR pass)
+        # 1. Draft the full CB0 sequence (single NAR pass).  Seeded like the AR
+        #    path so per-utterance B/C rows are reproducible across runs.
+        set_seed(seed)
         with torch.inference_mode():
             draft_out = self.draft.generate_chunk(
                 text=normalized, num_frames=n_frames, temperature=1.0, device=self.device
@@ -794,6 +887,12 @@ class EvalSynthesizer:
             chunk_tokens = draft_tokens[chunk_start:chunk_end]
             chunk_probs = draft_probs_all[chunk_start:chunk_end]
             c_chunk = int(chunk_tokens.shape[0])
+            # Draft confidence: mean top-1 probability over the chunk's frames
+            # (used for the confidence gate and for the calibration analysis).
+            try:
+                confidence: Optional[float] = float(np.mean(np.max(chunk_probs, axis=-1)))
+            except Exception:
+                confidence = None
 
             kept = chunk_tokens
             accepted_true: Optional[np.ndarray] = None
@@ -868,6 +967,7 @@ class EvalSynthesizer:
                 ready_ms=ready_ms,
                 accept_true=acceptance_rate(accepted_true),
                 accept_synth=acceptance_rate(accepted_synth),
+                confidence=confidence,
             ))
             if ttfa_e2e_ms is None:
                 ttfa_e2e_ms = ready_ms
@@ -910,6 +1010,17 @@ class EvalSynthesizer:
             "chunks": [asdict(t) for t in telemetry],
             "verify_mode": verify_mode,
             "seed": seed,
+            "draft_confidence": float(np.mean([t.confidence for t in telemetry
+                                               if t.confidence is not None]))
+            if any(t.confidence is not None for t in telemetry) else None,
+            # packed per-frame telemetry: raw material for the distance-to-switch
+            # analysis (survives JSONL round-trips, ~1 KB per row)
+            "switch_frames": [int(s) for s in switch_frames],
+            "frame_zones_b64": pack_u8(frame_zones.astype(np.uint8)) if n_frames > 0 else None,
+            "frame_accept_true_b64": (pack_bits(accept_true) if accept_true is not None else None),
+            "frame_accept_synth_b64": (pack_bits(accept_synth) if accept_synth is not None else None),
+            "frame_valid_b64": (pack_bits(np.ones_like(accept_true, dtype=bool))
+                                if accept_true is not None else None),
         })
         self._attach_zone_stats(row, frame_zones, accept_true, accept_synth)
         return row, wave
@@ -926,12 +1037,92 @@ class EvalSynthesizer:
             zone_stats[str(zone)] = entry
         row["zone_stats"] = zone_stats
 
+    def _draft_confidence(self, utt: Dict[str, str], seed: int,
+                          gate_stat: str = "utt_min") -> Optional[float]:
+        """Draft-only pass: utterance-level draftability statistic.
+
+        Returns the ``utt_min`` (worst chunk) or ``utt_mean`` of the per-chunk
+        mean top-1 draft probability.  Uses the same seeding as the real
+        synthesis pass, so the statistic describes the tokens that would be
+        proposed.
+        """
+        normalized = self.normalize(utt["text"])
+        n_frames = self._frames_for(normalized)
+        if n_frames <= 0:
+            return None
+        set_seed(seed)
+        with torch.inference_mode():
+            draft_out = self.draft.generate_chunk(
+                text=normalized, num_frames=n_frames, temperature=1.0, device=self.device
+            )
+        probs = draft_out.probabilities[0].detach().float().cpu().numpy()
+        per_chunk: List[float] = []
+        for chunk_start in range(0, n_frames, self.frames_per_chunk):
+            chunk_probs = probs[chunk_start: chunk_start + self.frames_per_chunk]
+            if chunk_probs.size:
+                per_chunk.append(float(np.mean(np.max(chunk_probs, axis=-1))))
+        if not per_chunk:
+            return None
+        return float(np.mean(per_chunk)) if gate_stat == "utt_mean" else float(np.min(per_chunk))
+
+    def synth_C(self, utt: Dict[str, str], utt_index: int, seed: int,
+                gate_threshold: float = 0.0, gate_stat: str = "utt_min",
+                ) -> Tuple[Dict[str, Any], np.ndarray]:
+        """Config C with a draft-confidence gate (utterance-level).
+
+        ``gate_threshold <= 0`` is plain speculative decoding.  Otherwise the
+        draft is run first; if its confidence statistic falls below the
+        threshold the utterance is handed to the full AR pipeline and the
+        *measured* latency/quality of that fallback are reported (so the gate
+        is a deployable knob, not a hypothetical).  Fallback rows carry
+        ``verify_mode="ar_fallback"``, no acceptance numbers, and are excluded
+        from acceptance aggregates but included in latency/CER ones.
+        """
+        threshold = float(gate_threshold or 0.0)
+        if threshold <= 0.0 or self.scorer is None:
+            row, wave = self._chunked_synthesis(utt, utt_index, seed, verify=True)
+            row["gate_threshold"] = 0.0
+            row["gate_stat"] = gate_stat
+            row["fallback"] = False
+            row.setdefault("draft_confidence", None)
+            return row, wave
+
+        confidence = self._draft_confidence(utt, seed, gate_stat)
+        if confidence is not None and confidence < threshold:
+            row, wave = self.synth_A(utt, utt_index, seed)
+            row.update({
+                "config": "C",
+                "config_label": CONFIG_LABELS["C"],
+                "verify_mode": "ar_fallback",
+                "fallback": True,
+                "gate_threshold": threshold,
+                "gate_stat": gate_stat,
+                "draft_confidence": confidence,
+                "accept_true": None,
+                "accept_synth": None,
+                "n_transitions": row.get("n_transitions"),
+                "chunks": [],
+                "zone_stats": {},
+                "switch_frames": [],
+                "frame_zones_b64": None,
+                "frame_accept_true_b64": None,
+                "frame_accept_synth_b64": None,
+                "frame_valid_b64": None,
+            })
+            return row, wave
+
+        row, wave = self._chunked_synthesis(utt, utt_index, seed, verify=True)
+        row["gate_threshold"] = threshold
+        row["gate_stat"] = gate_stat
+        row["fallback"] = False
+        row["draft_confidence"] = confidence
+        return row, wave
+
     @property
     def vocab_size(self) -> int:
         if self.scorer is not None and self.scorer.vocab:
             return int(self.scorer.vocab)
         return 1024
-
 
 # ===========================================================================
 # ASR / intelligibility
@@ -1075,7 +1266,14 @@ def aggregate_zones(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
+                      gate_threshold: float = 0.0) -> Dict[str, Dict[str, Any]]:
+    """Aggregate per-configuration statistics.
+
+    Config C rows are filtered to ``gate_threshold`` so a gate sweep stored in
+    one JSONL does not contaminate the main comparison (default 0.0 = the
+    un-gated hybrid).
+    """
     agg: Dict[str, Dict[str, Any]] = {}
     # Session cold start: the very first successful synthesis of the process
     # (configurations are interleaved per utterance, so this is the only row
@@ -1096,6 +1294,14 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dic
     for cfg in configs:
         ok = [r for r in rows if r.get("config") == cfg and not r.get("error")]
         err = [r for r in rows if r.get("config") == cfg and r.get("error")]
+        if cfg == "C" and any(float(r.get("gate_threshold") or 0.0) != float(gate_threshold)
+                              for r in ok):
+            filtered = [r for r in ok
+                        if float(r.get("gate_threshold") or 0.0) == float(gate_threshold)]
+            if filtered:  # never let the gate sweep empty the main comparison
+                ok = filtered
+                err = [r for r in err
+                       if float(r.get("gate_threshold") or 0.0) == float(gate_threshold)]
         if not ok:
             agg[cfg] = {"n": 0, "errors": len(err)}
             continue
@@ -1154,12 +1360,108 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dic
             "asr_fail_utts": sorted(
                 str(r.get("utt_id")) for r in ok if (r.get("cer") or 0.0) > ASR_FAIL_CER
             ),
+            "fallback_utts": sum(1 for r in ok if r.get("fallback")),
+            "fallback_rate": (sum(1 for r in ok if r.get("fallback")) / len(ok)) if ok else None,
+            "gate_threshold": float(gate_threshold) if cfg == "C" else None,
+            "gate_stat": next((r.get("gate_stat") for r in ok if r.get("gate_stat")), None),
             "verify_modes": sorted({str(r.get("verify_mode")) for r in ok}),
             "registers": registers,
             "values": values,
             "zones": aggregate_zones(ok),
         }
     return agg
+
+
+# ===========================================================================
+# Gate sweep + distance-to-switch analyses (config C)
+# ===========================================================================
+def aggregate_gate_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Realised latency/quality/fallback statistics per gate threshold (config C).
+
+    Each entry is one operating point of the confidence-gated hybrid: the
+    latency is the *measured* latency of the mixture (speculation + AR
+    fallbacks), the CER the measured ASR score of the resulting audio.
+    """
+    out: List[Dict[str, Any]] = []
+    thresholds = sorted({
+        float(r.get("gate_threshold") or 0.0)
+        for r in rows
+        if r.get("config") == "C" and not r.get("error")
+    })
+    for thr in thresholds:
+        sub = [r for r in rows if r.get("config") == "C" and not r.get("error")
+               and float(r.get("gate_threshold") or 0.0) == thr]
+        if not sub:
+            continue
+        fb = [r for r in sub if r.get("fallback")]
+        out.append({
+            "threshold": thr,
+            "n": len(sub),
+            "fallback_utts": len(fb),
+            "fallback_rate": len(fb) / len(sub),
+            "cer": _stats([r.get("cer") for r in sub]),
+            "cer_fallback": _stats([r.get("cer") for r in fb]),
+            "cer_speculative": _stats([r.get("cer") for r in sub if not r.get("fallback")]),
+            "ttfa_compute": _stats([r.get("ttfa_compute_ms") for r in sub]),
+            "ttfa_e2e": _stats([r.get("ttfa_e2e_ms") for r in sub]),
+            "total": _stats([r.get("total_ms") for r in sub]),
+            "rtf": _stats([r.get("rtf") for r in sub]),
+            "accept_true": _stats([r.get("accept_true") for r in sub if not r.get("fallback")]),
+            "asr_fail": sum(1 for r in sub if (r.get("cer") or 0.0) > ASR_FAIL_CER),
+            "cer_values": _finite_values(sub, "cer"),
+            "total_values": _finite_values(sub, "total_ms"),
+        })
+    return out
+
+
+def switch_distance_table(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """CB0 acceptance as a function of frames since the last Tamil<->Latin switch.
+
+    Uses the packed per-frame telemetry (``frame_accept_true_b64`` /
+    ``frame_valid_b64`` / ``switch_frames``), so the analysis conditions on
+    actually-speculated frames only.  Each bucket reports the frame count, the
+    number of utterances and a paired bootstrap over utterances against the
+    ``16+`` reference bucket.
+    """
+    per_utt: Dict[str, Dict[str, float]] = {}
+    counts: Dict[str, int] = {name: 0 for name, _, _ in SWITCH_DIST_BUCKETS}
+    for r in rows:
+        if r.get("config") != "C" or r.get("error"):
+            continue
+        arrs = frame_accept_arrays(r)
+        if arrs is None:
+            continue
+        accept, valid, dist = arrs
+        buckets: Dict[str, float] = {}
+        for name, lo, hi in SWITCH_DIST_BUCKETS:
+            mask = valid & (dist >= lo) & (dist < hi)
+            if not mask.any():
+                continue
+            buckets[name] = float(accept[mask].mean() * 100.0)
+            counts[name] += int(mask.sum())
+        if buckets:
+            per_utt[str(r.get("utt_id"))] = buckets
+
+    ref = SWITCH_DIST_BUCKETS[-1][0]
+    out: List[Dict[str, Any]] = []
+    for name, _, _ in SWITCH_DIST_BUCKETS:
+        vals = [b[name] for b in per_utt.values() if name in b]
+        pairs = ([] if name == ref else
+                 [(b[name], b[ref]) for b in per_utt.values() if name in b and ref in b])
+        diff, lo, hi, p = paired_bootstrap(pairs)
+        out.append({
+            "bucket": name,
+            "n_frames": counts[name],
+            "n_utts": len(vals),
+            "mean": float(np.mean(vals)) if vals else None,
+            "std": float(np.std(vals, ddof=0)) if vals else None,
+            "n_paired": len(pairs),
+            "delta_vs_far": diff,
+            "delta_ci_lo": lo,
+            "delta_ci_hi": hi,
+            "p_vs_far": p,
+        })
+    return out
 
 
 # ===========================================================================
@@ -1739,6 +2041,16 @@ def _mean_pm(entry: Dict[str, Any], key: str, digits: int = 1) -> str:
     return f"{mean:.{digits}f}$\\pm${std:.{digits}f}"
 
 
+def _fmt_stat(value: Optional[float], digits: int = 0) -> str:
+    """Plain console formatting for a scalar stat (or '--')."""
+    if value is None:
+        return "--"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "--"
+
+
 def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
     lines = [
         "% Table I: comparative performance (TTFA medians; mean $\\pm$ std for acceptance)",
@@ -1950,6 +2262,244 @@ def build_table_III(agg: Dict[str, Dict[str, Any]]) -> str:
 # ===========================================================================
 # CLI
 # ===========================================================================
+def figure5_gate_pareto(rows: List[Dict[str, Any]], agg: Dict[str, Dict[str, Any]],
+                        out_dir: Path) -> Optional[List[str]]:
+    """Fig. 5: (a) confidence-gated operating points, (b) draft-confidence calibration."""
+    try:
+        plt = _ieee_style()
+    except Exception as exc:
+        print(f"[Figures] matplotlib unavailable: {exc}")
+        return None
+    from matplotlib.lines import Line2D
+
+    gate_rows = aggregate_gate_sweep(rows)
+    if not gate_rows:
+        return None
+    c_rows = [r for r in rows if r.get("config") == "C" and not r.get("error")]
+    if not c_rows:
+        return None
+
+    fig, axes = plt.subplots(1, 2, figsize=(7.16, 2.6))
+    rng = np.random.RandomState(20261018)
+
+    # ---- (a) latency-quality operating points ------------------------------
+    ax = axes[0]
+    pts: List[Tuple[float, float, float]] = []  # (total p50, cer p50, fallback rate)
+    for entry in gate_rows:
+        total = (entry.get("total") or {}).get("p50")
+        cer = (entry.get("cer") or {}).get("p50")
+        if total is None or cer is None:
+            continue
+        pts.append((float(total), float(cer) * 100.0, float(entry.get("fallback_rate") or 0.0)))
+    pts.sort()
+    if pts:
+        ax.plot([p[0] for p in pts], [p[1] for p in pts], color=CONFIG_COLORS["C"],
+                marker="o", ms=4.5, linewidth=1.0, zorder=3, label=None)
+        for k, (total, cer, fb) in enumerate(pts):
+            ax.annotate(f"{fb * 100:.0f}% AR fallback", xy=(total, cer),
+                        textcoords="offset points",
+                        xytext=(5, -12 if k % 2 == 0 else -24),
+                        ha="left", va="top", fontsize=6.2, color="#555555")
+    a_entry = agg.get("A") or {}
+    a_total = (a_entry.get("total") or {}).get("p50")
+    a_cer = (a_entry.get("cer") or {}).get("p50")
+    if a_total is not None and a_cer is not None:
+        ax.scatter([float(a_total)], [float(a_cer) * 100.0], s=34, marker="s",
+                   color=CONFIG_COLORS["A"], zorder=4, label="Pure AR")
+    b_entry = agg.get("B") or {}
+    b_total = (b_entry.get("total") or {}).get("p50")
+    b_cer = (b_entry.get("cer") or {}).get("p50")
+    if b_total is not None and b_cer is not None:
+        ax.scatter([float(b_total)], [float(b_cer) * 100.0], s=34, marker="^",
+                   color=CONFIG_COLORS["B"], zorder=4, label="Pure NAR")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Total synthesis latency, p50 (ms, log)", fontsize=9)
+    ax.set_ylabel("CER p50 (%, log, lower better)", fontsize=9)
+    ax.set_title("(a) Confidence-gated operating points", fontsize=9)
+    ax.set_axisbelow(True)
+    handles = [Line2D([], [], marker="o", ms=4.5, linestyle="-", linewidth=1.0,
+                      color=CONFIG_COLORS["C"], label="Hybrid, gate $\\tau$ sweep"),
+               Line2D([], [], marker="s", ms=4.5, linestyle="none", color=CONFIG_COLORS["A"],
+                      label="Pure AR"),
+               Line2D([], [], marker="^", ms=5, linestyle="none", color=CONFIG_COLORS["B"],
+                      label="Pure NAR")]
+    ax.legend(handles=handles, loc="lower left", frameon=True, framealpha=0.9,
+              edgecolor="#dddddd", fontsize=6.8, handletextpad=0.4, borderpad=0.4)
+
+    # ---- (b) draft-confidence calibration ----------------------------------
+    ax = axes[1]
+    conf: List[float] = []
+    accept: List[float] = []
+    for r in c_rows:
+        for ch in (r.get("chunks") or []):
+            c = ch.get("confidence")
+            a = ch.get("accept_true")
+            if c is None or a is None:
+                continue
+            conf.append(float(c))
+            accept.append(float(a))
+    if conf:
+        ax.scatter(conf, accept, s=7, color=CONFIG_COLORS["C"], alpha=0.55, linewidths=0, zorder=3)
+        conf_arr = np.asarray(conf)
+        acc_arr = np.asarray(accept)
+        edges = np.linspace(float(conf_arr.min()), float(conf_arr.max()) + 1e-6, 9)
+        centers, means = [], []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            mask = (conf_arr >= lo) & (conf_arr < hi)
+            if mask.sum() >= 3:
+                centers.append((lo + hi) / 2.0)
+                means.append(float(acc_arr[mask].mean()))
+        if centers:
+            ax.plot(centers, means, color="#333333", marker="o", ms=3.6, linewidth=1.0, zorder=4)
+        ax.set_xlabel("Draft confidence (mean top-1 prob. per chunk)", fontsize=9)
+        ax.set_ylabel("Realised CB0 acceptance (%)", fontsize=9)
+        ax.set_title("(b) Gate calibration", fontsize=9)
+        ax.set_axisbelow(True)
+        # Spearman-style rank correlation without scipy.
+        if conf_arr.size >= 3:
+            rank_conf = np.argsort(np.argsort(conf_arr))
+            rank_acc = np.argsort(np.argsort(acc_arr))
+            rho = float(np.corrcoef(rank_conf, rank_acc)[0, 1])
+            ax.annotate(f"$\\rho$ = {rho:.2f}  (n = {conf_arr.size} chunks)",
+                        xy=(0.03, 0.95), xycoords="axes fraction", va="top", ha="left",
+                        fontsize=7, color="#444444")
+    else:
+        ax.text(0.5, 0.5, "no per-chunk confidence recorded", ha="center", va="center",
+                transform=ax.transAxes, fontsize=8, color="#777777")
+        ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    paths = _save_fig(fig, out_dir, "fig5_gate_pareto_calibration")
+    plt.close(fig)
+    return paths
+
+
+def build_table_IV(switch_rows: List[Dict[str, Any]]) -> str:
+    """Table IV: CB0 acceptance vs frames since the last code switch."""
+    lines = [
+        "% Table IV: distance-to-switch acceptance (power analysis for the boundary claim)",
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{CB0 acceptance on the hybrid configuration as a function of frames since the "
+        "last Tamil$\\leftrightarrow$Latin switch (packed per-frame telemetry, speculated frames "
+        "only). $\\Delta$ is the paired per-utterance difference against the $\\geq$16-frame "
+        "reference bucket with a 95\\% bootstrap CI; significance still requires a larger draft, "
+        "but this curve has the power that the four-way zone contrast lacks.}",
+        "\\label{tab:switchdist}",
+        "\\begin{tabular}{lccccc}",
+        "\\toprule",
+        "Frames since switch & Frames & Utts & CB0 acc.\\ (\\%) & $\\Delta$ vs $\\geq$16 (pts) & $p$ \\\\",
+        "\\midrule",
+    ]
+    for entry in switch_rows:
+        mean = "--" if entry.get("mean") is None else f"{entry['mean']:.1f}$\\pm${(entry.get('std') or 0.0):.1f}"
+        if entry.get("delta_vs_far") is None:
+            delta_cell, p_cell = "--", "--"
+        else:
+            delta_cell = (f"{entry['delta_vs_far']:+.1f} "
+                          f"[{entry['delta_ci_lo']:+.1f}, {entry['delta_ci_hi']:+.1f}]")
+            p_cell = f"{entry['p_vs_far']:.3f}"
+        label = entry["bucket"].replace("16+", "$\\geq$16").replace("-", "--")
+        lines.append(" & ".join([
+            label, str(entry.get("n_frames") or 0), str(entry.get("n_utts") or 0),
+            mean, delta_cell, p_cell,
+        ]) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines)
+
+
+def build_table_V(gate_rows: List[Dict[str, Any]], config_a: Optional[Dict[str, Any]] = None) -> str:
+    """Table V: confidence-gated operating points (measured latency vs quality)."""
+    lines = [
+        "% Table V: confidence-gated speculative decoding - measured operating points",
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Confidence-gated hybrid: the draft runs first and utterances whose worst-chunk "
+        "draft confidence falls below $\\tau$ are handed to the full AR pipeline. Latency/CER are "
+        "the measured end-to-end values of that mixture (fallback cost included); the gate turns "
+        "speculation quality into an explicit operating point rather than an assumption.}",
+        "\\label{tab:gate}",
+        "\\begin{tabular}{cccccccc}",
+        "\\toprule",
+        "$\\tau$ & AR fallback (\\%) & TTFA-c p50 (ms) & TTFA e2e p50 (ms) & Total p50 (ms) & RTF & CER p50 (\\%) & CB0 acc.\\ (\\%) \\\\",
+        "\\midrule",
+    ]
+    for entry in gate_rows:
+        lines.append(" & ".join([
+            f"{entry['threshold']:.2f}",
+            f"{entry['fallback_rate'] * 100.0:.1f}",
+            _tex((entry.get("ttfa_compute") or {}).get("p50"), 0),
+            _tex((entry.get("ttfa_e2e") or {}).get("p50"), 0),
+            _tex((entry.get("total") or {}).get("p50"), 0),
+            _tex((entry.get("rtf") or {}).get("mean"), 2),
+            _tex(None if (entry.get("cer") or {}).get("p50") is None
+                 else float(entry["cer"]["p50"]) * 100.0, 1),
+            _mean_pm(entry.get("accept_true") or {}, "mean"),
+        ]) + " \\\\")
+    if config_a and (config_a.get("n") or 0) > 0:
+        lines.append("\\midrule")
+        lines.append(" & ".join([
+            "AR (A)",
+            "100.0",
+            _tex((config_a.get("ttfa_compute_warm") or {}).get("p50"), 0),
+            _tex((config_a.get("ttfa_e2e_warm") or {}).get("p50"), 0),
+            _tex((config_a.get("total") or {}).get("p50"), 0),
+            _tex((config_a.get("rtf") or {}).get("mean"), 2),
+            _tex(None if (config_a.get("cer") or {}).get("p50") is None
+                 else float(config_a["cer"]["p50"]) * 100.0, 1),
+            "--",
+        ]) + " \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}", "\\end{table}"]
+    return "\n".join(lines)
+
+
+def print_gate_sweep(gate_rows: List[Dict[str, Any]]) -> None:
+    if not gate_rows:
+        return
+    print("\n" + "-" * 78)
+    print("CONFIDENCE-GATED HYBRID (config C operating points)")
+    print("-" * 78)
+    print(f"{'tau':>5} {'AR fallback':>12} {'TTFA-c p50':>11} {'Total p50':>10} "
+          f"{'RTF':>6} {'CER p50':>8} {'CB0 acc.':>9} {'halluc.':>8}")
+    for entry in gate_rows:
+        cer = entry.get("cer") or {}
+        total = entry.get("total") or {}
+        acc = entry.get("accept_true") or {}
+        print(
+            f"{entry['threshold']:>5.2f} {entry['fallback_rate'] * 100.0:>11.1f}% "
+            f"{_fmt_stat((entry.get('ttfa_compute') or {}).get('p50'), 0):>11} "
+            f"{_fmt_stat(total.get('p50'), 0):>10} "
+            f"{_fmt_stat((entry.get('rtf') or {}).get('mean'), 3):>6} "
+            f"{_fmt_stat(None if cer.get('p50') is None else float(cer['p50']) * 100.0, 1) + '%':>8} "
+            f"{_fmt_stat(acc.get('mean'), 1) + '%':>9} "
+            f"{entry.get('asr_fail', 0):>3}/{entry.get('n', 0):<3}"
+        )
+    print("gate: fallback rows are excluded from acceptance but included in latency/CER.")
+
+
+def print_switch_distance(switch_rows: List[Dict[str, Any]]) -> None:
+    if not switch_rows or all(r.get("mean") is None for r in switch_rows):
+        return
+    print("\n" + "-" * 78)
+    print("DISTANCE-TO-SWITCH ACCEPTANCE (config C, speculated frames only)")
+    print("-" * 78)
+    print(f"{'frames since switch':>20} {'frames':>8} {'utts':>6} {'acc. (%)':>10} "
+          f"{'delta vs >=16':>16} {'p':>7}")
+    for entry in switch_rows:
+        if entry.get("mean") is None:
+            continue
+        delta = ("--" if entry.get("delta_vs_far") is None else
+                 f"{entry['delta_vs_far']:+.1f} [{entry['delta_ci_lo']:+.1f},{entry['delta_ci_hi']:+.1f}]")
+        p = "--" if entry.get("p_vs_far") is None else f"{entry['p_vs_far']:.3f}"
+        print(f"{entry['bucket']:>20} {entry.get('n_frames', 0):>8} "
+              f"{entry.get('n_utts', 0):>6} {entry['mean']:>9.1f}% {delta:>16} {p:>7}")
+    print("note: delta/p are paired over utterances that contribute to both buckets.")
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="CodeSwitch-TTS full evaluation suite (60-utterance benchmark, figures, LaTeX).",
@@ -1982,6 +2532,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Parler streamer play_steps (smaller = lower TTFA, more decode calls).")
     p.add_argument("--boundary-frames", type=int, default=3,
                    help="Frames after a language switch counted as boundary zone.")
+    p.add_argument("--gate-thresholds", type=str, default="0.0",
+                   help="Comma-separated draft-confidence thresholds for config C. 0 disables the "
+                        "gate; each threshold adds its own (config, utterance, threshold) rows, so "
+                        "a single run produces the whole latency-quality operating curve.")
+    p.add_argument("--gate-stat", choices=["utt_min", "utt_mean"], default="utt_min",
+                   help="Utterance-level draft-confidence statistic compared with the threshold "
+                        "(utt_min = worst chunk, the conservative default).")
     return p
 
 
@@ -2137,86 +2694,105 @@ def main(argv: Optional[List[str]] = None) -> int:
         json.dumps(run_meta, indent=2, default=str), encoding="utf-8"
     )
 
-    done = {(r.get("config"), r.get("utt_id")) for r in rows if not r.get("error")}
+    done = {(r.get("config"), r.get("utt_id"), float(r.get("gate_threshold") or 0.0))
+            for r in rows if not r.get("error")}
     utterances = EVAL_UTTERANCES[: args.limit] if args.limit else EVAL_UTTERANCES
+    gate_thresholds = [float(t) for t in str(args.gate_thresholds).split(",")
+                       if str(t).strip() != ""] or [0.0]
 
     # ---------------- synthesis loop ----------------
     n_runs_since_gc = 0
     for utt_index, utt in enumerate(utterances):
         for cfg in configs:
-            if (cfg, utt["id"]) in done and not args.force:
-                continue
-            seed = args.seed * 100003 + utt_index * 7 + {"A": 0, "B": 1, "C": 2}[cfg]
-            label = f"[{cfg}][{utt['id']}]"
-            t0 = _now()
-            try:
-                if cfg == "A":
-                    row, wave = synthesizer.synth_A(utt, utt_index, seed)
-                elif cfg == "B":
-                    row, wave = synthesizer._chunked_synthesis(utt, utt_index, seed, verify=False)
+            for threshold in (gate_thresholds if cfg == "C" else [0.0]):
+                if (cfg, utt["id"], threshold) in done and not args.force:
+                    continue
+                seed = args.seed * 100003 + utt_index * 7 + {"A": 0, "B": 1, "C": 2}[cfg]
+                label = f"[{cfg}][{utt['id']}]" + (f"[g{threshold:.2f}]" if threshold > 0 else "")
+                t0 = _now()
+                try:
+                    if cfg == "A":
+                        row, wave = synthesizer.synth_A(utt, utt_index, seed)
+                        row["gate_threshold"] = 0.0
+                    elif cfg == "B":
+                        row, wave = synthesizer._chunked_synthesis(utt, utt_index, seed, verify=False)
+                        row["gate_threshold"] = 0.0
+                    else:
+                        row, wave = synthesizer.synth_C(
+                            utt, utt_index, seed, gate_threshold=threshold,
+                            gate_stat=args.gate_stat,
+                        )
+                except Exception as exc:
+                    row = synthesizer._base_row(cfg, utt, utt_index, synthesizer.normalize(utt["text"]))
+                    row["error"] = f"{type(exc).__name__}: {exc}"
+                    row["seed"] = seed
+                    row["gate_threshold"] = float(threshold)
+                    wave = None
+                    print(f"{label} ❌ {row['error']}")
+
+                if row.get("error") is None and wave is not None:
+                    if not args.no_save_audio:
+                        from codeswitch_tts.utils.audio import save_wav
+
+                        wav_path = audio_dir / (cfg if threshold <= 0 else
+                                                f"{cfg}_g{threshold:.2f}") / f"{utt['id']}.wav"
+                        save_wav(wav_path, wave, sample_rate=row["sample_rate"], normalize=False)
+                        row["audio_path"] = str(wav_path)
+                    if asr.available:
+                        hyp = asr.transcribe(wave, row["sample_rate"])
+                        cer, wer = ASREvaluator.score(row["normalized_text"], hyp)
+                        row["asr_text"] = hyp
+                        row["cer"] = cer
+                        row["wer"] = wer
+                    else:
+                        row["cer"] = None
+                        row["wer"] = None
+                        row["asr_text"] = None
+
+                if row.get("utt_index") is None:
+                    row["utt_index"] = utt_index
+
+                # replace any previous row for (cfg, utt, gate) then persist
+                rows = [r for r in rows
+                        if not (r.get("config") == cfg and r.get("utt_id") == utt["id"]
+                                and float(r.get("gate_threshold") or 0.0) == float(threshold))]
+                rows.append(row)
+                save_results(results_path, rows)
+                done.add((cfg, utt["id"], float(threshold)))
+
+                elapsed = _now() - t0
+                if row.get("error"):
+                    pass
                 else:
-                    row, wave = synthesizer._chunked_synthesis(utt, utt_index, seed, verify=True)
-            except Exception as exc:
-                row = synthesizer._base_row(cfg, utt, utt_index, synthesizer.normalize(utt["text"]))
-                row["error"] = f"{type(exc).__name__}: {exc}"
-                row["seed"] = seed
-                wave = None
-                print(f"{label} ❌ {row['error']}")
-
-            if row.get("error") is None and wave is not None:
-                if not args.no_save_audio:
-                    from codeswitch_tts.utils.audio import save_wav
-
-                    wav_path = audio_dir / cfg / f"{utt['id']}.wav"
-                    save_wav(wav_path, wave, sample_rate=row["sample_rate"], normalize=False)
-                    row["audio_path"] = str(wav_path)
-                if asr.available:
-                    hyp = asr.transcribe(wave, row["sample_rate"])
-                    cer, wer = ASREvaluator.score(row["normalized_text"], hyp)
-                    row["asr_text"] = hyp
-                    row["cer"] = cer
-                    row["wer"] = wer
-                else:
-                    row["cer"] = None
-                    row["wer"] = None
-                    row["asr_text"] = None
-
-            if row.get("utt_index") is None:
-                row["utt_index"] = utt_index
-
-            # replace any previous row for (cfg, utt) then persist
-            rows = [r for r in rows if not (r.get("config") == cfg and r.get("utt_id") == utt["id"])]
-            rows.append(row)
-            save_results(results_path, rows)
-            done.add((cfg, utt["id"]))
-
-            elapsed = _now() - t0
-            if row.get("error"):
-                pass
-            else:
-                print(
-                    f"{label} t_c={row.get('ttfa_compute_ms') if row.get('ttfa_compute_ms') is None else round(row['ttfa_compute_ms'])}ms "
-                    f"t_e2e={row.get('ttfa_e2e_ms') if row.get('ttfa_e2e_ms') is None else round(row['ttfa_e2e_ms'])}ms "
-                    f"total={round(row.get('total_ms') or 0)}ms rtf={row.get('rtf') if row.get('rtf') is None else round(row['rtf'], 2)} "
-                    f"acc_true={row.get('accept_true') if row.get('accept_true') is None else round(row['accept_true'], 1)} "
-                    f"acc_ref={row.get('accept_synth') if row.get('accept_synth') is None else round(row['accept_synth'], 1)} "
-                    f"cer={row.get('cer') if row.get('cer') is None else round(row['cer'], 3)} "
-                    f"[{elapsed:.1f}s]"
-                )
-            n_runs_since_gc += 1
-            if n_runs_since_gc >= 5:
-                n_runs_since_gc = 0
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    print(
+                        f"{label} t_c={row.get('ttfa_compute_ms') if row.get('ttfa_compute_ms') is None else round(row['ttfa_compute_ms'])}ms "
+                        f"t_e2e={row.get('ttfa_e2e_ms') if row.get('ttfa_e2e_ms') is None else round(row['ttfa_e2e_ms'])}ms "
+                        f"total={round(row.get('total_ms') or 0)}ms rtf={row.get('rtf') if row.get('rtf') is None else round(row['rtf'], 2)} "
+                        f"acc_true={row.get('accept_true') if row.get('accept_true') is None else round(row['accept_true'], 1)} "
+                        f"acc_ref={row.get('accept_synth') if row.get('accept_synth') is None else round(row['accept_synth'], 1)} "
+                        f"cer={row.get('cer') if row.get('cer') is None else round(row['cer'], 3)} "
+                        + (f"conf={row['draft_confidence']:.3f} " if row.get("draft_confidence") is not None else "")
+                        + ("FALLBACK " if row.get("fallback") else "")
+                        + f"[{elapsed:.1f}s]"
+                    )
+                n_runs_since_gc += 1
+                if n_runs_since_gc >= 5:
+                    n_runs_since_gc = 0
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
     return _finish(rows, args, configs, results_path, figures_dir, t_all)
 
 
 def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: float) -> int:
-    agg = aggregate_results(rows, configs)
+    gate_threshold = float(getattr(args, "gate_thresholds", "0.0").split(",")[0] or 0.0)
+    agg = aggregate_results(rows, configs, gate_threshold=gate_threshold)
+    gate_rows = aggregate_gate_sweep(rows)
+    switch_rows = switch_distance_table(rows)
     tables_tex = (
         build_table_I(agg) + "\n\n" + build_table_II(agg) + "\n\n" + build_table_III(agg)
+        + "\n\n" + build_table_IV(switch_rows) + "\n\n" + build_table_V(gate_rows, agg.get("A"))
     )
     (figures_dir / "tables.tex").write_text(tables_tex, encoding="utf-8")
 
@@ -2280,6 +2856,9 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
                 f"acc_true={'--' if acc is None else f'{acc:.1f}%'}"
             )
 
+    print_gate_sweep(gate_rows)
+    print_switch_distance(switch_rows)
+
     fig_paths: Dict[str, List[str]] = {}
     for name, fn in (
         ("fig1", figure1_latency_quality),
@@ -2298,6 +2877,12 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
     except Exception as exc:
         print(f"[Figures] fig4 failed: {type(exc).__name__}: {exc}")
     try:
+        paths = figure5_gate_pareto(rows, agg, figures_dir)
+        if paths:
+            fig_paths["fig5"] = paths
+    except Exception as exc:
+        print(f"[Figures] fig5 failed: {type(exc).__name__}: {exc}")
+    try:
         paths = figure3_stream_timeline(rows, figures_dir)
         if paths:
             fig_paths["fig3"] = paths
@@ -2308,6 +2893,8 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
         "n_rows": len(rows),
         "configs": configs,
         "aggregates": agg,
+        "gate_sweep": gate_rows,
+        "switch_distance": switch_rows,
         "figures": fig_paths,
         "tables_tex": str(figures_dir / "tables.tex"),
     }
@@ -2327,6 +2914,14 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
     print("TABLE III (LaTeX)")
     print("-" * 78)
     print(build_table_III(agg))
+    print("\n" + "-" * 78)
+    print("TABLE IV (LaTeX) - distance-to-switch acceptance")
+    print("-" * 78)
+    print(build_table_IV(switch_rows))
+    print("\n" + "-" * 78)
+    print("TABLE V (LaTeX) - confidence-gated operating points")
+    print("-" * 78)
+    print(build_table_V(gate_rows, agg.get("A")))
     print("\n" + "-" * 78)
     print(f"Artifacts: {results_path} | {figures_dir}/tables.tex | {figures_dir}/summary.json")
     for name, paths in fig_paths.items():

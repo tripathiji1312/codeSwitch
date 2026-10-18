@@ -63,22 +63,24 @@ def _zones_for(text: str, n_frames: int = 120):
     norm = TanglishNormalizer().normalize(text)
     spans = R.find_transit_spans(norm.normalized_text, norm.entity_replacements)
     char_zones = R.label_char_zones(norm.normalized_text, spans)
-    return norm, char_zones, *R.assign_frame_zones(char_zones, n_frames)
+    frame_zones, transitions, switch_frames = R.assign_frame_zones(char_zones, n_frames)
+    return norm, char_zones, frame_zones, transitions, switch_frames
 
 
 def test_zones_pure_tamil_has_no_boundaries():
-    norm, char_zones, frame_zones, transitions = _zones_for(
+    norm, char_zones, frame_zones, transitions, switch_frames = _zones_for(
         "வணக்கம், உங்கள் ஆர்டர் தயாராகிவிட்டது."
     )
     assert (char_zones == R.ZONE_TAMIL).any()
     assert transitions == 0
+    assert switch_frames == []
     assert (frame_zones == R.ZONE_BOUNDARY).sum() == 0
     assert (frame_zones == R.ZONE_TAMIL).sum() > 0
     assert frame_zones.shape[0] == 120
 
 
 def test_zones_transit_codemix_detects_all_four_zones():
-    norm, char_zones, frame_zones, transitions = _zones_for(
+    norm, char_zones, frame_zones, transitions, switch_frames = _zones_for(
         "Driver-ku OTP 8421 sollunga, fare Rs. 350."
     )
     norm_text = norm.normalized_text
@@ -90,13 +92,15 @@ def test_zones_transit_codemix_detects_all_four_zones():
     assert R.ZONE_TRANSIT in present          # verbalised entities
     assert R.ZONE_BOUNDARY in present         # cross-lingual switches
     assert transitions >= 2
+    assert len(switch_frames) == transitions
+    assert switch_frames == sorted(switch_frames)
     assert (frame_zones == R.ZONE_BOUNDARY).sum() <= 3 * transitions
 
 
 def test_frame_zone_alignment_is_bounded_and_monotonic():
     text = "Unga order vandhuduchu, OTP 8421 confirm aagiduchu."
     for n_frames in (30, 86, 300):
-        _, _, frame_zones, transitions = _zones_for(text, n_frames=n_frames)
+        _, _, frame_zones, transitions, _sw = _zones_for(text, n_frames=n_frames)
         assert frame_zones.shape == (n_frames,)
         assert set(np.unique(frame_zones).tolist()) <= {
             R.ZONE_NONE, R.ZONE_TAMIL, R.ZONE_ENGLISH, R.ZONE_TRANSIT, R.ZONE_BOUNDARY
@@ -271,15 +275,50 @@ def _fabricated_rows() -> list[dict]:
             "dac_ms_total": 200.0, "accept_true": 68.0 + i, "accept_synth": 74.0 + i,
             "cer": 0.15 - 0.005 * i, "wer": 0.3, "n_frames": 172, "n_transitions": 4,
             "zone_stats": zone_stats_c, "verify_mode": "true", "error": None,
+            "gate_threshold": 0.0, "gate_stat": "utt_min", "fallback": False,
+            "draft_confidence": 0.42 + 0.02 * i,
+            "switch_frames": [40, 120],
+            "frame_zones_b64": R.pack_u8(np.array(
+                [1] * 40 + [4] * 3 + [2] * 77 + [4] * 3 + [1] * 49, dtype=np.uint8)),
+            "frame_accept_true_b64": R.pack_bits(
+                np.array([(j % 3 != 0) for j in range(172)], dtype=bool)),
+            "frame_accept_synth_b64": R.pack_bits(
+                np.array([(j % 4 != 0) for j in range(172)], dtype=bool)),
+            "frame_valid_b64": R.pack_bits(np.ones(172, dtype=bool)),
             "chunks": [
                 {"idx": 0, "n_frames": 86, "verify_ms": 90.0, "residual_ms": 130.0,
                  "dac_ms": 200.0, "ready_ms": 300.0 + 5 * i, "accept_true": 70.0,
-                 "accept_synth": 75.0},
+                 "accept_synth": 75.0, "confidence": 0.44},
                 {"idx": 1, "n_frames": 86, "verify_ms": 85.0, "residual_ms": 120.0,
                  "dac_ms": 210.0, "ready_ms": 900.0 + 5 * i, "accept_true": 66.0,
-                 "accept_synth": 72.0},
+                 "accept_synth": 72.0, "confidence": 0.38},
             ],
         })
+        # gated variant at tau=0.5: utterance 0 falls back to AR, 1 and 2 stay speculative
+        if i == 0:
+            rows.append({
+                "schema": R.SCHEMA_VERSION, "config": "C", "config_label": R.CONFIG_LABELS["C"],
+                "utt_id": f"ta-0{i + 1}", "register": "native_tamil", "utt_index": i,
+                "text": "x", "normalized_text": "x", "sample_rate": 44100,
+                "ttfa_compute_ms": 900.0, "ttfa_e2e_ms": 1100.0, "total_ms": 7000.0,
+                "rtf": 2.2, "audio_sec": 3.1, "accept_true": None, "accept_synth": None,
+                "cer": 0.14, "wer": 0.3, "n_frames": None, "zone_stats": {}, "chunks": [],
+                "verify_mode": "ar_fallback", "error": None, "fallback": True,
+                "gate_threshold": 0.5, "gate_stat": "utt_min", "draft_confidence": 0.21,
+            })
+        else:
+            rows.append({
+                "schema": R.SCHEMA_VERSION, "config": "C", "config_label": R.CONFIG_LABELS["C"],
+                "utt_id": f"ta-0{i + 1}", "register": "native_tamil", "utt_index": i,
+                "text": "x", "normalized_text": "x", "sample_rate": 44100,
+                "ttfa_compute_ms": 270.0 + 5 * i, "ttfa_e2e_ms": 310.0 + 5 * i,
+                "total_ms": 3300.0 + 100 * i, "rtf": 1.06, "audio_sec": 3.1,
+                "accept_true": 50.0 + i, "accept_synth": 55.0 + i,
+                "cer": 0.12 - 0.005 * i, "wer": 0.3, "n_frames": 172, "n_transitions": 4,
+                "zone_stats": zone_stats_c, "verify_mode": "true", "error": None,
+                "fallback": False, "gate_threshold": 0.5, "gate_stat": "utt_min",
+                "draft_confidence": 0.51 + 0.02 * i, "chunks": [],
+            })
     return rows
 
 
@@ -439,6 +478,8 @@ def test_module_arg_parsers_exist():
     assert eval_args.ckpt == "codeswitch_ckpt"
     assert eval_args.configs == "A,B,C"
     assert math.isfinite(eval_args.seed)
+    assert eval_args.gate_thresholds == "0.0"
+    assert eval_args.gate_stat in ("utt_min", "utt_mean")
 
     import train_draft_distill as T
 
@@ -446,6 +487,159 @@ def test_module_arg_parsers_exist():
     assert train_args.num_sentences == 300
     assert train_args.target_source == "auto"
     assert train_args.dry_run is False
+
+
+# ===========================================================================
+# Confidence gate, frame telemetry, distance-to-switch analysis
+# ===========================================================================
+def test_switch_distances_and_buckets():
+    dist = R.switch_distances(20, [5, 12])
+    # frames before the first switch are sentinel (n_frames) -> "far" bucket
+    assert dist[0] == 20 and dist[4] == 20
+    assert dist[5] == 0 and dist[6] == 1 and dist[11] == 6
+    assert dist[12] == 0 and dist[19] == 7
+    assert dist.dtype.kind == "i"
+    # no switches -> everything far
+    assert (R.switch_distances(10, []) == 10).all()
+    # no frames -> empty
+    assert R.switch_distances(0, [1]).size == 0
+
+
+def test_pack_roundtrip_frame_telemetry():
+    flags = np.array([True, False, True, True, False, False, True, False, True])
+    packed = R.pack_bits(flags)
+    assert isinstance(packed, str) and packed
+    assert (R.unpack_bits(packed, flags.size) == flags).all()
+    zones = R.pack_u8([0, 1, 2, 3, 4, 4])
+    assert (R.unpack_u8(zones) == np.array([0, 1, 2, 3, 4, 4], dtype=np.uint8)).all()
+
+
+def test_frame_accept_arrays_requires_valid_bits():
+    row = _fabricated_rows()[1]  # first config-C row
+    arrs = R.frame_accept_arrays(row)
+    assert arrs is not None
+    accept, valid, dist = arrs
+    assert accept.size == 172 and valid.all() and dist.shape == (172,)
+    # rows without packed telemetry (old JSONLs / fallbacks) are skipped
+    assert R.frame_accept_arrays({"n_frames": 10}) is None
+    assert R.frame_accept_arrays({"n_frames": 0, "frame_accept_true_b64": "AA==",
+                                  "frame_valid_b64": "AA=="}) is None
+
+
+def test_switch_distance_table_aggregates_and_pairs():
+    rows = _fabricated_rows()
+    table = R.switch_distance_table(rows)
+    assert [r["bucket"] for r in table] == [b[0] for b in R.SWITCH_DIST_BUCKETS]
+    by_bucket = {r["bucket"]: r for r in table}
+    # frames 0-1 after a switch exist for both switches of every utterance: 3 x 2 x 2
+    assert by_bucket["0-1"]["n_frames"] == 12
+    assert by_bucket["0-1"]["n_utts"] == 3
+    assert by_bucket["16+"]["n_frames"] > 0        # frames before the first switch
+    assert by_bucket["0-1"]["mean"] is not None
+    # paired stats against the far bucket are reported for the near bucket
+    assert by_bucket["0-1"]["n_paired"] >= 2
+    assert by_bucket["0-1"]["p_vs_far"] is not None
+    # no config-C rows with frame data -> graceful empty analysis
+    empty = R.switch_distance_table([{"config": "A", "utt_id": "x"}])
+    assert all(r["mean"] is None for r in empty)
+
+
+def test_gate_sweep_aggregation_and_fallback_exclusion():
+    rows = _fabricated_rows()
+    sweep = R.aggregate_gate_sweep(rows)
+    assert [round(e["threshold"], 2) for e in sweep] == [0.0, 0.5]
+    open_pt, gated = sweep
+    assert open_pt["fallback_utts"] == 0
+    assert gated["fallback_utts"] == 1
+    assert gated["fallback_rate"] == pytest.approx(1 / 3)
+    # acceptance excludes the fallback row, latency/CER include it
+    assert gated["accept_true"]["n"] == 2
+    assert gated["cer"]["n"] == 3
+    assert gated["cer"]["p50"] is not None
+    # here the gated mixture is slower (fallback cost) on the latency side
+    assert gated["total"]["p50"] > open_pt["total"]["p50"]
+
+
+def test_gate_threshold_filtering_in_aggregate():
+    rows = _fabricated_rows()
+    default = R.aggregate_results(rows, ["C"], gate_threshold=0.0)
+    gated = R.aggregate_results(rows, ["C"], gate_threshold=0.5)
+    assert default["C"]["n"] == 3          # un-gated rows only
+    assert gated["C"]["n"] == 3            # 2 speculative + 1 fallback row
+    assert gated["C"]["fallback_utts"] == 1
+    # a threshold with no rows at all never empties the comparison (all C rows used)
+    fallback = R.aggregate_results(rows, ["C"], gate_threshold=0.9)
+    assert fallback["C"]["n"] == 6
+
+
+def test_synth_C_falls_back_below_threshold(monkeypatch):
+    """The gate hands low-confidence utterances to the AR path and labels it."""
+    synth = R.EvalSynthesizer.__new__(R.EvalSynthesizer)
+    synth.args = type("A", (), {"boundary_frames": 3})()
+    synth.scorer = object()
+    calls = {"chunked": 0, "ar": 0}
+
+    def fake_conf(utt, seed, gate_stat="utt_min"):
+        return 0.10
+
+    def fake_chunked(utt, utt_index, seed, verify):
+        calls["chunked"] += 1
+        return {"verify_mode": "true", "accept_true": 40.0, "n_transitions": 2}, np.zeros(4, dtype=np.float32)
+
+    def fake_ar(utt, utt_index, seed):
+        calls["ar"] += 1
+        return {"config": "A", "accept_true": None, "n_frames": None,
+                "ttfa_compute_ms": 900.0, "zone_stats": {}}, np.zeros(4, dtype=np.float32)
+
+    monkeypatch.setattr(synth, "_draft_confidence", fake_conf)
+    monkeypatch.setattr(synth, "_chunked_synthesis", fake_chunked)
+    monkeypatch.setattr(synth, "synth_A", fake_ar)
+
+    row, _ = synth.synth_C({"id": "ta-01", "register": "native_tamil", "text": "x"}, 0, 7,
+                           gate_threshold=0.5)
+    assert calls == {"chunked": 0, "ar": 1}
+    assert row["config"] == "C" and row["fallback"] is True
+    assert row["verify_mode"] == "ar_fallback"
+    assert row["gate_threshold"] == 0.5
+    assert row["accept_true"] is None and row["zone_stats"] == {}
+
+    # high confidence -> normal speculative path, no fallback
+    monkeypatch.setattr(synth, "_draft_confidence", lambda utt, seed, gate_stat="utt_min": 0.90)
+    row2, _ = synth.synth_C({"id": "ta-01", "register": "native_tamil", "text": "x"}, 0, 7,
+                            gate_threshold=0.5)
+    assert calls == {"chunked": 1, "ar": 1}
+    assert row2["fallback"] is False and row2["gate_threshold"] == 0.5
+    assert row2["draft_confidence"] == pytest.approx(0.90)
+
+    # threshold 0 disables the gate entirely (back-compatible behaviour)
+    row3, _ = synth.synth_C({"id": "ta-01", "register": "native_tamil", "text": "x"}, 0, 7,
+                            gate_threshold=0.0)
+    assert row3["fallback"] is False and row3["gate_threshold"] == 0.0
+
+
+def test_tables_IV_and_V_render():
+    rows = _fabricated_rows()
+    switch_rows = R.switch_distance_table(rows)
+    gate_rows = R.aggregate_gate_sweep(rows)
+    table4 = R.build_table_IV(switch_rows)
+    table5 = R.build_table_V(gate_rows, R.aggregate_results(rows, ["A", "C"]).get("A"))
+    for table in (table4, table5):
+        assert "\\begin{tabular}" in table and "\\end{tabular}" in table
+        assert "\\bottomrule" in table
+    assert "$\\geq$16" in table4
+    assert "AR fallback" in table5 or "tau" in table5 or "$\\tau$" in table5
+    assert "AR (A)" in table5    # the pure-AR endpoint is listed
+
+
+def test_figure5_gate_pareto(tmp_path: Path):
+    rows = _fabricated_rows()
+    agg = R.aggregate_results(rows, ["A", "C"])
+    paths = R.figure5_gate_pareto(rows, agg, tmp_path)
+    assert paths
+    for p in paths:
+        assert Path(p).exists() and Path(p).stat().st_size > 1000
+    # no gated rows at all -> no figure (nothing to plot)
+    assert R.figure5_gate_pareto([r for r in rows if r["config"] == "A"], agg, tmp_path) is None
 
 
 # ===========================================================================
