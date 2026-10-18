@@ -316,6 +316,61 @@ def test_latex_tables_render():
     assert "--" in table1      # missing values rendered
 
 
+def _rows_multi_register() -> list[dict]:
+    """Config-C rows spanning the three registers, one poisoned by an ASR loop."""
+    rows: list[dict] = []
+    cer_by_reg = {"native_tamil": 0.10, "romanized_tanglish": 0.50, "transit_codemixed": 9.0}
+    for i, reg in enumerate(cer_by_reg):
+        rows.append({
+            "schema": R.SCHEMA_VERSION, "config": "C", "config_label": R.CONFIG_LABELS["C"],
+            "utt_id": f"u-0{i + 1}", "register": reg, "utt_index": i,
+            "text": "x", "normalized_text": "x", "sample_rate": 44100,
+            "ttfa_compute_ms": 100.0 + i, "ttfa_e2e_ms": 110.0 + i,
+            "total_ms": 200.0, "rtf": 0.07, "audio_sec": 3.0,
+            "accept_true": 40.0 + i, "accept_synth": 25.0 + i,
+            "logq_draft": -3.20 + 0.01 * i, "logq_kept": -3.00 + 0.01 * i,
+            "cer": cer_by_reg[reg], "wer": 0.3, "zone_stats": {}, "chunks": [],
+            "verify_mode": "true", "error": None,
+        })
+    return rows
+
+
+def test_register_aggregation_and_asr_failures():
+    agg = R.aggregate_results(_rows_multi_register(), ["C"])["C"]
+    regs = agg["registers"]
+    assert set(regs) == {"native_tamil", "romanized_tanglish", "transit_codemixed"}
+    assert regs["native_tamil"]["cer"]["p50"] == pytest.approx(0.10)
+    assert regs["transit_codemixed"]["asr_fail"] == 1
+    assert agg["asr_fail"] == 1
+    assert agg["asr_fail_utts"] == ["u-03"]
+    # the median survives the hallucination row, the mean does not
+    assert agg["cer"]["p50"] == pytest.approx(0.50)
+    assert agg["cer"]["mean"] > 3.0
+    # target-correction diagnostics aggregate over the rows that carry them
+    assert agg["logq_draft"]["mean"] == pytest.approx(-3.19)
+    assert agg["logq_kept"]["mean"] > agg["logq_draft"]["mean"]
+
+
+def test_table_three_and_median_cer_reporting():
+    agg = R.aggregate_results(_rows_multi_register(), ["C"])
+    table3 = R.build_table_III(agg)
+    assert "\\begin{tabular}" in table3 and "\\bottomrule" in table3
+    assert "Native Tamil" in table3 and "Transit Code-Mixed" in table3
+    assert "logq" not in table3  # diagnostics must not leak into the LaTeX
+    table1 = R.build_table_I(agg)
+    assert "CER p50 (\\%)" in table1
+    assert "1/3" in table1                       # ASR-failure census
+    assert "log-likelihood" in table1            # target-correction footnote
+    assert f"{agg['C']['logq_draft']['mean']:.2f}" in table1
+    assert f"{agg['C']['logq_kept']['mean']:.2f}" in table1
+
+
+def test_table_three_empty_aggregate_placeholder():
+    table3 = R.build_table_III({"A": {"n": 0}})
+    assert "\\begin{tabular}" in table3 and "\\end{tabular}" in table3
+    assert "-- & --" in table3
+
+
 def test_tables_and_figures_from_fabricated_rows(tmp_path: Path):
     rows = _fabricated_rows()
     agg = R.aggregate_results(rows, ["A", "C"])

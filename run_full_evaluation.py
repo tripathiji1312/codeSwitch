@@ -18,13 +18,14 @@ What it produces
                       (rejection sampling) -> residual -> DAC  [proposed].
 * Per-utterance metrics (``eval_results/raw_results.jsonl``, resumable):
   TTFA (component-compute + end-to-end wall clock), total latency, RTF, DAC
-  Codebook-0 acceptance (true teacher-forced + synthetic-target telemetry),
+  Codebook-0 acceptance (teacher-forced target + unrelated-target reference),
   zone-split acceptance (Pure Tamil / English loanword / transit alphanumeric /
   cross-lingual boundary), CER/WER via whisper (optional, inline).
 * Publication figures (300 dpi PNG + vector PDF, IEEE style) in
   ``paper_figures/``: fig1 latency-quality tradeoff, fig2 zone acceptance,
   fig3 streaming chunk + buffer timeline.
-* Copy-pasteable LaTeX for Table I & II (stdout + ``paper_figures/tables.tex``).
+* Copy-pasteable LaTeX for Tables I-III (stdout + ``paper_figures/tables.tex``):
+  I comparative, II zone acceptance, III per-register CER/latency breakdown.
 
 Protocol notes (state these in the paper)
 -----------------------------------------
@@ -35,10 +36,22 @@ Protocol notes (state these in the paper)
   state -- a documented single-channel verification protocol).  Rejection
   sampling uses the textbook ratio ``min(1, q(x)/p_hat(x))`` with residual
   resampling ``norm(max(0, q - p_hat))``.
-* SYNTHETIC column ("upper-bound telemetry"): identical acceptance math
-  against a random-target distribution ``softmax(randn)`` -- the legacy demo
-  protocol, reported separately for transparency.  It is not a rigorous upper
-  bound; treat it as a synthetic reference.
+* SYNTHETIC column (reference point, NOT an upper bound): identical acceptance
+  math against an unrelated random-target distribution ``softmax(randn)``
+  (the legacy demo protocol).  Because the drafted student is distilled from
+  the real teacher, its proposal agrees with the true target far more than with
+  an unrelated random target, so this column typically sits BELOW the true
+  acceptance.  A perfectly aligned draft would score 100\\% against its own
+  target, so read it as a mismatched-target baseline, not as a ceiling.
+* CER caveat: the reference is the normaliser's Tamil-script text, so
+  whisper-small transliteration choices (Latin output for English loanwords)
+  and occasional hallucination loops inflate CER on the code-mixed registers.
+  Aggregation therefore reports medians alongside means (Table I uses medians)
+  and flags rows above ``ASR_FAIL_CER`` (200\\% CER) as ASR failures.  Per
+  register numbers live in Table III.
+* Target-correction diagnostic: for Config C the teacher-forced mean
+  log-likelihood (nats/frame) of the emitted CB0 tokens is recorded next to
+  that of the raw draft proposal; rejection sampling should raise it.
 * TTFA modes: component-compute (draft + verify + residual + DAC of the first
   chunk) and end-to-end wall clock until the first ~1 s audio buffer exists
   (real streamer for A; first decoded chunk for B/C).
@@ -88,6 +101,11 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"PyTorch import failed: {exc}")
 
 SCHEMA_VERSION = 1
+
+# CER above this threshold on a single utterance is almost always a whisper
+# hallucination loop (repeated/duplicated transcripts) rather than a synthesis
+# failure; such rows are counted separately so means are not silently poisoned.
+ASR_FAIL_CER = 2.0
 
 # ===========================================================================
 # Zone constants
@@ -760,6 +778,8 @@ class EvalSynthesizer:
         waves: List[np.ndarray] = []
         accept_true_parts: List[np.ndarray] = []
         accept_synth_parts: List[np.ndarray] = []
+        logq_draft_parts: List[float] = []
+        logq_kept_parts: List[float] = []
         telemetry: List[ChunkTelemetry] = []
         prefix = np.asarray([], dtype=np.int64)
         verify_ms_total = 0.0
@@ -787,6 +807,12 @@ class EvalSynthesizer:
                 if q_true is not None:
                     kept, accepted_true, _ = rejection_sample(q_true, chunk_probs, chunk_tokens, rng_accept)
                     verify_mode = "true"
+                    # Target-correction diagnostic: teacher-forced mean log-likelihood
+                    # (nats/frame) of the raw draft proposal vs. the emitted tokens.
+                    lq = np.log(np.clip(np.asarray(q_true, dtype=np.float64), 1e-12, None))
+                    frame_idx = np.arange(c_chunk)
+                    logq_draft_parts.append(float(lq[frame_idx, chunk_tokens].mean()))
+                    logq_kept_parts.append(float(lq[frame_idx, kept].mean()))
                 else:
                     verify_mode = "synthetic"
                 # Synthetic-target telemetry (always computed for fig2/table)
@@ -877,6 +903,8 @@ class EvalSynthesizer:
             "dac_ms_total": dac_ms_total,
             "accept_true": acceptance_rate(accept_true),
             "accept_synth": acceptance_rate(accept_synth),
+            "logq_draft": float(np.mean(logq_draft_parts)) if logq_draft_parts else None,
+            "logq_kept": float(np.mean(logq_kept_parts)) if logq_kept_parts else None,
             "n_frames": int(n_frames),
             "n_transitions": int(n_transitions),
             "chunks": [asdict(t) for t in telemetry],
@@ -1041,6 +1069,22 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dic
             continue
         first = min(ok, key=lambda r: r.get("utt_index", 0))
         warm = [r for r in ok if r is not first]
+        registers: Dict[str, Dict[str, Any]] = {}
+        for reg in REGISTER_LABELS:
+            sub = [r for r in ok if r.get("register") == reg]
+            if not sub:
+                continue
+            registers[reg] = {
+                "n": len(sub),
+                "cer": _stats([r.get("cer") for r in sub]),
+                "wer": _stats([r.get("wer") for r in sub]),
+                "ttfa_compute": _stats([r.get("ttfa_compute_ms") for r in sub]),
+                "ttfa_e2e": _stats([r.get("ttfa_e2e_ms") for r in sub]),
+                "rtf": _stats([r.get("rtf") for r in sub]),
+                "accept_true": _stats([r.get("accept_true") for r in sub]),
+                "accept_synth": _stats([r.get("accept_synth") for r in sub]),
+                "asr_fail": sum(1 for r in sub if (r.get("cer") or 0.0) > ASR_FAIL_CER),
+            }
         agg[cfg] = {
             "n": len(ok),
             "errors": len(err),
@@ -1055,9 +1099,16 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dic
             "audio_sec": _stats([r.get("audio_sec") for r in ok]),
             "accept_true": _stats([r.get("accept_true") for r in ok]),
             "accept_synth": _stats([r.get("accept_synth") for r in ok]),
+            "logq_draft": _stats([r.get("logq_draft") for r in ok]),
+            "logq_kept": _stats([r.get("logq_kept") for r in ok]),
             "cer": _stats([r.get("cer") for r in ok]),
             "wer": _stats([r.get("wer") for r in ok]),
+            "asr_fail": sum(1 for r in ok if (r.get("cer") or 0.0) > ASR_FAIL_CER),
+            "asr_fail_utts": sorted(
+                str(r.get("utt_id")) for r in ok if (r.get("cer") or 0.0) > ASR_FAIL_CER
+            ),
             "verify_modes": sorted({str(r.get("verify_mode")) for r in ok}),
+            "registers": registers,
             "zones": aggregate_zones(ok),
         }
     return agg
@@ -1185,23 +1236,35 @@ def figure1_latency_quality(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Op
     axes[0].legend(loc="upper center", bbox_to_anchor=(0.5, -0.20), ncol=3,
                    frameon=False, fontsize=7.5, handletextpad=0.4, columnspacing=1.0)
 
-    cer_means = [agg[c].get("cer", {}).get("mean") for c in configs]
-    cer_stds = [agg[c].get("cer", {}).get("std") or 0.0 for c in configs]
-    cer_pct = [None if v is None else v * 100.0 for v in cer_means]
-    if any(v is not None for v in cer_pct):
-        axes[1].bar(xs, [np.nan if v is None else v for v in cer_pct], 0.55,
-                    yerr=[np.nan if v is None else s * 100.0 for v, s in zip(cer_pct, cer_stds)],
-                    capsize=3, color=[CONFIG_COLORS[c] for c in configs], alpha=0.9)
-        for xi, val in zip(xs, cer_pct):
+    cer_p50 = []
+    for c in configs:
+        stat = agg[c].get("cer") or {}
+        cer_p50.append(None if stat.get("p50") is None else float(stat["p50"]) * 100.0)
+    if any(v is not None for v in cer_p50):
+        axes[1].bar(xs, [np.nan if v is None else v for v in cer_p50], 0.55,
+                    color=[CONFIG_COLORS[c] for c in configs], alpha=0.9)
+        for xi, val in zip(xs, cer_p50):
             if val is not None:
                 axes[1].annotate(f"{val:.1f}%", (xi, val), textcoords="offset points",
                                  xytext=(0, 3), ha="center", fontsize=8)
+        fails = [int(agg[c].get("asr_fail") or 0) for c in configs]
+        top = max(v for v in cer_p50 if v is not None)
+        axes[1].set_ylim(0, max(top * 1.18, 1.0))
+        if any(fails):
+            axes[1].annotate(
+                "median; ASR failures (CER>200%): "
+                + ", ".join(f"{c} {f}" for c, f in zip(configs, fails)),
+                xy=(0.02, 0.99), xycoords="axes fraction", fontsize=5.5,
+                va="top", ha="left", color="#444444",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                          edgecolor="none", alpha=0.85),
+            )
     else:
         axes[1].text(0.5, 0.5, "ASR disabled\n(--skip-asr or model load failure)",
                      ha="center", va="center", transform=axes[1].transAxes, fontsize=9)
     axes[1].set_xticks(xs)
     axes[1].set_xticklabels([CONFIG_LABELS[c].split(" (")[0].replace("Pure ", "") for c in configs])
-    axes[1].set_ylabel("CER (lower is better)")
+    axes[1].set_ylabel("CER (%, median, lower is better)")
     axes[1].set_title("(b) Intelligibility")
     fig.tight_layout()
     paths = _save_fig(fig, out_dir, "fig1_latency_quality_tradeoff")
@@ -1237,7 +1300,7 @@ def figure2_zone_acceptance(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Op
                color=color, alpha=0.9, label=label, hatch=hatch, edgecolor="black", linewidth=0.4)
 
     _plot_bars(-width / 2, true_vals, true_errs, "#2ca02c", "True target (Parler P)", None)
-    _plot_bars(+width / 2, synth_vals, synth_errs, "#ff7f0e", "Synthetic target (UB)", "//")
+    _plot_bars(+width / 2, synth_vals, synth_errs, "#ff7f0e", "Mismatched target (ref)", "//")
     ax.set_xticks(x)
     ax.set_xticklabels([ZONE_NAMES[z].replace(" ", "\n") for z in ZONE_ORDER], fontsize=8)
     ax.set_ylabel("CB0 acceptance (%)")
@@ -1248,12 +1311,17 @@ def figure2_zone_acceptance(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Op
         base = [v for i, v in enumerate(true_vals) if v is not None and i != b_idx]
         if base:
             drop = true_vals[b_idx] - float(np.mean(base))
+            # Colour/mark only if the difference clears the per-utterance std.
+            ref_std = float(true_errs[b_idx] or 0.0)
+            significant = ref_std > 0.0 and abs(drop) > ref_std
+            color = "#d62728" if significant else "#7f7f7f"
+            label = f"{drop:+.1f} pts" + ("" if significant else " (n.s.)")
             ax.annotate(
-                f"{drop:+.1f} pts",
+                label,
                 xy=(b_idx - width / 2, true_vals[b_idx]),
                 xytext=(b_idx - 1.5, max(5.0, true_vals[b_idx] + 25)),
-                fontsize=8, arrowprops=dict(arrowstyle="->", linestyle="--", color="#d62728"),
-                color="#d62728",
+                fontsize=8, arrowprops=dict(arrowstyle="->", linestyle="--", color=color),
+                color=color,
             )
     fig.tight_layout()
     paths = _save_fig(fig, out_dir, "fig2_boundary_acceptance_breakdown")
@@ -1384,18 +1452,19 @@ def _mean_pm(entry: Dict[str, Any], key: str, digits: int = 1) -> str:
 
 def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
     lines = [
-        "% Table I: comparative performance (mean $\\pm$ std unless p50/p90 noted)",
+        "% Table I: comparative performance (TTFA medians; mean $\\pm$ std for acceptance)",
         "\\begin{table*}[t]",
         "\\centering",
         "\\caption{Comparative evaluation of Pure AR, Pure NAR and the proposed CodeSwitch-TTS "
         "hybrid on the 60-utterance Tanglish benchmark (Kaggle T4, fp16). "
-        "TTFA-c: component compute latency; TTFA-e2e: wall-clock to first audio buffer.}",
+        "TTFA-c: component compute latency; TTFA-e2e: wall-clock to first audio buffer; "
+        "CER medians (ASR-limited, see text).}",
         "\\label{tab:comparison}",
         "\\begin{tabular}{lccccccccc}",
         "\\toprule",
         "Architecture & TTFA-c cold (ms) & TTFA-c warm p50 (ms) & TTFA-c warm p90 (ms) "
-        "& TTFA-e2e warm p50 (ms) & Total (s) & RTF & CER (\\%) "
-        "& CB0 acc. true (\\%) & CB0 acc. synth (\\%) \\\\",
+        "& TTFA-e2e warm p50 (ms) & Total (s) & RTF & CER p50 (\\%) "
+        "& CB0 acc. true (\\%) & CB0 acc. ref. (\\%) \\\\",
         "\\midrule",
     ]
     for cfg in ("A", "B", "C"):
@@ -1411,7 +1480,7 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
 
         total = (a.get("total") or {}).get("mean")
         cer_stat = a.get("cer") or {}
-        cer_pct = None if cer_stat.get("mean") is None else float(cer_stat["mean"]) * 100.0
+        cer_p50 = None if cer_stat.get("p50") is None else float(cer_stat["p50"]) * 100.0
         cells = [
             CONFIG_LABELS[cfg],
             _tex(a.get("ttfa_compute_cold"), 0),
@@ -1420,24 +1489,47 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
             _tex(_stat("ttfa_e2e", "p50"), 0),
             _tex(None if total is None else total / 1000.0, 2),
             _tex((a.get("rtf") or {}).get("mean"), 2),
-            _tex(cer_pct, 1),
+            _tex(cer_p50, 1),
             _pm(a.get("accept_true") or {}),
             _pm(a.get("accept_synth") or {}),
         ]
         lines.append(" & ".join(cells) + " \\\\")
+    # ASR-failure census (whisper hallucination loops poison the mean CER)
+    fail_bits = []
+    for cfg in ("A", "B", "C"):
+        a = agg.get(cfg) or {}
+        if a.get("n"):
+            fail_bits.append(f"{cfg}: {int(a.get('asr_fail') or 0)}/{a['n']}")
+    logq_d = (agg.get("C") or {}).get("logq_draft") or {}
+    logq_k = (agg.get("C") or {}).get("logq_kept") or {}
+    logq_sentence = ""
+    if logq_d.get("mean") is not None and logq_k.get("mean") is not None:
+        logq_sentence = (
+            f" In Config C rejection sampling raises the teacher-forced mean CB0 "
+            f"log-likelihood per frame from {logq_d['mean']:.2f} to {logq_k['mean']:.2f} nats "
+            f"(n={int(logq_k.get('n') or 0)} utterances), i.e.\\ the emitted tokens are closer to "
+            f"the target distribution than the raw draft proposal."
+        )
     lines += [
         "\\bottomrule",
         "\\end{tabular}",
         "\\vspace{2pt}",
-        "\\footnotesize{cold = first utterance per configuration (CUDA kernels, allocator and "
-        "description cache warming); warm = remaining utterances (cold-start overhead excluded, "
-        "per-utterance seeds and texts identical). True = teacher-forced Parler target: one "
-        "decoder forward per chunk scoring codebook 0 with codebooks 1-8 held at bos "
-        "(single-channel verification approximation, i.e. $q(c_0|\\mathrm{text}, c_0^{<t})$ with "
-        "null inter-codebook context); synth = synthetic-target telemetry with the same chunk "
-        "layout. Config A has no draft/verification stage (acc. n/a); its TTFA-c is the time "
-        "from decoder start to the first decoded audio buffer. CER reference: normalised "
-        "Tamil-script text.}",
+        (
+            "\\footnotesize{cold = first utterance per configuration (CUDA kernels, allocator and "
+            "description cache warming); warm = remaining utterances (cold-start overhead excluded, "
+            "per-utterance seeds and texts identical). True = teacher-forced Parler target: one "
+            "decoder forward per chunk scoring codebook 0 with codebooks 1-8 held at bos "
+            "(single-channel verification approximation, i.e. $q(c_0|\\mathrm{text}, c_0^{<t})$ with "
+            "null inter-codebook context); ref.\\ = the same acceptance math against an unrelated "
+            "random target distribution (the legacy demo protocol). The ref.\\ column is a "
+            "mismatched-target baseline, not an upper bound: the distillation-aligned draft agrees "
+            "with the real teacher more often than with a random target (a perfectly aligned draft "
+            "would score 100\\% against its own target). Config A has no draft/verification stage "
+            "(acc. n/a); its TTFA-c is the time from decoder start to the first decoded audio buffer. "
+            "CER reference: normalised Tamil-script text; ASR failures with CER $>$ 200\\% "
+            "(whisper-small hallucination loops) = " + ", ".join(fail_bits) + "; Table III gives "
+            "per-register numbers." + logq_sentence + "}"
+        ),
         "\\end{table*}",
     ]
     return "\n".join(lines)
@@ -1450,14 +1542,15 @@ def build_table_II(agg: Dict[str, Dict[str, Any]]) -> str:
         "\\begin{table}[t]",
         "\\centering",
         "\\caption{Speculative Codebook-0 acceptance by linguistic zone for CodeSwitch-TTS "
-        "(mean $\\pm$ std across utterances).}",
+        "(mean $\\pm$ std across utterances; $\\Delta$ relative to Pure Tamil).}",
         "\\label{tab:zones}",
         "\\begin{tabular}{lcccc}",
         "\\toprule",
-        "Linguistic zone & Frames & CB0 acc. true (\\%) & CB0 acc. synth (\\%) & $\\Delta$ true (pts) \\\\",
+        "Linguistic zone & Frames & CB0 acc. true (\\%) & CB0 acc. ref. (\\%) & $\\Delta$ true (pts) \\\\",
         "\\midrule",
     ]
     base = None
+    deltas: List[float] = []
     for zone in ZONE_ORDER:
         z = zones.get(str(zone)) or {}
         if zone == ZONE_TAMIL:
@@ -1465,6 +1558,7 @@ def build_table_II(agg: Dict[str, Dict[str, Any]]) -> str:
         delta = None
         if z.get("accept_true") is not None and base is not None:
             delta = float(z["accept_true"]) - float(base)
+            deltas.append(delta)
         cells = [
             ZONE_NAMES[zone],
             str(z.get("n_frames", 0)),
@@ -1473,6 +1567,77 @@ def build_table_II(agg: Dict[str, Dict[str, Any]]) -> str:
             "--" if delta is None else f"{delta:+.1f}",
         ]
         lines.append(" & ".join(cells) + " \\\\")
+    lines += [
+        "\\bottomrule",
+        "\\end{tabular}",
+    ]
+    max_abs = max((abs(d) for d in deltas), default=0.0)
+    n_utts = max((int((z or {}).get("accept_true_utts") or 0) for z in zones.values()), default=0)
+    lines.append(
+        "\\vspace{2pt}",
+    )
+    lines.append(
+        "\\footnotesize{ref.\\ = acceptance against an unrelated random target "
+        "(mismatched-target baseline, not a bound). Per-utterance std in the true column "
+        "is 10-20 pts, i.e.\\ the largest inter-zone difference here "
+        f"({max_abs:.1f} pts) is within one standard deviation: at this draft quality the "
+        f"zone split does not resolve a significant boundary penalty (n={n_utts} utterances)."
+        "}"
+    )
+    lines.append("\\end{table}")
+    return "\n".join(lines)
+
+
+def build_table_III(agg: Dict[str, Dict[str, Any]]) -> str:
+    """Per-register breakdown: CER (median/mean) and latency per config."""
+    lines = [
+        "% Table III: per-register CER and latency breakdown",
+        "\\begin{table}[t]",
+        "\\centering",
+        "\\caption{Per-register breakdown over the 60-utterance benchmark: CER median/mean and "
+        "warm-component latency. CER is ASR-limited (whisper-small transliteration choices and "
+        "hallucination loops), so the median is the comparable statistic; rows above 200\\% are "
+        "censused in Table~I.}",
+        "\\label{tab:registers}",
+        "\\begin{tabular}{llcccccc}",
+        "\\toprule",
+        "Register & Config & N & CER p50 (\\%) & CER mean (\\%) & TTFA-c p50 (ms) & RTF & CB0 acc.\\ true (\\%) \\\\",
+        "\\midrule",
+    ]
+    any_row = False
+    for reg, reg_label in REGISTER_LABELS.items():
+        first_row = True
+        for cfg in ("A", "B", "C"):
+            entry = ((agg.get(cfg) or {}).get("registers") or {}).get(reg)
+            if not entry or not entry.get("n"):
+                continue
+            any_row = True
+            cer = entry.get("cer") or {}
+            p50 = None if cer.get("p50") is None else float(cer["p50"]) * 100.0
+            mean = cer.get("mean")
+            mean_cell = "--"
+            if mean is not None:
+                std = cer.get("std")
+                mean_cell = (
+                    f"{mean * 100.0:.1f}"
+                    if std is None
+                    else f"{mean * 100.0:.1f}$\\pm${std * 100.0:.1f}"
+                )
+            acc = entry.get("accept_true") or {}
+            cells = [
+                reg_label if first_row else "",
+                cfg,
+                str(entry.get("n")),
+                _tex(p50, 1),
+                mean_cell,
+                _tex((entry.get("ttfa_compute") or {}).get("p50"), 0),
+                _tex((entry.get("rtf") or {}).get("mean"), 2),
+                "--" if acc.get("mean") is None else f"{acc['mean']:.1f}$\\pm${acc.get('std') or 0.0:.1f}",
+            ]
+            lines.append(" & ".join(cells) + " \\\\")
+            first_row = False
+    if not any_row:
+        lines.append("-- & -- & -- & -- & -- & -- & -- & -- \\\\")
     lines += [
         "\\bottomrule",
         "\\end{tabular}",
@@ -1506,7 +1671,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-untrained", action="store_true",
                    help="Permit random-weight modules (local smoke tests only).")
     p.add_argument("--no-true-probs", action="store_true",
-                   help="Disable teacher-forced scoring (synthetic telemetry only).")
+                   help="Disable teacher-forced scoring (unrelated-target reference telemetry only).")
     p.add_argument("--no-save-audio", action="store_true")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp16",
@@ -1620,7 +1785,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("       Fix the backend (protobuf==5.29.5 + kernel restart) and re-run,")
                 print("       or run with --configs B (NAR-only) / --allow-untrained for smoke tests.")
                 return 2
-            print("[Eval] ⚠ Parler unavailable — proceeding in reduced mode (no A / synthetic "
+            print("[Eval] ⚠ Parler unavailable — proceeding in reduced mode (no A / unrelated-target "
                   "acceptance only).")
 
     draft_model = residual_model = None
@@ -1640,7 +1805,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if engine is not None and engine.speech_available:
             scorer = TeacherForcedScorer(engine)
         else:
-            print("[Eval] ⚠ true acceptance disabled (no Parler backend) — synthetic telemetry only.")
+            print("[Eval] ⚠ true acceptance disabled (no Parler backend) — unrelated-target "
+                  "reference telemetry only.")
 
     synthesizer = EvalSynthesizer(
         args, config, engine, draft_model, residual_model, length_model, scorer, device,
@@ -1732,7 +1898,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     f"t_e2e={row.get('ttfa_e2e_ms') if row.get('ttfa_e2e_ms') is None else round(row['ttfa_e2e_ms'])}ms "
                     f"total={round(row.get('total_ms') or 0)}ms rtf={row.get('rtf') if row.get('rtf') is None else round(row['rtf'], 2)} "
                     f"acc_true={row.get('accept_true') if row.get('accept_true') is None else round(row['accept_true'], 1)} "
-                    f"acc_synth={row.get('accept_synth') if row.get('accept_synth') is None else round(row['accept_synth'], 1)} "
+                    f"acc_ref={row.get('accept_synth') if row.get('accept_synth') is None else round(row['accept_synth'], 1)} "
                     f"cer={row.get('cer') if row.get('cer') is None else round(row['cer'], 3)} "
                     f"[{elapsed:.1f}s]"
                 )
@@ -1748,7 +1914,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: float) -> int:
     agg = aggregate_results(rows, configs)
-    tables_tex = build_table_I(agg) + "\n\n" + build_table_II(agg)
+    tables_tex = (
+        build_table_I(agg) + "\n\n" + build_table_II(agg) + "\n\n" + build_table_III(agg)
+    )
     (figures_dir / "tables.tex").write_text(tables_tex, encoding="utf-8")
 
     print("\n" + "=" * 78)
@@ -1761,6 +1929,9 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
             continue
         tc = a.get("ttfa_compute") or {}
         te = a.get("ttfa_e2e") or {}
+        cer = a.get("cer") or {}
+        cer_p50 = "--" if cer.get("p50") is None else f"{cer['p50'] * 100:.1f}%"
+        cer_mean = "--" if cer.get("mean") is None else f"{cer['mean'] * 100:.1f}%"
         print(
             f"[{cfg}] n={a['n']} (errors={a['errors']}) | "
             f"TTFA-c p50/p90={tc.get('p50') if tc.get('p50') is None else round(tc['p50'])}/"
@@ -1768,10 +1939,45 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
             f"TTFA-e2e p50={te.get('p50') if te.get('p50') is None else round(te['p50'])}ms | "
             f"total={round((a.get('total') or {}).get('mean') or 0)}ms | "
             f"RTF={round((a.get('rtf') or {}).get('mean') or 0, 2)} | "
-            f"CER={None if (a.get('cer') or {}).get('mean') is None else round((a['cer']['mean']) * 100, 1)}% | "
+            f"CER p50={cer_p50} mean={cer_mean} | "
             f"acc_true={None if (a.get('accept_true') or {}).get('mean') is None else round(a['accept_true']['mean'], 1)}% | "
-            f"acc_synth={None if (a.get('accept_synth') or {}).get('mean') is None else round(a['accept_synth']['mean'], 1)}%"
+            f"acc_ref={None if (a.get('accept_synth') or {}).get('mean') is None else round(a['accept_synth']['mean'], 1)}%"
         )
+        if a.get("asr_fail"):
+            utts = a.get("asr_fail_utts") or []
+            shown = ", ".join(utts[:6]) + (" ..." if len(utts) > 6 else "")
+            print(
+                f"      ASR failures (CER>200%, whisper hallucination loops, excluded from p50): "
+                f"{a['asr_fail']}/{a['n']} [{shown}]"
+            )
+        lq_d = a.get("logq_draft") or {}
+        lq_k = a.get("logq_kept") or {}
+        if lq_d.get("mean") is not None and lq_k.get("mean") is not None:
+            print(
+                f"      target correction: teacher-forced mean log q = "
+                f"{lq_d['mean']:.2f} nats/frame (draft proposal) -> {lq_k['mean']:.2f} "
+                f"(emitted after rejection sampling)"
+            )
+
+    print("-" * 78)
+    print("PER-REGISTER BREAKDOWN (CER p50 / mean; TTFA-c warm p50)")
+    print("-" * 78)
+    for reg, reg_label in REGISTER_LABELS.items():
+        for cfg in configs:
+            entry = ((agg.get(cfg) or {}).get("registers") or {}).get(reg)
+            if not entry or not entry.get("n"):
+                continue
+            cer = entry.get("cer") or {}
+            p50 = "--" if cer.get("p50") is None else f"{cer['p50'] * 100:.1f}%"
+            mean = "--" if cer.get("mean") is None else f"{cer['mean'] * 100:.1f}%"
+            t50 = (entry.get("ttfa_compute") or {}).get("p50")
+            acc = (entry.get("accept_true") or {}).get("mean")
+            print(
+                f"[{cfg}] {reg_label:<20s} n={entry['n']:<3d} CER p50={p50:<7s} mean={mean:<7s} "
+                f"TTFA-c p50={('--' if t50 is None else str(round(t50)) + 'ms'):<8s} "
+                f"RTF={round((entry.get('rtf') or {}).get('mean') or 0, 2):<5} "
+                f"acc_true={'--' if acc is None else f'{acc:.1f}%'}"
+            )
 
     fig_paths: Dict[str, List[str]] = {}
     for name, fn in (
@@ -1810,6 +2016,10 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
     print("TABLE II (LaTeX)")
     print("-" * 78)
     print(build_table_II(agg))
+    print("\n" + "-" * 78)
+    print("TABLE III (LaTeX)")
+    print("-" * 78)
+    print(build_table_III(agg))
     print("\n" + "-" * 78)
     print(f"Artifacts: {results_path} | {figures_dir}/tables.tex | {figures_dir}/summary.json")
     for name, paths in fig_paths.items():

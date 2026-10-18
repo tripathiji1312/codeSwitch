@@ -134,10 +134,11 @@ evaluation uses for frame sizing). A short sanity WAV is rendered at the end.
 * **Resume**: results are written atomically to `eval_results/raw_results.jsonl` after every
   utterance. Re-running the same command skips completed (config, utterance) pairs; broken
   rows are retried automatically. `--force` re-runs everything; `--replay` rebuilds
-  aggregates/figures/tables from the JSONL without synthesising anything.
+  aggregates/figures/tables from the JSONL without synthesising anything (use it after a code
+  update to refresh tables/figures at zero GPU cost).
 * **Smoke test**: `!python run_full_evaluation.py --configs B --limit 3 --skip-asr --allow-untrained`
 * **Options**: `--skip-asr` (no CER/WER, everything else still runs), `--no-save-audio`,
-  `--no-true-probs` (synthetic acceptance telemetry only), `--play-steps 12`,
+  `--no-true-probs` (unrelated-target acceptance only), `--play-steps 12`,
   `--boundary-frames 3`, `--dtype fp16`.
 
 The run writes:
@@ -148,7 +149,7 @@ eval_results/run_meta.json         # args, package versions, checkpoint provenan
 paper_figures/fig1_latency_quality_tradeoff.{png,pdf}
 paper_figures/fig2_boundary_acceptance_breakdown.{png,pdf}
 paper_figures/fig3_streaming_chunk_timeline.{png,pdf}
-paper_figures/tables.tex           # Table I (comparative) + Table II (zone acceptance), IEEE style
+paper_figures/tables.tex           # Tables I (comparative) + II (zones) + III (per-register), IEEE style
 paper_figures/summary.json         # aggregates + figure paths
 eval_audio/{A,B,C}/{utt_id}.wav    # listening samples
 ```
@@ -180,11 +181,29 @@ Kaggle unless you want to archive them too.)
   uses the median/p90 of the remaining 59 utterances (warm) everywhere else; Fig. 1 draws warm
   p50 bars with a black x marker for the cold value. Report warm numbers in the paper text and
   cite the cold column when discussing streaming start-up latency.
-* **Acceptance** is reported twice: *true* (teacher-forced Parler probabilities) and *synth*
-  (theoretical upper-bound telemetry). A distilled draft should give `0 < acc_true < acc_synth`;
-  that gap is the honest speculative-decoding trade-off story.
-* **Fig. 2** is the boundary breakdown: the Cross-Lingual Boundary zone should show the
-  largest acceptance drop relative to Pure Tamil — that is the paper's headline.
+* **Acceptance** is reported twice: *true* (teacher-forced Parler probabilities) and *ref*
+  (identical acceptance math against an **unrelated random target** — the legacy demo
+  protocol). The ref column is a *mismatched-target baseline, not an upper bound*: a draft
+  distilled from the real teacher agrees with the teacher more often than with a random
+  target, so `acc_true > acc_ref` is the expected (and observed) ordering. A perfectly
+  aligned draft would score 100 % against its own target.
+* **Target correction (Config C)**: the console prints the teacher-forced mean log-likelihood
+  (nats/frame) of the raw draft proposal vs. the tokens actually emitted after rejection
+  sampling. If the emitted value is higher, the correction stage is doing its job (moving CB0
+  toward the teacher distribution) even when the perceptual quality of the weak draft's audio
+  is still poor. Only Config C rows synthesised *after* the 2026-10 update carry these fields
+  (`logq_draft`/`logq_kept`); older rows show `--` until you re-run C with `--force`.
+* **CER**: reported as medians in Table I (means are poisoned by whisper-small hallucination
+  loops and by transliteration choices on the code-mixed registers). The console prints an
+  ASR-failure census (CER > 200 %) with the offending utterance ids, and **Table III** gives
+  the per-register (native / romanised / transit) CER median + mean and latency for every
+  config. Listen to `eval_audio/A/rt-01.wav` etc. before blaming the metric on a specific row.
+* **Fig. 2** is the boundary breakdown. Colour/arrow annotations are grey and marked `(n.s.)`
+  when the boundary-vs-Tamil difference is smaller than the per-utterance standard deviation —
+  at the current draft quality the zone effect is **not** resolved, so do not claim a
+  boundary penalty in the paper unless the annotation is red.
+* **Table III** (new) is the per-register table; it is the right place to discuss
+  native-vs-code-mixed quality differences at this training scale.
 * If `acc_true` is ≈ 0: the draft is not yet aligned with the teacher. Collect more teacher
   sentences (`--num-sentences 800`) or train longer (`--draft-epochs 150 --max-minutes 20`).
   Check `codeswitch_ckpt/meta.json` → `draft` for the reported top-1/top-5.
