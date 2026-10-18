@@ -501,6 +501,108 @@ def test_trim_valid_frames_keeps_interior_clean_columns():
     assert trimmed.tolist() == [[1, 2, 4, 5], [1, 2, 4, 5]]
 
 
+def test_scorer_uses_codebook0_logits_and_codebook_vocab():
+    """Regression for two Kaggle failures: the LM wrapper returns
+    ``logits`` shaped (K, seq, model_vocab) — the scorer used to read
+    ``last_hidden_state`` (AttributeError) and treat ``decoder.config.vocab_size``
+    (1088) as the code vocabulary, which then broke Config C's rejection
+    sampling with "operands could not be broadcast together ... (1088,) (1024,)"."""
+    import torch
+
+    class _Out:
+        def __init__(self, logits):
+            self.logits = logits
+
+    class _Decoder:
+        num_codebooks = 9
+
+        def __init__(self):
+            self.config = type("Cfg", (), {"vocab_size": 1088})()
+            self.seen_ids = None
+
+        def __call__(self, input_ids=None, **kwargs):
+            self.seen_ids = input_ids
+            seq = input_ids.shape[1]
+            logits = torch.zeros(self.num_codebooks, seq, 1088)
+            for p in range(seq):
+                logits[0, p, p % 1024] = 5.0  # position-dependent cb0 preference
+            return _Out(logits)
+
+    scorer = R.TeacherForcedScorer.__new__(R.TeacherForcedScorer)
+    scorer.engine = type("Eng", (), {"device": torch.device("cpu")})()
+    scorer.decoder = _Decoder()
+    scorer.num_codebooks = 9
+    scorer.vocab = 1024
+    scorer.bos_id = 1025
+    scorer.prompt_cross_attention = True
+    scorer.verbose = False
+    ctx = {
+        "offset": 0,
+        "encoder_hidden_states": torch.zeros(1, 4, 8),
+        "encoder_attention_mask": None,
+    }
+    prefix = np.asarray([11, 12], dtype=np.int64)
+    chunk = np.asarray([13, 14, 15], dtype=np.int64)
+    probs = scorer._forward_probs(ctx, prefix, chunk)
+
+    assert probs is not None
+    assert probs.shape == (3, 1024)  # codebook vocab, not the padded head width
+    assert probs.sum(axis=1) == pytest.approx(np.ones(3), abs=1e-5)
+    # logits[p] scores frame p - 1; the first scored frame is index len(prefix)
+    assert list(probs.argmax(axis=1)) == [2, 3, 4]
+    # ids: (K, L) with row 0 = [bos] + prefix + chunk, other rows all bos
+    ids = scorer.decoder.seen_ids
+    assert tuple(ids.shape) == (9, 6)
+    assert int(ids[0, 0]) == 1025
+    assert ids[0, 1:].tolist() == [11, 12, 13, 14, 15]
+    assert (ids[1:] == 1025).all()
+
+
+def test_scorer_offset_accounts_for_prepended_prompt():
+    import torch
+
+    class _Out:
+        def __init__(self, logits):
+            self.logits = logits
+
+    class _Decoder:
+        num_codebooks = 9
+
+        def __init__(self):
+            self.config = type("Cfg", (), {"vocab_size": 1088})()
+
+        def __call__(self, input_ids=None, prompt_hidden_states=None, **kwargs):
+            seq_tokens = input_ids.shape[1]
+            prompt_len = 0 if prompt_hidden_states is None else prompt_hidden_states.shape[1]
+            # the decoder concatenates prompt embeddings in front of the token
+            # embeddings, so logits cover P + L positions
+            seq = prompt_len + seq_tokens
+            logits = torch.zeros(self.num_codebooks, seq, 1088)
+            for p in range(seq):
+                logits[0, p, p % 1024] = 5.0
+            return _Out(logits)
+
+    scorer = R.TeacherForcedScorer.__new__(R.TeacherForcedScorer)
+    scorer.engine = type("Eng", (), {"device": torch.device("cpu")})()
+    scorer.decoder = _Decoder()
+    scorer.num_codebooks = 9
+    scorer.vocab = 1024
+    scorer.bos_id = 1025
+    scorer.prompt_cross_attention = False  # prompt prepended in the decoder
+    scorer.verbose = False
+    ctx = {
+        "offset": 3,
+        "encoder_hidden_states": torch.zeros(1, 4, 8),
+        "encoder_attention_mask": None,
+        "prompt_hidden_states": torch.zeros(1, 3, 8),
+        "prompt_attention_mask": torch.ones(1, 3, dtype=torch.long),
+    }
+    probs = scorer._forward_probs(ctx, np.asarray([1], dtype=np.int64), np.asarray([2, 3], dtype=np.int64))
+    assert probs is not None and probs.shape == (2, 1024)
+    # token k sits after the prompt, so frame k is scored by logits[prompt_len + k]
+    assert list(probs.argmax(axis=1)) == [4, 5]
+
+
 def test_codec_reencode_casts_waveform_to_encoder_dtype():
     """Regression: fp16 teacher + float32 waveform raised
     'Input type (float) and bias type (c10::Half) should be the same'."""

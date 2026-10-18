@@ -204,6 +204,7 @@ Kaggle unless you want to archive them too.)
 | `TTFA` much larger for the first category/register | cold start (first synthesis in the session). `kaggle_demo.py` now runs a discarded warm-up pass first; `run_full_evaluation.py` always reports cold and warm separately. |
 | `[Teacher] DAC re-encode failed: Input type (float) and bias type (c10::Half)...` | fixed — the waveform is now cast to the audio encoder's dtype before `encode()`. Pull the latest repo before re-running. |
 | `[Teacher] LM token capture validation: MISMATCH` | the printed `len_ratio`/`corr` say why; the codec fallback takes over automatically. Capture and decode both try the 3-D and 4-D code layouts now, so a mismatch with `corr ≈ 1` means the trim differs, and `decode failed` means no layout matched. |
+| `[Scorer] forward failed: ... 'last_hidden_state'` or Config C aborts with `operands could not be broadcast ... (1088,) (1024,)` | fixed — the scorer now reads the LM wrapper's `logits` (shape `(9, L, 1088)`, codebook 0 in row 0, valid codes in `[:1024]`). Pull the latest repo; the probe line must print `[Scorer] teacher-forced CB0 scoring: OK` for `acc_true` and Fig. 2 to appear. |
 | Session dies mid-run | re-run the same command(s): teacher shards and evaluated rows are resumed. |
 
 ## 7) Where the knobs live

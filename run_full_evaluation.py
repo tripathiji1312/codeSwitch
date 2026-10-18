@@ -295,14 +295,23 @@ class TeacherForcedScorer:
         self.ar = getattr(engine, "ar_model", None)
         self.decoder = getattr(self.ar, "decoder", None) if self.ar is not None else None
         self.num_codebooks = int(getattr(self.decoder, "num_codebooks", 9)) if self.decoder else 9
-        self.vocab = int(getattr(getattr(self.decoder, "config", None), "vocab_size", 1024))
+        # codebook-0 sampling vocabulary (rejection sampling operates over the
+        # 1024 valid codes); the LM head itself is wider — decoder.config.vocab_size
+        # (1088) pads the code space with eos (1024) / bos (1025) slots.
+        self.vocab = int(
+            getattr(
+                getattr(getattr(self.ar, "audio_encoder", None), "config", None),
+                "codebook_size",
+                1024,
+            )
+        )
+        self.model_vocab = int(getattr(getattr(self.decoder, "config", None), "vocab_size", 0) or 0)
         gc_cfg = getattr(self.ar, "generation_config", None)
         self.bos_id = int(
             getattr(gc_cfg, "bos_token_id", None)
             or getattr(gc_cfg, "decoder_start_token_id", None)
             or 1025
         )
-        self.fused_heads = bool(getattr(self.decoder, "use_fused_lm_heads", False))
         self.prompt_cross_attention = bool(getattr(self.ar, "prompt_cross_attention", False))
         self._probe()
 
@@ -340,13 +349,6 @@ class TeacherForcedScorer:
             return None
 
     # -- scoring -------------------------------------------------------------
-    def _head0(self, hidden: torch.Tensor) -> torch.Tensor:
-        if self.fused_heads:
-            logits = self.decoder.lm_heads(hidden)
-            logits = logits.view(*hidden.shape[:2], self.num_codebooks, self.vocab)
-            return logits[..., 0, :]
-        return self.decoder.lm_heads[0](hidden)
-
     @torch.inference_mode()
     def _forward_probs(
         self, ctx: Dict[str, Any], prefix_cb0: np.ndarray, chunk_cb0: np.ndarray
@@ -368,9 +370,16 @@ class TeacherForcedScorer:
                 kwargs["prompt_hidden_states"] = ctx["prompt_hidden_states"]
                 kwargs["prompt_attention_mask"] = ctx.get("prompt_attention_mask")
             out = self.decoder(**kwargs)
-            logits = self._head0(out.last_hidden_state).float()
+            # ``ParlerTTSForCausalLM`` returns logits shaped (K, L, model_vocab):
+            # row 0 holds codebook 0, columns [0, codebook_size) are the valid
+            # codes and the remaining slots are eos/bos padding.  Logits at
+            # position p predict the token at p + 1, and the codebook-0 stream
+            # starts with the bos token at position 0, so frame k is scored by
+            # logits[offset + k] (offset = prompt length when the prompt is
+            # prepended to the decoder inputs, else 0).
+            logits = out.logits[0].float()
             start = ctx.get("offset", 0) + prefix_cb0.shape[0]
-            logits = logits[start: start + chunk_cb0.shape[0]]
+            logits = logits[start: start + chunk_cb0.shape[0], : self.vocab]
             probs = torch.softmax(logits, dim=-1)
             return probs.detach().cpu().numpy().astype(np.float32)
         except Exception as exc:
@@ -1422,10 +1431,13 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         "\\vspace{2pt}",
         "\\footnotesize{cold = first utterance per configuration (CUDA kernels, allocator and "
         "description cache warming); warm = remaining utterances (cold-start overhead excluded, "
-        "per-utterance seeds and texts identical). True = teacher-forced Parler target; synth = "
-        "synthetic-target telemetry. Config A has no draft/verification stage (acc. n/a); its "
-        "TTFA-c is the time from decoder start to the first decoded audio buffer. CER reference: "
-        "normalised Tamil-script text.}",
+        "per-utterance seeds and texts identical). True = teacher-forced Parler target: one "
+        "decoder forward per chunk scoring codebook 0 with codebooks 1-8 held at bos "
+        "(single-channel verification approximation, i.e. $q(c_0|\\mathrm{text}, c_0^{<t})$ with "
+        "null inter-codebook context); synth = synthetic-target telemetry with the same chunk "
+        "layout. Config A has no draft/verification stage (acc. n/a); its TTFA-c is the time "
+        "from decoder start to the first decoded audio buffer. CER reference: normalised "
+        "Tamil-script text.}",
         "\\end{table*}",
     ]
     return "\n".join(lines)
