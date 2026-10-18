@@ -786,40 +786,85 @@ class ResidualTrainer:
         lr: float = 3e-4,
         batch_size: int = 32,
         seed: int = 42,
+        draft_model: Optional[torch.nn.Module] = None,
+        sched_target: float = 0.0,
     ):
         self.model = residual_model
         self.device = device
         self.lr = lr
         self.batch_size = batch_size
         self.seed = seed
+        # Scheduled sampling: the residual is trained on teacher CB0 but runs on
+        # *draft* CB0 at inference.  Feeding it draft-produced CB0 for a growing
+        # fraction of windows closes that exposure bias (target 0 disables it).
+        self.draft = draft_model
+        self.sched_target = float(max(0.0, min(0.9, sched_target)))
 
-    def build_windows(self, shards: List[TeacherShard]):
+    def precompute_draft_cb0(self, shards: List[TeacherShard]) -> Dict[int, np.ndarray]:
+        """One NAR draft pass per shard: the CB0 the residual will actually see.
+
+        Cheap relative to the teacher pass (a single forward per sentence) and
+        only computed when scheduled sampling is enabled.
+        """
+        out: Dict[int, np.ndarray] = {}
+        if self.draft is None or self.sched_target <= 0.0:
+            return out
+        self.draft.eval()
+        for shard in shards:
+            try:
+                with torch.inference_mode():
+                    draft_out = self.draft.generate_chunk(
+                        text=shard.norm_text, num_frames=int(shard.frames),
+                        temperature=1.0, device=self.device,
+                    )
+                tokens = draft_out.tokens[0].detach().cpu().numpy().astype(np.int64)
+                if tokens.shape[0] >= int(shard.frames):
+                    out[int(shard.index)] = tokens[: int(shard.frames)]
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[Residual] draft pass failed for shard {shard.index}: "
+                      f"{type(exc).__name__}: {exc}")
+        return out
+
+    def build_windows(self, shards: List[TeacherShard],
+                      draft_cb0: Optional[Dict[int, np.ndarray]] = None):
         windows = []
         for s in shards:
             t = s.frames
+            draft_tokens = (draft_cb0 or {}).get(int(s.index))
             for start in range(0, max(1, t - self.WINDOW + 1), self.WINDOW):
                 end = min(start + self.WINDOW, t)
                 if end - start < 24:
                     continue
-                windows.append((s.codes[0, start:end], s.codes[1:9, start:end]))
+                draft_slice = (draft_tokens[start:end]
+                               if draft_tokens is not None else None)
+                windows.append((s.codes[0, start:end], s.codes[1:9, start:end], draft_slice))
         return windows
 
-    def _batches(self, windows, shuffle: bool):
+    def _batches(self, windows, shuffle: bool, sched_p: float = 0.0, rng=None):
         order = list(range(len(windows)))
         if shuffle:
             random.shuffle(order)
+        rng = rng or random.Random(self.seed)
         for start in range(0, len(order), self.batch_size):
             idx = order[start:start + self.batch_size]
-            cb0 = torch.stack([torch.from_numpy(windows[j][0]).long() for j in idx]).to(self.device)
+            inputs = []
+            for j in idx:
+                teacher_cb0, _, draft_cb0 = windows[j]
+                if sched_p > 0.0 and draft_cb0 is not None and rng.random() < sched_p:
+                    inputs.append(draft_cb0)
+                else:
+                    inputs.append(teacher_cb0)
+            cb0 = torch.stack([torch.from_numpy(x).long() for x in inputs]).to(self.device)
             tgt = torch.stack([torch.from_numpy(windows[j][1]).long() for j in idx]).to(self.device)
             yield cb0, tgt
 
-    def _epoch(self, windows, optimizer, scaler, train: bool):
+    def _epoch(self, windows, optimizer, scaler, train: bool, sched_p: float = 0.0,
+               rng=None):
         self.model.train(train)
         use_amp = self.device.type == "cuda"
         loss_sum, n_batches = 0.0, 0
         per_cb_loss = np.zeros(8, dtype=np.float64)
-        for cb0, tgt in self._batches(windows, shuffle=train):
+        for cb0, tgt in self._batches(windows, shuffle=train, sched_p=sched_p, rng=rng):
             with torch.set_grad_enabled(train):
                 with torch.autocast(
                     device_type=self.device.type,
@@ -869,10 +914,14 @@ class ResidualTrainer:
         epochs: int = 60,
         patience: int = 10,
         max_minutes: float = 6.0,
+        sched_target: float = 0.0,
     ) -> Dict[str, float]:
-        windows = self.build_windows(shards)
+        target = float(max(0.0, min(0.9, sched_target if sched_target > 0 else self.sched_target)))
+        draft_cb0 = self.precompute_draft_cb0(shards) if target > 0 else {}
+        windows = self.build_windows(shards, draft_cb0)
         if not windows:
             raise RuntimeError("No residual training windows could be built.")
+        sched_rng = random.Random(self.seed + 17)
         train_w = [w for i, w in enumerate(windows) if i % 10 != 9]
         val_w = [w for i, w in enumerate(windows) if i % 10 == 9] or windows[-1:]
         print(
@@ -891,8 +940,18 @@ class ResidualTrainer:
         stale = 0
         t_start = _now()
         stats: Dict[str, float] = {}
+        if target > 0:
+            if draft_cb0:
+                print(f"[Residual] scheduled sampling: {len(draft_cb0)}/{len(shards)} shards have "
+                      f"draft CB0, ramp 0 -> {target:.2f} over {epochs} epochs")
+            else:
+                print("[Residual] ⚠ scheduled sampling requested but no draft CB0 is available "
+                      "(draft not trained in this run or the draft pass failed) — the residual "
+                      "will train on teacher CB0 only.")
         for epoch in range(1, epochs + 1):
-            train_loss, _ = self._epoch(train_w, optimizer, scaler, train=True)
+            sched_p = target * (epoch - 1) / max(1, epochs - 1)
+            train_loss, _ = self._epoch(train_w, optimizer, scaler, train=True,
+                                        sched_p=sched_p, rng=sched_rng)
             val_loss, _ = self._epoch(val_w, optimizer, scaler, train=False)
             scheduler.step(val_loss)
             improved = val_loss < best_val - 1e-4
@@ -996,9 +1055,10 @@ def run_dry_run(args) -> None:
     draft_stats = DraftTrainer(draft, device, batch_size=8, seed=args.seed).train(
         shards, epochs=3, patience=3, max_minutes=2.0
     )
-    residual_stats = ResidualTrainer(residual, device, batch_size=8, seed=args.seed).train(
-        shards, epochs=3, patience=3, max_minutes=2.0
-    )
+    residual_stats = ResidualTrainer(
+        residual, device, batch_size=8, seed=args.seed,
+        draft_model=draft, sched_target=args.residual_sched,
+    ).train(shards, epochs=3, patience=3, max_minutes=2.0, sched_target=args.residual_sched)
 
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1051,6 +1111,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--residual-epochs", type=int, default=60)
     p.add_argument("--residual-batch", type=int, default=32)
     p.add_argument("--residual-lr", type=float, default=3e-4)
+    p.add_argument("--residual-sched", type=float, default=0.0,
+                   help="Scheduled-sampling target fraction (0-0.9). The residual is trained on "
+                        "teacher CB0 but runs on draft CB0, so a ramp to ~0.5 closes that exposure "
+                        "bias; requires the draft to be trained in the same run (default: off).")
     p.add_argument("--max-minutes-residual", type=float, default=6.0,
                    help="Wall-clock budget for residual training.")
     p.add_argument("--skip-teacher", action="store_true", help="Reuse cached shards only.")
@@ -1152,8 +1216,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         ).train(shards, epochs=args.draft_epochs, max_minutes=args.max_minutes)
     if not args.skip_residual:
         residual_stats = ResidualTrainer(
-            residual, device, lr=args.residual_lr, batch_size=args.residual_batch, seed=args.seed
-        ).train(shards, epochs=args.residual_epochs, max_minutes=args.max_minutes_residual)
+            residual, device, lr=args.residual_lr, batch_size=args.residual_batch, seed=args.seed,
+            draft_model=(draft if not args.skip_draft else None),
+            sched_target=args.residual_sched,
+        ).train(shards, epochs=args.residual_epochs, max_minutes=args.max_minutes_residual,
+                sched_target=args.residual_sched)
 
     # ---------------- checkpoints ----------------
     ckpt_dir = Path(args.ckpt_dir)
@@ -1174,6 +1241,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "corpus_source": args.corpus_json or f"bootstrap(seed={args.seed})",
         "target_source": args.target_source,
         "target_stats": getattr(engine, "backend", "n/a"),
+        "residual_scheduled_sampling": args.residual_sched,
         "length_model": length_model.to_dict(),
         "draft": draft_stats,
         "residual": residual_stats,

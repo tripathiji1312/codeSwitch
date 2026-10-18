@@ -95,6 +95,7 @@ from codeswitch_tts import (  # noqa: E402
     TanglishNormalizer,
 )
 from codeswitch_benchmark_data import EVAL_UTTERANCES, REGISTER_LABELS  # noqa: E402
+from codeswitch_tts.frontend.tamil_latin import latinize_text  # noqa: E402
 
 try:
     import torch
@@ -1198,6 +1199,192 @@ class ASREvaluator:
             wer = None
         return cer, wer
 
+    @staticmethod
+    def score_latin(reference: str, hypothesis: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+        """CER/WER after transliterating *both* sides to Latin.
+
+        Tamil-script references are routinely transcribed by ASR models in Latin
+        (and vice versa), which inflates script-level CER for reasons that have
+        nothing to do with intelligibility.  Transliterating both sides puts the
+        comparison in one alphabet, so the number reflects the audio, not the
+        ASR model's script convention.
+        """
+        if hypothesis is None:
+            return None, None
+        try:
+            import jiwer
+        except Exception:
+            return None, None
+        ref = latinize_text(clean_for_cer(reference))
+        hyp = latinize_text(clean_for_cer(hypothesis))
+        if not ref:
+            return None, None
+        try:
+            cer = float(jiwer.cer(ref, hyp))
+        except Exception:
+            cer = None
+        try:
+            wer = float(jiwer.wer(ref, hyp))
+        except Exception:
+            wer = None
+        return cer, wer
+
+
+# ---------------------------------------------------------------------------
+# Optional perceptual / spectral metrics
+# ---------------------------------------------------------------------------
+class UTMOSScorer:
+    """UTMOS22 (``tarepan/SpeechMOS``) - a no-listener perceptual proxy.
+
+    Loaded lazily and entirely optional: if the checkpoint or its remote code is
+    unavailable the run continues without it (``available=False``).
+    """
+
+    def __init__(self, device, enabled: bool = True, model_id: str = "tarepan/SpeechMOS",
+                 verbose: bool = True):
+        self.model_id = model_id
+        self.available = False
+        self.reason = "disabled" if not enabled else "not initialised"
+        self.model = None
+        self.device = torch.device("cpu") if str(device).startswith("cpu") else device
+        if not enabled:
+            return
+        try:
+            from transformers import AutoModel
+
+            self.model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+            self.model = self.model.to(self.device).eval()
+            self.available = True
+            self.reason = "ok"
+            if verbose:
+                print(f"[UTMOS] loaded {model_id} (device={self.device})")
+        except Exception as exc:
+            self.reason = f"{type(exc).__name__}: {exc}"
+            if verbose:
+                print(f"[UTMOS] ⚠ perceptual proxy unavailable ({self.reason}); "
+                      "UTMOS columns will be absent.")
+
+    def score(self, wave: np.ndarray, sample_rate: int) -> Optional[float]:
+        if not self.available or self.model is None:
+            return None
+        try:
+            import torchaudio
+
+            wav = torch.from_numpy(np.asarray(wave, dtype=np.float32))
+            if int(sample_rate) != 16000:
+                wav = torchaudio.functional.resample(wav, int(sample_rate), 16000)
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)
+            wav = wav.to(self.device)
+            with torch.inference_mode():
+                out = self.model(wav, 16000)
+            value = out.detach().float().cpu().reshape(-1)
+            return float(value[0])
+        except Exception as exc:
+            print(f"[UTMOS] scoring failed: {type(exc).__name__}: {exc}")
+            return None
+
+
+def mcd_between(a: np.ndarray, b: np.ndarray, sample_rate: int = 44100,
+                n_mfcc: int = 13) -> Optional[float]:
+    """Mel-cepstral distortion between two utterances (DTW-aligned, dB scale).
+
+    Used to compare the hybrid/NAR renderings against the AR baseline for the
+    *same text*: a standard spectral-quality proxy that does not depend on an
+    ASR model.  Both signals are resampled to 16 kHz and aligned with a simple
+    DTW over MFCC frames (utterances are seconds long, so this is cheap).
+    """
+    try:
+        import torchaudio
+
+        def _mfcc(wave: np.ndarray) -> np.ndarray:
+            wav = torch.from_numpy(np.asarray(wave, dtype=np.float32)).unsqueeze(0)
+            if int(sample_rate) != 16000:
+                wav = torchaudio.functional.resample(wav, int(sample_rate), 16000)
+            transform = torchaudio.transforms.MFCC(
+                sample_rate=16000, n_mfcc=n_mfcc,
+                melkwargs={"n_fft": 1024, "hop_length": 160, "n_mels": 40},
+            )
+            with torch.inference_mode():
+                feats = transform(wav).squeeze(0).transpose(0, 1).cpu().numpy()
+            return feats[:, 1:]  # drop c0 (energy)
+
+        fa, fb = _mfcc(a), _mfcc(b)
+        if fa.size == 0 or fb.size == 0:
+            return None
+        cost = np.linalg.norm(fa[:, None, :] - fb[None, :, :], axis=2) / np.sqrt(fa.shape[1])
+        n, m = cost.shape
+        dtw = np.full((n + 1, m + 1), np.inf, dtype=np.float64)
+        dtw[0, 0] = 0.0
+        for i in range(1, n + 1):
+            row, prev = dtw[i], dtw[i - 1]
+            c_row = cost[i - 1]
+            for j in range(1, m + 1):
+                row[j] = c_row[j - 1] + min(prev[j], row[j - 1], prev[j - 1])
+        return float(dtw[n, m] / max(n, m) * (10.0 / np.log(10.0)) * np.sqrt(2.0))
+    except Exception:
+        return None
+
+
+def _load_wav_mono(path: str) -> Optional[Tuple[np.ndarray, int]]:
+    """Loads a wav as mono float32 (soundfile first, torchaudio fallback)."""
+    try:
+        import soundfile as sf
+
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        return data.mean(axis=1), int(sr)
+    except Exception:
+        pass
+    try:
+        import torchaudio
+
+        wav, sr = torchaudio.load(str(path))
+        return wav.mean(dim=0).numpy().astype(np.float32), int(sr)
+    except Exception:
+        return None
+
+
+def attach_mcd_from_audio(rows: List[Dict[str, Any]], verbose: bool = True) -> int:
+    """Adds ``mcd_vs_a`` to every B/C row that has a saved wav.
+
+    MCD is computed against the Pure-AR rendering of the *same text*.  The two
+    renderings use different sampling seeds (that is the point of the comparison),
+    so this is a distribution-level spectral distance, not an exact paired one -
+    documented as such wherever it is reported.
+    """
+    by_utt: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if row.get("error") or not row.get("audio_path"):
+            continue
+        by_utt.setdefault(str(row.get("utt_id")), {})[str(row.get("config"))] = row
+    computed = 0
+    for utt_id, per_cfg in by_utt.items():
+        ref_row = per_cfg.get("A")
+        if ref_row is None or not Path(str(ref_row["audio_path"])).exists():
+            continue
+        loaded_ref = _load_wav_mono(str(ref_row["audio_path"]))
+        if loaded_ref is None:
+            continue
+        ref_wav, ref_sr = loaded_ref
+        ref_row.setdefault("mcd_vs_a", 0.0)
+        for cfg in ("B", "C"):
+            row = per_cfg.get(cfg)
+            if row is None or not Path(str(row.get("audio_path") or "")).exists():
+                continue
+            loaded = _load_wav_mono(str(row["audio_path"]))
+            if loaded is None:
+                continue
+            wav, sr = loaded
+            value = mcd_between(wav, ref_wav, sample_rate=sr or ref_sr)
+            if value is not None:
+                row["mcd_vs_a"] = value
+                computed += 1
+    if verbose and computed:
+        print(f"[MCD] mel-cepstral distortion vs Pure AR computed for {computed} rows")
+    elif verbose:
+        print("[MCD] skipped (no saved wavs found - run without --no-save-audio)")
+    return computed
+
 
 # ===========================================================================
 # Aggregation
@@ -1316,6 +1503,9 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
                 "n": len(sub),
                 "cer": _stats([r.get("cer") for r in sub]),
                 "wer": _stats([r.get("wer") for r in sub]),
+                "cer_latin": _stats([r.get("cer_latin") for r in sub]),
+                "utmos": _stats([r.get("utmos") for r in sub]),
+                "mcd_vs_a": _stats([r.get("mcd_vs_a") for r in sub]),
                 "ttfa_compute": _stats([r.get("ttfa_compute_ms") for r in sub]),
                 "ttfa_e2e": _stats([r.get("ttfa_e2e_ms") for r in sub]),
                 "rtf": _stats([r.get("rtf") for r in sub]),
@@ -1324,6 +1514,9 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
                 "asr_fail": sum(1 for r in sub if (r.get("cer") or 0.0) > ASR_FAIL_CER),
                 "values": {
                     "cer": _finite_values(sub, "cer"),
+                    "cer_latin": _finite_values(sub, "cer_latin"),
+                    "utmos": _finite_values(sub, "utmos"),
+                    "mcd_vs_a": _finite_values(sub, "mcd_vs_a"),
                     "ttfa_compute": _finite_values(sub, "ttfa_compute_ms"),
                 },
             }
@@ -1337,6 +1530,9 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
             "ttfa_e2e": _raw("ttfa_e2e_ms"),
             "rtf": _raw("rtf"),
             "cer": _raw("cer"),
+            "cer_latin": _raw("cer_latin"),
+            "utmos": _raw("utmos"),
+            "mcd_vs_a": _raw("mcd_vs_a"),
         }
         agg[cfg] = {
             "n": len(ok),
@@ -1356,6 +1552,9 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
             "logq_kept": _stats([r.get("logq_kept") for r in ok]),
             "cer": _stats([r.get("cer") for r in ok]),
             "wer": _stats([r.get("wer") for r in ok]),
+            "cer_latin": _stats([r.get("cer_latin") for r in ok]),
+            "utmos": _stats([r.get("utmos") for r in ok]),
+            "mcd_vs_a": _stats([r.get("mcd_vs_a") for r in ok]),
             "asr_fail": sum(1 for r in ok if (r.get("cer") or 0.0) > ASR_FAIL_CER),
             "asr_fail_utts": sorted(
                 str(r.get("utt_id")) for r in ok if (r.get("cer") or 0.0) > ASR_FAIL_CER
@@ -1408,7 +1607,10 @@ def aggregate_gate_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "rtf": _stats([r.get("rtf") for r in sub]),
             "accept_true": _stats([r.get("accept_true") for r in sub if not r.get("fallback")]),
             "asr_fail": sum(1 for r in sub if (r.get("cer") or 0.0) > ASR_FAIL_CER),
+            "cer_latin": _stats([r.get("cer_latin") for r in sub]),
+            "utmos": _stats([r.get("utmos") for r in sub]),
             "cer_values": _finite_values(sub, "cer"),
+            "cer_latin_values": _finite_values(sub, "cer_latin"),
             "total_values": _finite_values(sub, "total_ms"),
         })
     return out
@@ -1556,6 +1758,22 @@ def _stat_p50(cfg_agg: Dict[str, Any], key: str) -> Optional[float]:
     v = entry.get("p50")
     return None if v is None else float(v)
 
+
+def _prefer_latin_cer(cfg_agg: Dict[str, Any]) -> bool:
+    """True when the run recorded script-robust (Latin-transliterated) CER."""
+    return bool(_values_for(cfg_agg, "cer_latin"))
+
+
+def _cer_values(cfg_agg: Dict[str, Any]) -> List[float]:
+    """Per-utterance CER, preferring the Latin-transliterated variant."""
+    latin = _values_for(cfg_agg, "cer_latin")
+    return latin if latin else _values_for(cfg_agg, "cer")
+
+
+def _cer_p50(cfg_agg: Dict[str, Any]) -> Optional[float]:
+    key = "cer_latin" if _prefer_latin_cer(cfg_agg) else "cer"
+    return _stat_p50(cfg_agg, key)
+
 def _draw_box(ax, pos: float, vals: Sequence[float], color: str, width: float = 0.44) -> None:
     """IQR box + median for one group (points are drawn separately)."""
     if not vals:
@@ -1665,8 +1883,12 @@ def figure1_latency_quality(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Op
                      ha="left", va="bottom", fontsize=6.5, color="#666666")
 
     # ---- (c) intelligibility ------------------------------------------------
-    _panel(axes[2], "cer", "CER (%, log scale, lower better)", "(c) Intelligibility",
-           floor=0.5, pct=True, digits=0, suffix="%")
+    # Latin-transliterated CER when the run recorded it: ASR script choice must
+    # not decide how intelligible the audio looks.
+    cer_key = "cer_latin" if any(_prefer_latin_cer(agg[c]) for c in configs) else "cer"
+    cer_name = "CER$_{lat}$" if cer_key == "cer_latin" else "CER"
+    _panel(axes[2], cer_key, f"{cer_name} (%, log scale, lower better)",
+           "(c) Intelligibility", floor=0.5, pct=True, digits=0, suffix="%")
     fails = [int(agg[c].get("asr_fail") or 0) for c in configs]
     if any(fails):
         axes[2].annotate(
@@ -1981,7 +2203,9 @@ def figure4_scaling_and_registers(rows: List[Dict[str, Any]], agg: Dict[str, Dic
     for i, reg in enumerate(regs):
         for k, c in enumerate(configs):
             entry = ((agg.get(c) or {}).get("registers") or {}).get(reg) or {}
-            vals = [float(v) * 100.0 for v in ((entry.get("values") or {}).get("cer") or [])]
+            reg_vals = (entry.get("values") or {}).get("cer_latin") or \
+                (entry.get("values") or {}).get("cer") or []
+            vals = [float(v) * 100.0 for v in reg_vals]
             vals = [v for v in vals if np.isfinite(v)]
             pos = i + (k - (n_cfg - 1) / 2.0) * 0.26
             if vals:
@@ -1991,7 +2215,7 @@ def figure4_scaling_and_registers(rows: List[Dict[str, Any]], agg: Dict[str, Dic
                              spread=0.07, alpha=0.8)
                 drawn.extend(plot_vals)
             else:
-                p50 = ((entry.get("cer") or {}).get("p50"))
+                p50 = ((entry.get("cer_latin") or entry.get("cer") or {}).get("p50"))
                 if p50 is None:
                     continue
                 p50 = max(float(p50) * 100.0, 0.5)
@@ -2004,7 +2228,12 @@ def figure4_scaling_and_registers(rows: List[Dict[str, Any]], agg: Dict[str, Dic
     ax.set_xticks(positions)
     ax.set_xticklabels([REGISTER_LABELS[r].replace(" ", "\n") for r in regs], fontsize=8)
     ax.set_xlim(-0.55, len(regs) - 0.45)
-    ax.set_ylabel("CER (%, log, lower better)", fontsize=9)
+    cer_label = "CER$_{lat}$" if any(
+        (entry.get("values") or {}).get("cer_latin")
+        for c in configs
+        for entry in (((agg.get(c) or {}).get("registers") or {}).values())
+    ) else "CER"
+    ax.set_ylabel(f"{cer_label} (%, log, lower better)", fontsize=9)
     ax.set_title("(b) Intelligibility per register", fontsize=9)
     ax.set_axisbelow(True)
     # colour key is shared with panel (a); no second legend needed
@@ -2059,13 +2288,14 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         "\\caption{Comparative evaluation of Pure AR, Pure NAR and the proposed CodeSwitch-TTS "
         "hybrid on the 60-utterance Tanglish benchmark (Kaggle T4, fp16). "
         "TTFA-c: component compute latency; TTFA-e2e: wall-clock to first audio buffer; "
-        "CER medians (ASR-limited, see text).}",
+        "CER medians (ASR-limited); CER$_{\\mathrm{lat}}$ is script-robust; UTMOS and MCD are "
+        "perceptual/spectral proxies (no listeners, see text).}",
         "\\label{tab:comparison}",
-        "\\begin{tabular}{lccccccccc}",
+        "\\begin{tabular}{lcccccccccccc}",
         "\\toprule",
         "Architecture & TTFA-c cold (ms) & TTFA-c warm p50 (ms) & TTFA-c warm p90 (ms) "
-        "& TTFA-e2e warm p50 (ms) & Total (s) & RTF & CER p50 (\\%) "
-        "& CB0 acc. true (\\%) & CB0 acc. ref. (\\%) \\\\",
+        "& TTFA-e2e warm p50 (ms) & Total (s) & RTF & CER p50 (\\%) & CER$_{\\mathrm{lat}}$ p50 (\\%) "
+        "& UTMOS & MCD (dB) & CB0 acc. true (\\%) & CB0 acc. ref. (\\%) \\\\",
         "\\midrule",
     ]
     for cfg in ("A", "B", "C"):
@@ -2082,6 +2312,10 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         total = (a.get("total") or {}).get("mean")
         cer_stat = a.get("cer") or {}
         cer_p50 = None if cer_stat.get("p50") is None else float(cer_stat["p50"]) * 100.0
+        cer_lat = a.get("cer_latin") or {}
+        cer_lat_p50 = None if cer_lat.get("p50") is None else float(cer_lat["p50"]) * 100.0
+        utmos_stat = a.get("utmos") or {}
+        mcd_stat = a.get("mcd_vs_a") or {}
         cells = [
             CONFIG_LABELS[cfg],
             _tex(a.get("ttfa_compute_cold"), 0),
@@ -2091,6 +2325,9 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
             _tex(None if total is None else total / 1000.0, 2),
             _tex((a.get("rtf") or {}).get("mean"), 2),
             _tex(cer_p50, 1),
+            _tex(cer_lat_p50, 1),
+            _tex(utmos_stat.get("mean"), 2),
+            _tex(mcd_stat.get("mean"), 2),
             _pm(a.get("accept_true") or {}),
             _pm(a.get("accept_synth") or {}),
         ]
@@ -2139,7 +2376,12 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
             "with the real teacher more often than with a random target (a perfectly aligned draft "
             "would score 100\\% against its own target). Config A has no draft/verification stage "
             "(acc. n/a); its TTFA-c is the time from decoder start to the first decoded audio buffer. "
-            "CER reference: normalised Tamil-script text; ASR failures with CER $>$ 200\\% "
+            "CER reference: normalised Tamil-script text; CER$_{\\mathrm{lat}}$ is the same metric "
+            "after transliterating both sides to Latin, which removes the ASR model's script-choice "
+            "component; UTMOS is the UTMOS22 no-listener perceptual proxy; MCD is mel-cepstral "
+            "distortion against the Pure-AR rendering of the same text (a different sampling seed, so "
+            "a distribution-level spectral distance rather than an exact paired one). "
+            "ASR failures with CER $>$ 200\\% "
             "(whisper-small hallucination loops) = " + ", ".join(fail_bits) + "; Table III gives "
             "per-register numbers." + cold_sentence + logq_sentence + "}"
         ),
@@ -2212,9 +2454,10 @@ def build_table_III(agg: Dict[str, Dict[str, Any]]) -> str:
         "hallucination loops), so the median is the comparable statistic; rows above 200\\% are "
         "censused in Table~I.}",
         "\\label{tab:registers}",
-        "\\begin{tabular}{llcccccc}",
+        "\\begin{tabular}{llccccccc}",
         "\\toprule",
-        "Register & Config & N & CER p50 (\\%) & CER mean (\\%) & TTFA-c p50 (ms) & RTF & CB0 acc.\\ true (\\%) \\\\",
+        "Register & Config & N & CER p50 (\\%) & CER$_{\\mathrm{lat}}$ p50 (\\%) & CER mean (\\%) "
+        "& TTFA-c p50 (ms) & RTF & CB0 acc.\\ true (\\%) \\\\",
         "\\midrule",
     ]
     any_row = False
@@ -2237,11 +2480,14 @@ def build_table_III(agg: Dict[str, Dict[str, Any]]) -> str:
                     else f"{mean * 100.0:.1f}$\\pm${std * 100.0:.1f}"
                 )
             acc = entry.get("accept_true") or {}
+            lat = entry.get("cer_latin") or {}
+            lat_cell = _tex(None if lat.get("p50") is None else float(lat["p50"]) * 100.0, 1)
             cells = [
                 reg_label if first_row else "",
                 cfg,
                 str(entry.get("n")),
                 _tex(p50, 1),
+                lat_cell,
                 mean_cell,
                 _tex((entry.get("ttfa_compute") or {}).get("p50"), 0),
                 _tex((entry.get("rtf") or {}).get("mean"), 2),
@@ -2250,7 +2496,7 @@ def build_table_III(agg: Dict[str, Dict[str, Any]]) -> str:
             lines.append(" & ".join(cells) + " \\\\")
             first_row = False
     if not any_row:
-        lines.append("-- & -- & -- & -- & -- & -- & -- & -- \\\\")
+        lines.append("-- & -- & -- & -- & -- & -- & -- & -- & -- \\\\")
     lines += [
         "\\bottomrule",
         "\\end{tabular}",
@@ -2285,9 +2531,11 @@ def figure5_gate_pareto(rows: List[Dict[str, Any]], agg: Dict[str, Dict[str, Any
     # ---- (a) latency-quality operating points ------------------------------
     ax = axes[0]
     pts: List[Tuple[float, float, float]] = []  # (total p50, cer p50, fallback rate)
+    use_latin = any((entry.get("cer_latin") or {}).get("p50") is not None
+                    for entry in gate_rows)
     for entry in gate_rows:
         total = (entry.get("total") or {}).get("p50")
-        cer = (entry.get("cer") or {}).get("p50")
+        cer = ((entry.get("cer_latin") if use_latin else entry.get("cer")) or {}).get("p50")
         if total is None or cer is None:
             continue
         pts.append((float(total), float(cer) * 100.0, float(entry.get("fallback_rate") or 0.0)))
@@ -2302,20 +2550,21 @@ def figure5_gate_pareto(rows: List[Dict[str, Any]], agg: Dict[str, Dict[str, Any
                         ha="left", va="top", fontsize=6.2, color="#555555")
     a_entry = agg.get("A") or {}
     a_total = (a_entry.get("total") or {}).get("p50")
-    a_cer = (a_entry.get("cer") or {}).get("p50")
+    a_cer = _cer_p50(a_entry)
     if a_total is not None and a_cer is not None:
         ax.scatter([float(a_total)], [float(a_cer) * 100.0], s=34, marker="s",
                    color=CONFIG_COLORS["A"], zorder=4, label="Pure AR")
     b_entry = agg.get("B") or {}
     b_total = (b_entry.get("total") or {}).get("p50")
-    b_cer = (b_entry.get("cer") or {}).get("p50")
+    b_cer = _cer_p50(b_entry)
     if b_total is not None and b_cer is not None:
         ax.scatter([float(b_total)], [float(b_cer) * 100.0], s=34, marker="^",
                    color=CONFIG_COLORS["B"], zorder=4, label="Pure NAR")
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("Total synthesis latency, p50 (ms, log)", fontsize=9)
-    ax.set_ylabel("CER p50 (%, log, lower better)", fontsize=9)
+    ax.set_ylabel(("CER$_{lat}$" if use_latin else "CER")
+                  + " p50 (%, log, lower better)", fontsize=9)
     ax.set_title("(a) Confidence-gated operating points", fontsize=9)
     ax.set_axisbelow(True)
     handles = [Line2D([], [], marker="o", ms=4.5, linestyle="-", linewidth=1.0,
@@ -2518,6 +2767,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--replay", action="store_true",
                    help="Skip synthesis; rebuild aggregates/figures/tables from the JSONL.")
     p.add_argument("--skip-asr", action="store_true")
+    p.add_argument("--no-utmos", action="store_true",
+                   help="Skip the UTMOS22 perceptual proxy (tarepan/SpeechMOS; downloads "
+                        "~50 MB and needs trust_remote_code on first use).")
+    p.add_argument("--no-mcd", action="store_true",
+                   help="Skip mel-cepstral distortion against the Pure-AR rendering "
+                        "(computed from the saved wavs, no GPU needed).")
     p.add_argument("--asr-model", type=str, default="openai/whisper-small")
     p.add_argument("--allow-untrained", action="store_true",
                    help="Permit random-weight modules (local smoke tests only).")
@@ -2675,6 +2930,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.asr_model, device,
         enabled=(not args.skip_asr and any(c in configs for c in ("A", "B", "C"))),
     )
+    utmos = UTMOSScorer(
+        device,
+        enabled=(not args.no_utmos and not args.skip_asr
+                 and any(c in configs for c in ("A", "B", "C"))),
+    )
 
     run_meta = {
         "args": vars(args),
@@ -2687,6 +2947,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "draft_trained": draft_trained,
         "residual_trained": residual_trained,
         "scorer_available": bool(scorer and scorer.available),
+        "utmos_available": bool(utmos and utmos.available),
+        "utmos_model": (getattr(utmos, "model_id", None) if utmos is not None else None),
         "length_model": (length_model.to_dict() if length_model else None),
     }
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2741,13 +3003,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if asr.available:
                         hyp = asr.transcribe(wave, row["sample_rate"])
                         cer, wer = ASREvaluator.score(row["normalized_text"], hyp)
+                        cer_lat, wer_lat = ASREvaluator.score_latin(row["normalized_text"], hyp)
                         row["asr_text"] = hyp
                         row["cer"] = cer
                         row["wer"] = wer
+                        row["cer_latin"] = cer_lat
+                        row["wer_latin"] = wer_lat
                     else:
                         row["cer"] = None
                         row["wer"] = None
+                        row["cer_latin"] = None
+                        row["wer_latin"] = None
                         row["asr_text"] = None
+                    if utmos is not None:
+                        row["utmos"] = utmos.score(wave, row["sample_rate"])
 
                 if row.get("utt_index") is None:
                     row["utt_index"] = utt_index
@@ -2787,6 +3056,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: float) -> int:
     gate_threshold = float(getattr(args, "gate_thresholds", "0.0").split(",")[0] or 0.0)
+    if not getattr(args, "no_mcd", False):
+        attach_mcd_from_audio(rows)
     agg = aggregate_results(rows, configs, gate_threshold=gate_threshold)
     gate_rows = aggregate_gate_sweep(rows)
     switch_rows = switch_distance_table(rows)
@@ -2820,6 +3091,18 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
             f"acc_true={None if (a.get('accept_true') or {}).get('mean') is None else round(a['accept_true']['mean'], 1)}% | "
             f"acc_ref={None if (a.get('accept_synth') or {}).get('mean') is None else round(a['accept_synth']['mean'], 1)}%"
         )
+        extra = []
+        lat = a.get("cer_latin") or {}
+        if lat.get("p50") is not None:
+            extra.append(f"CER-lat p50={float(lat['p50']) * 100:.1f}%")
+        ut = a.get("utmos") or {}
+        if ut.get("mean") is not None:
+            extra.append(f"UTMOS={ut['mean']:.2f}")
+        mcd = a.get("mcd_vs_a") or {}
+        if mcd.get("mean") is not None:
+            extra.append(f"MCD={mcd['mean']:.2f} dB")
+        if extra:
+            print("      " + " | ".join(extra))
         if a.get("asr_fail"):
             utts = a.get("asr_fail_utts") or []
             shown = ", ".join(utts[:6]) + (" ..." if len(utts) > 6 else "")

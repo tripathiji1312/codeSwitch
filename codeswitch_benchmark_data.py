@@ -126,6 +126,41 @@ _TAMIL_TEMPLATES: List[str] = [
     "{place} வழியாகச் செல்வது வேகமாக இருக்கும்.",
 ]
 
+#: Tamil-script-only templates with slots, so the *unique* yield of the native
+#: register is combinatorial rather than a handful of fixed sentences.
+_TAMIL_SLOT_TEMPLATES: List[str] = [
+    "{place_ta} போய் சேர்ந்ததும் எனக்கு ஒரு அழைப்பு போடுங்கள்.",
+    "இந்த {shop_ta} {time_ta} மணிக்கு திறக்கும்.",
+    "உங்கள் {noun_ta} {day_ta} காலையில் வந்துவிடும்.",
+    "{place_ta} வரைக்கும் ஆட்டோவில் போனால் {amount_ta} ரூபாய் ஆகும்.",
+    "நாளைக்கு {shop_ta} மூடியிருக்கும், முன்பே வாங்கிக் கொள்ளுங்கள்.",
+    "{name_ta}, நீங்கள் சொன்ன {noun_ta} இன்னும் தயாராகவில்லை.",
+    "சுமார் {min_ta} நிமிடத்தில் வந்து விடுவேன்.",
+    "இந்த {noun_ta} யாருடையது என்று சொல்லுங்கள்.",
+    "{place_ta} பக்கம் திரும்பினால் விரைவாக போகலாம்.",
+    "{day_ta} {time_ta} மணிக்கு வருகிறேன்.",
+    "தயவுசெய்து {min_ta} நிமிடம் காத்திருங்கள்.",
+    "உங்கள் {noun_ta} க்கு {amount_ta} ரூபாய் ஆகும்.",
+    "எனக்கு {place_ta} வழி தெரியாது, வழி சொல்லுங்கள்.",
+    "இந்த {shop_ta} நல்ல தரமானது.",
+    "{name_ta}, {noun_ta} கொஞ்சம் தாமதம் ஆகும்.",
+    "நான் {day_ta} {place_ta} போகிறேன்.",
+    "அந்த {noun_ta} எங்கே இருக்கிறது என்று பாருங்கள்.",
+    "எங்கள் {shop_ta} {time_ta} மணி வரை திறந்திருக்கும்.",
+    "இந்த பகுதியில் {place_ta} எங்கே இருக்கிறது?",
+    "{min_ta} நிமிடத்தில் {place_ta} சேர்ந்து விடுவோம்.",
+    "{place_ta} சாலையில் இன்று நெரிசல் அதிகம்.",
+    "உங்கள் {noun_ta} நேற்றே அனுப்பப்பட்டது, நாளை வந்து சேரும்.",
+    "நான் {time_ta} மணிக்கு {shop_ta} அருகில் இருப்பேன்.",
+    "எங்கள் {shop_ta} க்கு {day_ta} வருகை அதிகம்.",
+    "{name_ta}, {place_ta} வழியா வருகிறீர்களா?",
+    "இந்த {noun_ta} விலை {amount_ta} ரூபாய் என்று நினைக்கிறேன்.",
+    "தினமும் {time_ta} மணிக்கு பேருந்து வரும்.",
+    "என் {noun_ta} இன்னும் இரண்டு நாள் ஆகும்.",
+    "{place_ta} ல் புதிய {shop_ta} ஒன்று திறந்திருக்கிறது.",
+    "{min_ta} நிமிடத்திற்கு ஒரு முறை பேருந்து வரும்.",
+]
+
 _TANGLISH_TEMPLATES: List[str] = [
     "Unga {noun} vandhuduchu, {name}.",
     "Enakku route therila, map paarunga.",
@@ -180,14 +215,28 @@ _TRANSIT_TEMPLATES: List[str] = [
 
 _SLOTS: Dict[str, List[str]] = {
     "name": ["sir", "madam", "boss", "unga friend", "driver", "customer"],
+    "name_ta": ["சார்", "மேடம்", "அண்ணா", "அக்கா", "தம்பி", "தங்கச்சி"],
     "noun": ["order", "parcel", "booking", "food", "ticket", "payment"],
+    "noun_ta": ["ஆர்டர்", "பார்சல்", "புக்கிங்", "பில்", "டிக்கெட்", "பணம்",
+                "மளிகை பொருள்", "மருந்து"],
+    "shop_ta": ["கடை", "ஹோட்டல்", "மருத்துவமனை", "வங்கி", "சந்தை", "பள்ளி",
+                "பேக்கரி", "பூங்கா"],
     "place": ["T Nagar", "Anna Nagar", "Velachery", "Guindy", "Chromepet",
               "Tambaram", "Adyar", "Koyambedu", "Egmore", "Mylapore",
               "Porur", "Ambattur", "Perungudi", "Pallikaranai"],
+    "place_ta": ["தி நகர்", "அண்ணா நகர்", "வேளச்சேரி", "கிண்டி", "சுரேந்திர நகர்",
+                 "தாம்பரம்", "அடையாறு", "கோயம்பேடு", "எழும்பூர்", "மயிலாப்பூர்",
+                 "போரூர்", "அம்பத்தூர்", "பெருங்குடி", "பள்ளிக்கரணை"],
     "min_en": ["two", "three", "five", "seven", "ten", "fifteen"],
     "mins": ["இரண்டு", "மூன்று", "ஐந்து", "ஏழு", "பத்து"],
+    "min_ta": ["இரண்டு", "மூன்று", "ஐந்து", "ஏழு", "பத்து", "பதினைந்து"],
     "time": ["six", "seven", "eight", "nine", "ten"],
+    "time_ta": ["ஆறு", "ஏழு", "எட்டு", "ஒன்பது", "பத்து", "பதினொன்று"],
+    "day_ta": ["இன்று", "நாளை", "நேற்று", "இன்று மாலை", "நாளை காலை",
+               "வாரம் இறுதியில்"],
     "ta_num": ["இருநூறு", "முந்நூறு", "நானூறு", "ஐந்நூறு", "எண்ணூறு"],
+    "amount_ta": ["நூறு", "இருநூறு", "முந்நூறு", "நானூறு", "ஐந்நூறு", "எண்ணூறு",
+                  "ஆயிரம்", "ஆயிரத்து ஐந்நூறு"],
     "kg": ["1.5", "2.5", "3", "5"],
     "slot": ["A 12", "B 47", "C 09", "D 23"],
     "seat": ["12A", "23B", "7C", "15D"],
@@ -237,7 +286,8 @@ def build_training_corpus(n: int = 400, seed: int = 7) -> List[str]:
     """
     rng = random.Random(seed)
     eval_norm = {_normalize_for_compare(u["text"]) for u in EVAL_UTTERANCES}
-    pool = _TAMIL_TEMPLATES + _TANGLISH_TEMPLATES + _TRANSIT_TEMPLATES
+    pool = (_TAMIL_TEMPLATES + _TAMIL_SLOT_TEMPLATES + _TANGLISH_TEMPLATES
+            + _TRANSIT_TEMPLATES)
     corpus: List[str] = []
     seen: set[str] = set()
     attempts = 0
