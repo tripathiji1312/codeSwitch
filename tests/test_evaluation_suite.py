@@ -481,6 +481,15 @@ def test_results_roundtrip_preserves_chunk_telemetry(tmp_path: Path):
     assert json.dumps(c_row, ensure_ascii=False)
 
 
+def test_asr_generation_cap_scales_with_audio_length():
+    """Whisper's 448-token default is what turns unintelligible rows into ~5 s loops."""
+    assert R.asr_max_new_tokens(0.0) == 24
+    assert R.asr_max_new_tokens(3.0) == 30
+    assert R.asr_max_new_tokens(6.0) >= 48
+    assert R.asr_max_new_tokens(300.0) == 448        # whisper's own maximum
+    assert R.asr_max_new_tokens(3.0) < 448
+
+
 def test_provenance_guard_blocks_resuming_with_new_checkpoints(tmp_path):
     """A retrain must not silently mix two models' rows in one results file."""
     ckpt = tmp_path / "ckpt"

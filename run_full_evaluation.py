@@ -1188,6 +1188,19 @@ class EvalSynthesizer:
 # ===========================================================================
 # ASR / intelligibility
 # ===========================================================================
+def asr_max_new_tokens(audio_sec: float) -> int:
+    """Generation cap for one ASR pass.
+
+    Whisper's short-form decoder defaults to 448 new tokens.  On unintelligible
+    audio it can fall into a repetition loop that burns ~5 s of wall-clock per
+    row and reports a hallucinated transcript (the ``CER > 200 %`` rows, which
+    is also why exactly those rows take ~5 s longer than their synthesis time).
+    Real transcripts need ~4-7 tokens per second of Tamil speech, so 10/s
+    leaves genuine output untouched while cutting the loops off.
+    """
+    return int(min(448, max(24, round(10.0 * float(audio_sec)))))
+
+
 class ASREvaluator:
     def __init__(self, model_id: str, device, enabled: bool = True, verbose: bool = True):
         self.model_id = model_id
@@ -1226,9 +1239,15 @@ class ASREvaluator:
         if not self.available or self.pipe is None:
             return None
         try:
+            wave = np.asarray(wave, dtype=np.float32)
+            audio_sec = len(wave) / float(max(1, int(sample_rate)))
             result = self.pipe(
-                {"array": np.asarray(wave, dtype=np.float32), "sampling_rate": sample_rate},
-                generate_kwargs={"language": "ta", "task": "transcribe"},
+                {"array": wave, "sampling_rate": sample_rate},
+                generate_kwargs={
+                    "language": "ta",
+                    "task": "transcribe",
+                    "max_new_tokens": asr_max_new_tokens(audio_sec),
+                },
             )
             if isinstance(result, list):
                 result = result[0]
