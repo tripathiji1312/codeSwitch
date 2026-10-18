@@ -373,3 +373,78 @@ def test_legacy_position_named_shards_are_adopted(tmp_path):
     assert shards[0].raw_text == sentence
     assert (out_dir / T.teacher_shard_name(sentence)).is_file()
     assert not (out_dir / "shard_00000.npz").exists()          # renamed in place
+
+
+def _fake_teacher_shards(n: int = 12, frames: int = 120):
+    """Minimal TeacherShard list, enough to build residual/draft windows."""
+    import numpy as np
+    import train_draft_distill as T
+
+    return [
+        T.TeacherShard(
+            index=i,
+            raw_text=f"sentence {i}",
+            norm_text=f"sentence {i}",
+            n_chars=12,
+            frames=frames,
+            codes=np.random.RandomState(i).randint(0, 1024, size=(9, frames)).astype(np.int16),
+            audio_sec=frames / 86.0,
+            target_source="lm",
+            gen_ms=1.0,
+        )
+        for i in range(n)
+    ]
+
+
+def test_min_epochs_blocks_premature_early_stopping():
+    """A small, noisy validation split must not be able to end training early.
+
+    The 300-sentence pilot early-stopped the draft at epoch 10 of ~9 batches and
+    left the residual at its uniform-noise level; --min-epochs is the floor that
+    makes the same wall-clock budget produce a trained student.
+    """
+    import torch
+    import train_draft_distill as T
+
+    shards = _fake_teacher_shards()
+
+    class _Residual(T.ResidualTrainer):
+        def _epoch(self, windows, optimizer, scaler, train, sched_p=0.0, rng=None):
+            return 6.9, []          # never improves -> `stale` grows immediately
+
+        @torch.inference_mode()
+        def evaluate(self, windows):
+            return float(len(windows)), [0.0] * 8
+
+    plain = _Residual(T.ResidualDecoder(), torch.device("cpu"), batch_size=4)
+    stats = plain.train(shards, epochs=30, patience=1, max_minutes=5.0, min_epochs=0)
+    assert stats["epochs_run"] == 2                       # patience honoured as before
+
+    floored = _Residual(T.ResidualDecoder(), torch.device("cpu"), batch_size=4)
+    stats = floored.train(shards, epochs=30, patience=1, max_minutes=5.0, min_epochs=6)
+    assert stats["epochs_run"] == 6                       # floor wins over patience
+
+    class _Draft(T.DraftTrainer):
+        def _run_epoch(self, shards_, optimizer, scaler, train):
+            return 5.0
+
+        @torch.inference_mode()
+        def evaluate_topk(self, shards_):
+            return 0.0, 0.0
+
+    draft = _Draft(T.DraftTransformer(), torch.device("cpu"), batch_size=4)
+    stats = draft.train(shards, epochs=30, patience=1, max_minutes=5.0, min_epochs=5)
+    assert stats["epochs_run"] == 5
+
+
+def test_min_epochs_flag_is_wired_into_both_trainers():
+    import inspect
+
+    import train_draft_distill as T
+
+    args = T.build_arg_parser().parse_args(["--corpus-json", "x.txt", "--min-epochs", "150"])
+    assert args.min_epochs == 150
+    source = inspect.getsource(T.main)
+    assert source.count("min_epochs=args.min_epochs") == 2, (
+        "--min-epochs must be passed to both the draft and the residual trainer"
+    )

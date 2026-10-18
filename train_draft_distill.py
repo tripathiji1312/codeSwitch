@@ -781,6 +781,7 @@ class DraftTrainer:
         patience: int = 12,
         max_minutes: float = 12.0,
         log_every: int = 1,
+        min_epochs: int = 0,
     ) -> Dict[str, float]:
         # deterministic split: every 10th shard is validation
         train_shards = [s for i, s in enumerate(shards) if i % 10 != 9]
@@ -826,7 +827,7 @@ class DraftTrainer:
                     f"{'  *best*' if improved else ''} | lr {lr_now:.2e} | "
                     f"{_fmt_time(_now() - t_epoch)}/ep | total {_fmt_time(elapsed)}"
                 )
-            if stale >= patience:
+            if stale >= patience and epoch >= int(min_epochs):
                 print(f"[Draft] early stopping at epoch {epoch} (patience {patience})")
                 break
             if (_now() - t_start) > max_minutes * 60.0:
@@ -994,6 +995,7 @@ class ResidualTrainer:
         patience: int = 10,
         max_minutes: float = 6.0,
         sched_target: float = 0.0,
+        min_epochs: int = 0,
     ) -> Dict[str, float]:
         target = float(max(0.0, min(0.9, sched_target if sched_target > 0 else self.sched_target)))
         draft_cb0 = self.precompute_draft_cb0(shards) if target > 0 else {}
@@ -1046,7 +1048,7 @@ class ResidualTrainer:
                 f"[Residual] epoch {epoch:3d} | train {train_loss:.4f} | val {val_loss:.4f}"
                 f"{'  *best*' if improved else ''} | total {_fmt_time(_now() - t_start)}"
             )
-            if stale >= patience:
+            if stale >= patience and epoch >= int(min_epochs):
                 print(f"[Residual] early stopping at epoch {epoch}")
                 break
             if (_now() - t_start) > max_minutes * 60.0:
@@ -1187,6 +1189,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft-lr", type=float, default=3e-4)
     p.add_argument("--max-minutes", type=float, default=12.0,
                    help="Wall-clock budget for draft training.")
+    p.add_argument("--min-epochs", type=int, default=0,
+                   help="Epochs that must elapse before early stopping can fire (both stages). "
+                        "The 300-sentence pilot early-stopped at epoch 10 of ~9 batches/epoch "
+                        "(~200 optimizer steps) and its residual never left the uniform-noise "
+                        "regime; a floor of 150-400 turns the same wall-clock budget into a "
+                        "trained student. --max-minutes* still caps the run.")
     p.add_argument("--residual-epochs", type=int, default=60)
     p.add_argument("--residual-batch", type=int, default=32)
     p.add_argument("--residual-lr", type=float, default=3e-4)
@@ -1292,14 +1300,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.skip_draft:
         draft_stats = DraftTrainer(
             draft, device, lr=args.draft_lr, batch_size=args.draft_batch, seed=args.seed
-        ).train(shards, epochs=args.draft_epochs, max_minutes=args.max_minutes)
+        ).train(shards, epochs=args.draft_epochs, max_minutes=args.max_minutes,
+                min_epochs=args.min_epochs)
     if not args.skip_residual:
         residual_stats = ResidualTrainer(
             residual, device, lr=args.residual_lr, batch_size=args.residual_batch, seed=args.seed,
             draft_model=(draft if not args.skip_draft else None),
             sched_target=args.residual_sched,
         ).train(shards, epochs=args.residual_epochs, max_minutes=args.max_minutes_residual,
-                sched_target=args.residual_sched)
+                sched_target=args.residual_sched, min_epochs=args.min_epochs)
 
     # ---------------- checkpoints ----------------
     ckpt_dir = Path(args.ckpt_dir)
