@@ -481,6 +481,44 @@ def test_results_roundtrip_preserves_chunk_telemetry(tmp_path: Path):
     assert json.dumps(c_row, ensure_ascii=False)
 
 
+def test_provenance_guard_blocks_resuming_with_new_checkpoints(tmp_path):
+    """A retrain must not silently mix two models' rows in one results file."""
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "meta.json").write_text('{"corpus_size": 300}', encoding="utf-8")
+    results = tmp_path / "eval_results" / "raw_results.jsonl"
+    results.parent.mkdir(parents=True, exist_ok=True)
+
+    first = R.check_provenance(results, ckpt)
+    assert first["blocked"] is False and first["previous"] is None
+    assert first["fingerprint"]["meta.json"]["size"] == 20   # len('{"corpus_size": 300}')
+    Path(first["path"]).write_text(json.dumps({"checkpoints": first["fingerprint"]}), encoding="utf-8")
+
+    results.write_text('{"config": "A"}\n', encoding="utf-8")
+    assert R.check_provenance(results, ckpt)["blocked"] is False        # same weights
+    (ckpt / "meta.json").write_text('{"corpus_size": 2000}', encoding="utf-8")
+    blocked = R.check_provenance(results, ckpt)
+    assert blocked["blocked"] is True
+    assert "different checkpoints" in blocked["reason"]
+    assert "--force" in blocked["reason"]
+    assert R.check_provenance(results, ckpt, force=True)["blocked"] is False
+    assert R.check_provenance(results, ckpt, replay=True)["blocked"] is False
+
+
+def test_provenance_notes_legacy_results_without_a_manifest(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "draft_cb0.pt").write_bytes(b"weights")
+    results = tmp_path / "raw_results.jsonl"
+    results.write_text('{"config": "A"}\n', encoding="utf-8")
+    check = R.check_provenance(results, ckpt)
+    assert check["blocked"] is False
+    assert "without provenance" in check["note"]
+    assert check["fingerprint"]["draft_cb0.pt"]["sha1"]
+    empty = R.check_provenance(tmp_path / "other.jsonl", tmp_path / "no_ckpt")
+    assert empty["fingerprint"] == {} and empty["note"] is None
+
+
 def test_replay_pushes_to_wandb_when_asked(tmp_path, monkeypatch, capsys):
     """--replay --wandb rebuilds the artifacts (no GPU) and pushes them once."""
     import push_to_wandb as W

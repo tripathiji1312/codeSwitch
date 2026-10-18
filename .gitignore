@@ -43,3 +43,14 @@ Thumbs.db
 .idea/
 .claude/
 *.log
+
+# Kaggle run artifacts (corpus, teacher cache, evaluation outputs)
+codeswitch_corpus.txt
+codeswitch_corpus*.json
+wikidata_tamil_sentences.txt
+teacher_cache*/
+codeswitch_ckpt*/
+eval_results*/
+eval_audio*/
+paper_figures*/
+*.npz

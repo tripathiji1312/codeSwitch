@@ -266,3 +266,110 @@ def test_teacher_cache_recollects_when_the_corpus_changes(tmp_path, monkeypatch)
     shards2, _ = _Collector().collect(["மாற்றம் செய்யப்பட்ட வாக்கியம்."])
     assert collected == []
     assert shards2[0].raw_text == shards[0].raw_text
+
+
+def test_teacher_shard_names_are_content_addressed():
+    """Same sentence -> same cache file; whitespace/case do not matter."""
+    import train_draft_distill as T
+
+    assert T.teacher_shard_name("நாளை வருகிறேன்.") == T.teacher_shard_name("  நாளை   வருகிறேன். ")
+    assert T.teacher_shard_name("a") != T.teacher_shard_name("b")
+    assert T.teacher_shard_name("x").startswith("shard_") and len(T.teacher_shard_name("x")) == 6 + 16 + 4
+
+
+def test_corpus_cap_keeps_the_register_mix_and_prefix():
+    """--max-sentences caps the size; a smaller cap is a prefix of a bigger one."""
+    import build_codeswitch_corpus as B
+
+    small, counts_small = B.build_corpus(n_templates=300, max_sentences=120, seed=7)
+    big, counts_big = B.build_corpus(n_templates=300, max_sentences=300, seed=7)
+    assert len(small) == 120 and len(big) == 300
+    assert all(0.25 <= c / len(small) <= 0.42 for c in counts_small.values())
+    # deterministic selection: raising the cap only adds sentences
+    assert set(small) <= set(big)
+
+
+def test_content_addressed_cache_only_collects_new_sentences(tmp_path):
+    """Growing/reordering the corpus must not re-collect cached sentences."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    import train_draft_distill as T
+
+    out_dir = tmp_path / "teacher"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    collected: list[str] = []
+
+    class _Collector(T.TeacherCollector):
+        def __init__(self):  # noqa: D107 - bypass the real engine
+            self.out_dir = out_dir
+            self.target_source = "lm"
+            self.verbose = False
+            self.stats: dict = {}
+            self._lm_capture_ok = True
+            self.max_frames = 10000
+            self.engine = SimpleNamespace(ar_model=SimpleNamespace(
+                config=SimpleNamespace(sampling_rate=44100),
+                audio_encoder=SimpleNamespace(
+                    config=SimpleNamespace(codebook_size=1024))))
+
+        def _prepare_prompt(self, text):
+            return text, text
+
+        def _generate_and_capture(self, prompt, index):
+            collected.append(prompt)
+            return np.zeros(1600, dtype=np.float32), np.ones((9, 24), dtype=np.int64)
+
+    first = ["வணக்கம் சார்.", "நாளை வருகிறேன்."]
+    _Collector().collect(first)
+    assert collected == first
+
+    # the same sentences in a different order + one new line: only the new line costs
+    collected.clear()
+    shards, _ = _Collector().collect(["நாளை வருகிறேன்.", "புதிய வாக்கியம்.", "வணக்கம் சார்."])
+    assert collected == ["புதிய வாக்கியம்."]
+    assert [s.index for s in shards] == [0, 1, 2]              # positions refreshed
+    assert [s.raw_text for s in shards] == ["நாளை வருகிறேன்.", "புதிய வாக்கியம்.", "வணக்கம் சார்."]
+
+
+def test_legacy_position_named_shards_are_adopted(tmp_path):
+    """A pre-content-addressing cache is renamed, not re-synthesised."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    import train_draft_distill as T
+
+    out_dir = tmp_path / "teacher"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentence = "பழைய தரவு சேமிப்பு."
+    legacy = T.TeacherShard(index=0, raw_text=sentence, norm_text=sentence, n_chars=len(sentence),
+                            frames=20, codes=np.zeros((9, 20), dtype=np.int32), audio_sec=0.5,
+                            target_source="lm", gen_ms=1.0)
+    T.TeacherShard.save(legacy, out_dir / "shard_00000.npz")
+    collected: list[str] = []
+
+    class _Collector(T.TeacherCollector):
+        def __init__(self):  # noqa: D107
+            self.out_dir = out_dir
+            self.target_source = "lm"
+            self.verbose = False
+            self.stats: dict = {}
+            self._lm_capture_ok = True
+            self.max_frames = 10000
+            self.engine = SimpleNamespace(ar_model=SimpleNamespace(
+                config=SimpleNamespace(sampling_rate=44100),
+                audio_encoder=SimpleNamespace(
+                    config=SimpleNamespace(codebook_size=1024))))
+
+        def _prepare_prompt(self, text):
+            return text, text
+
+        def _generate_and_capture(self, prompt, index):
+            collected.append(prompt)
+            return np.zeros(1600, dtype=np.float32), np.ones((9, 24), dtype=np.int64)
+
+    shards, _ = _Collector().collect([sentence])
+    assert collected == []                                     # adopted, not re-synthesised
+    assert shards[0].raw_text == sentence
+    assert (out_dir / T.teacher_shard_name(sentence)).is_file()
+    assert not (out_dir / "shard_00000.npz").exists()          # renamed in place

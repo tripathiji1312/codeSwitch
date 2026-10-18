@@ -5,8 +5,10 @@ between cells except the one-time dependency install.
 
 | Step | Command | Wall-clock (T4) | Artifacts |
 |------|---------|-----------------|-----------|
+| 0 | corpus cell (`build_codeswitch_corpus.py --max-sentences 2000`) | 1–3 min | `codeswitch_corpus.txt` (2 000 lines, 34/33/33) |
 | 1 | setup cell (below) | 4–8 min + 1 restart | — |
-| 2 | `python train_draft_distill.py` | 35–55 min | `teacher_cache/shard_*.npz`, `codeswitch_ckpt/{draft_cb0.pt,residual_cb1_8.pt,meta.json}` |
+| 2 | teacher pass `--skip-draft --skip-residual` | 2–5 h (2000 lines ≈ 4.5 h) | `teacher_cache/shard_<hash>.npz` |
+| 2b | `python train_draft_distill.py` (draft + residual) | ≈ 10 min | `codeswitch_ckpt/{draft_cb0.pt,residual_cb1_8.pt,meta.json}` |
 | 3 | `python run_full_evaluation.py --ckpt codeswitch_ckpt` | 25–40 min | `eval_results/{raw_results.jsonl,run_meta.json}`, `paper_figures/{fig1,fig2,fig3,fig4}.{png,pdf}`, `paper_figures/{tables.tex,summary.json}`, `eval_audio/{A,B,C}/*.wav` |
 | 3b | `python push_to_wandb.py` (optional) | 1–3 min | one W&B run: scalars + figures + tables + audio + `codeswitch-eval-*` artifact (the off-Kaggle copy of everything above) |
 
@@ -96,11 +98,19 @@ print("✓ Setup complete. Work from:", CLONE_DIR)
 
 ## 2a) Corpus cell — build a register-balanced distillation corpus
 
+**The fresh-run corpus (recommended): 2 000 lines, ~4.5 h of teacher time**
+
 ```python
 %cd /kaggle/working/codeSwitch
-# template generator + optional real Tamil text (Wikimedia streamed, cached) + your own files
-!python build_codeswitch_corpus.py --templates 2500 --wikipedia 0 \
+# template generator + real Tamil text (Wikimedia streamed + cached) + your own files
+!python build_codeswitch_corpus.py --templates 2500 --wikipedia 900 --max-sentences 2000 \
     --out codeswitch_corpus.txt --json-out codeswitch_corpus.stats.json
+```
+
+```
+Corpus written: codeswitch_corpus.txt | 2000 unique sentences | disjoint from eval set OK
+  words/sentence: mean 8.6 (min 3, max 27)
+  register mix (classified from the final text): native_tamil=680 (34%), romanized_tanglish=660 (33%), transit_codemixed=660 (33%)
 ```
 
 * The benchmark is 20 native Tamil / 20 romanised / 20 transit, so the training corpus is
@@ -112,11 +122,17 @@ print("✓ Setup complete. Work from:", CLONE_DIR)
 * Augmentation = English entity insertion (`order`, `OTP`, `UPI`, `Rs. 420`, plates …) and
   rule-based romanisation (`codeswitch_tts/frontend/tamil_latin.py`). Everything is deduped
   and asserted disjoint from the 60 eval utterances.
-* `--wikipedia N` adds real Tamil text from a Wikimedia dump (streamed, cached to
-  `wikidata_tamil_sentences.txt`); `--wikipedia-file path.txt` uses a local file offline;
-  `--extra-file my_sentences.txt my_sentences.json` mixes in your own text. Raise
-  `--templates` for a bigger corpus — the corpus size, not the epochs, is the current
-  quality bottleneck.
+* `--wikipedia N` adds real Tamil text from a Wikimedia dump (streamed once and cached to
+  `wikidata_tamil_sentences.txt`, so later builds are instant); `--wikipedia-file path.txt`
+  uses a local file offline; `--extra-file my_sentences.txt my_sentences.json` mixes in your
+  own text.
+* **`--max-sentences N` is the budget knob**: the corpus size, not the epochs, is the quality
+  bottleneck, but every sentence costs ≈ 7.9 s of teacher time on a T4. 2 000 lines ≈ 4.5 h,
+  3 900 lines (no cap, `--templates 2500 --wikipedia 900`) ≈ 8.5 h. The cap keeps the
+  34/33/33 mix and selection is deterministic and *prefix-stable*: raising the cap later only
+  adds sentences, and the content-addressed teacher cache means only those new sentences are
+  collected (see 2b).
+* Sizing rule of thumb: `--max-sentences ≈ session_budget_hours × 450`.
 
 ## 2b) Distillation cell — gives the draft/residual models real weights
 
@@ -126,18 +142,39 @@ print("✓ Setup complete. Work from:", CLONE_DIR)
     --draft-epochs 60 --residual-sched 0.5 --max-minutes 40 --ckpt-dir codeswitch_ckpt
 ```
 
-* **Budget reality**: the teacher pass is the bottleneck (≈ 6–9 s/sentence on a T4). A
-  2 500-sentence corpus needs ≈ 4–6 h of teacher time, so run it with a wall-clock cap that
-  fits your session (`--max-minutes 540`) and continue in the next session — the shards
-  resume exactly where they stopped. `--num-sentences 300` is the old quick default;
-  `--corpus-json` supersedes it when supplied.
+* **Budget reality**: the teacher pass is the bottleneck (≈ 7.9 s/sentence on a T4 measured
+  over 300 sentences), so a 2 000-line corpus needs ≈ 4.5 h. Run the teacher pass first and
+  on its own, then train — that keeps a session that dies at 90 % from losing the training
+  budget too:
+
+```python
+# pass 1: teacher only  (~4.5 h for 2000 lines; Ctrl-C / session death is safe)
+!python train_draft_distill.py --corpus-json codeswitch_corpus.txt \
+    --skip-draft --skip-residual --ckpt-dir codeswitch_ckpt
+# pass 2: draft + residual on the finished cache  (~15-25 min for 2000 lines)
+!python train_draft_distill.py --corpus-json codeswitch_corpus.txt \
+    --draft-epochs 60 --residual-sched 0.5 \
+    --max-minutes 30 --max-minutes-residual 20 --ckpt-dir codeswitch_ckpt
+```
+
+`--max-minutes` (draft) and `--max-minutes-residual` (residual) are independent wall-clock
+caps; both stages early-stop on their own validation split anyway. With 2 000 sentences an
+epoch is ~7x longer than with 300, so give the residual the 20 minutes — its budget was the
+binding constraint in the first full run.
+* **`--max-minutes` only budgets draft training** — the teacher pass runs to completion or
+  until you stop it. Ctrl-C is safe at any point; the collection line prints the cache state
+  up front (`cache: 812/2000 sentences already collected (1188 to go, ~2h36m)`).
+* **Save Version** (Kaggle: *Save & Run All*) after the teacher pass so `teacher_cache/`
+  survives the session; the checkpoint/cache directories are a few MB (codes are int16).
 * **Scheduled sampling** (`--residual-sched 0.5`): the residual decoder is trained on
   *teacher* CB0 but runs on *draft* CB0, so the exposure bias is real: with probability that
   ramps 0 → 0.5 across epochs, a training window's CB0 input is replaced by the draft's own
   CB0 for that text (the draft model is captured to `teacher_cache/draft_cb0_XXXX.npz`
   first). `--residual-sched 0.9` is the aggressive setting; 0 reproduces the old behaviour.
-* **Resume**: safe to re-run at any time. Teacher shards are cached per sentence in
-  `teacher_cache/shard_XXXX.npz`, so a second run only collects what is missing.
+* **Resume**: safe to re-run at any time. Teacher shards are cached **by sentence content**
+  (`teacher_cache/shard_<sha1(text)>.npz`), so growing, reordering or re-sourcing the corpus
+  only collects the sentences that are actually new; position-named shards from older caches
+  are re-indexed by their text and adopted (`adopted N position-named shards`).
   `--skip-teacher` reuses the cache entirely; `--skip-draft` / `--skip-residual` skip a stage.
   The teacher loop prints an ETA every 10 sentences — Ctrl-C stops cleanly and a re-run
   resumes from the last cached sentence.
@@ -176,9 +213,12 @@ back on every utterance when the draft's mean top-1 is ≈0.1, which produces an
 `--gate-mode synth --gate-thresholds 0,0.3,0.34,0.36` if you want the gated mixture synthesised
 end to end (the run prints a derived-vs-synthesised validation line whenever both exist).
 
-* **Resume**: results are written atomically to `eval_results/raw_results.jsonl` after every
-  utterance. Re-running the same command skips completed (config, utterance) pairs; broken
-  rows are retried automatically. `--force` re-runs everything; `--replay` rebuilds
+* **Resume + provenance**: results are written atomically to `eval_results/raw_results.jsonl`
+  after every utterance. Re-running the same command skips completed (config, utterance)
+  pairs; broken rows are retried automatically. `eval_results/provenance.json` stores a hash of
+  the checkpoints those rows came from, and a run with *different* weights refuses to resume
+  (exit 3) instead of mixing two models' audio in one file — `--force` accepts the change and
+  re-synthesises. `--force` re-runs everything; `--replay` rebuilds
   aggregates/figures/tables from the JSONL without synthesising anything (use it after a code
   update to refresh tables/figures at zero GPU cost — MCD is recomputed from the saved wavs).
 * **Smoke test**: `!python run_full_evaluation.py --configs B --limit 3 --skip-asr --allow-untrained`
@@ -366,7 +406,8 @@ Kaggle unless you want to archive them too.)
 | `[Gate] ⚠ every requested threshold makes the same decision` | thresholds are outside the draft's confidence range (e.g. `0.6` when the draft's mean top-1 is `0.1`). Re-run with `--gate-thresholds auto` (default), which uses quantiles of the measured confidence. |
 | MCD column shows `--` | no saved wavs (`--no-save-audio`) or `soundfile`/`torchaudio` missing. Re-run (or `--replay`) with the wavs in place. |
 | `KeyError: 'residual_sched'`/old CLI flags | pull the latest repo — the corpus builder, scheduled sampling, the derived gate sweep and the new metrics are all post-2026-10. |
-| Session dies mid-run | re-run the same command(s): teacher shards and evaluated rows are resumed. |
+| `[Ckpt] ❌ these results were produced with different checkpoints` (exit 3) | you retrained and pointed the evaluation at the same `--results` file. Pass `--force` to re-synthesise, or use a different `--results` path to keep both runs. |
+| Session dies mid-run | re-run the same command(s): teacher shards (content-addressed) and evaluated rows are resumed. |
 | `[W&B] ⚠ push failed: ...` (e.g. `CommError`, `UsageError: api_key not configured`) | the notebook's *Internet* switch is off, or the key is missing. Add the Kaggle secret `WANDB_API_KEY` (or pass `--api-key`), or `pip install -q wandb` first if the import failed. The evaluation artifacts are unaffected — push afterwards with `!python push_to_wandb.py`. |
 | W&B run shows `undefined` scalars or an empty panel | the metric is legitimately absent (e.g. MCD without saved wavs, UTMOS when both loaders failed, acceptance for A/B). `--dry-run` lists exactly which scalars exist. |
 | A corpus change made the teacher pass recompute everything | expected: cached shards are validated against the sentence text (a positional cache must not train on another corpus's codes), and only changed positions are recollected — the summary line reports `N recollected after a corpus change`. |
@@ -375,12 +416,12 @@ Kaggle unless you want to archive them too.)
 
 * Test set + template corpus: `codeswitch_benchmark_data.py` (20 native Tamil / 20 romanised
   Tanglish / 20 transit code-mixed utterances; `build_training_corpus(n, seed)`).
-* Corpus assembly (real text, mixing, romanisation, register balancing):
-  `build_codeswitch_corpus.py`; the shared Tamil→Latin transliterator is
+* Corpus assembly (real text, mixing, romanisation, register balancing, size cap
+  `--max-sentences`): `build_codeswitch_corpus.py`; the shared Tamil→Latin transliterator is
   `codeswitch_tts/frontend/tamil_latin.py`.
 * Synthesis/timing/acceptance/zone/gate/switch-distance logic + metrics + figures + tables:
   `run_full_evaluation.py`.
 * Teacher collection + distillation + scheduled sampling + checkpoints: `train_draft_distill.py`.
 * W&B upload (scalars, panels, tables, media, artifact): `push_to_wandb.py`; `--wandb` on
   `run_full_evaluation.py` calls it at the end, and the notebook has a dedicated cell (§3b).
-* Local test suite: `python -m pytest tests/ -q` (92 tests, no GPU and no network needed).
+* Local test suite: `python -m pytest tests/ -q` (98 tests, no GPU and no network needed).

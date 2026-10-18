@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import base64
 import gc
+import hashlib
 import json
 import math
 import os
@@ -172,6 +173,65 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def checkpoint_fingerprint(ckpt_dir: Any) -> Dict[str, Any]:
+    """Content hash of the checkpoints a run's rows were produced with.
+
+    Resume is keyed by ``(config, utterance, gate)``, so re-running with *different*
+    weights would silently mix two models' audio in one results file.  The
+    fingerprint is stored next to the JSONL and checked before resuming.
+    """
+    out: Dict[str, Any] = {}
+    for name in ("draft_cb0.pt", "residual_cb1_8.pt", "meta.json"):
+        path = Path(ckpt_dir) / name
+        if not path.is_file():
+            continue
+        digest = hashlib.sha1()
+        with path.open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(block)
+        out[name] = {"sha1": digest.hexdigest()[:16], "size": path.stat().st_size}
+    return out
+
+
+def check_provenance(results_path: Path, ckpt_dir: Any, force: bool = False,
+                     replay: bool = False, verbose: bool = True) -> Dict[str, Any]:
+    """Compares the current checkpoints with the ones that produced the rows.
+
+    Returns ``{"fingerprint", "previous", "blocked", "reason", "note"}``;
+    ``blocked`` means the caller should refuse to resume (unless ``--force``).
+    """
+    path = Path(results_path).parent / "provenance.json"
+    fingerprint = checkpoint_fingerprint(ckpt_dir)
+    previous: Optional[Dict[str, Any]] = None
+    try:
+        if path.is_file():
+            previous = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        previous = None
+    out: Dict[str, Any] = {"path": str(path), "fingerprint": fingerprint,
+                           "previous": previous, "blocked": False, "reason": None, "note": None}
+    if replay or force:
+        return out
+    if previous is None:
+        if Path(results_path).is_file() and Path(results_path).stat().st_size > 0:
+            out["note"] = ("existing results without provenance (they predate this check): "
+                           "assuming they came from these checkpoints - pass --force to be sure")
+        return out
+    old = previous.get("checkpoints") or {}
+    if old and old != fingerprint:
+        changed = sorted({*old, *fingerprint} )
+        detail = ", ".join(
+            f"{name}: {old.get(name, {}).get('sha1', 'absent')} -> "
+            f"{fingerprint.get(name, {}).get('sha1', 'absent')}"
+            for name in changed if old.get(name, {}).get("sha1") != fingerprint.get(name, {}).get("sha1")
+        )
+        out["blocked"] = True
+        out["reason"] = (f"these results were produced with different checkpoints ({detail}). "
+                         "Resuming would mix two models' audio in one file: pass --force to "
+                         "re-synthesise, or write to a different --results path")
+    return out
 
 
 def package_versions() -> Dict[str, str]:
@@ -3012,7 +3072,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Comma-separated subset of A,B,C.")
     p.add_argument("--limit", type=int, default=None,
                    help="Evaluate only the first N utterances (smoke tests).")
-    p.add_argument("--force", action="store_true", help="Re-run utterances already present in the JSONL.")
+    p.add_argument("--force", action="store_true",
+                   help="Re-run utterances already present in the JSONL (also accepts results "
+                        "produced with different checkpoints - see provenance.json).")
     p.add_argument("--replay", action="store_true",
                    help="Skip synthesis; rebuild aggregates/figures/tables from the JSONL.")
     p.add_argument("--skip-asr", action="store_true")
@@ -3133,6 +3195,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     figures_dir = Path(args.figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
+    provenance = check_provenance(results_path, args.ckpt, force=args.force, replay=args.replay)
+    print(f"[Ckpt] provenance: {len(provenance['fingerprint'])} files hashed from {args.ckpt}"
+          f"{' (replay: not checked)' if args.replay else ''}")
+    if provenance.get("note"):
+        print(f"[Ckpt] note: {provenance['note']}")
+    if provenance["blocked"]:
+        print("[Ckpt] ❌ " + provenance["reason"])
+        return 3
+    if not args.replay:
+        Path(provenance["path"]).write_text(
+            json.dumps({"checkpoints": provenance["fingerprint"],
+                        "written": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "ckpt_dir": str(args.ckpt)},
+                       indent=2, default=str),
+            encoding="utf-8",
+        )
+
     t_all = _now()
     print("=" * 78)
     print("CodeSwitch-TTS · Full Evaluation Suite")
@@ -3220,6 +3299,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "utmos_model": (getattr(utmos, "source", None) or getattr(utmos, "model_id", None)
                         if utmos is not None else None),
         "length_model": (length_model.to_dict() if length_model else None),
+        "checkpoint_fingerprint": provenance["fingerprint"],
+        "checkpoint_provenance_note": provenance.get("note"),
     }
     results_path.parent.mkdir(parents=True, exist_ok=True)
     (results_path.parent / "run_meta.json").write_text(
@@ -3495,6 +3576,7 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
         "gate_validation": gate_validation,
         "gate_note": gate_note,
         "switch_distance": switch_rows,
+        "checkpoint_fingerprint": checkpoint_fingerprint(args.ckpt),
         "figures": fig_paths,
         "tables_tex": str(figures_dir / "tables.tex"),
     }

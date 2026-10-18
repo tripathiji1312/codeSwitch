@@ -43,15 +43,17 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import gc
+import hashlib
 import json
 import math
 import os
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_FLAX", "0")
@@ -175,10 +177,26 @@ class LengthModel:
 # Teacher data collection
 # ===========================================================================
 
+def _norm_text(text: Any) -> str:
+    """Whitespace/case-insensitive sentence identity (teacher-cache key)."""
+    return " ".join(str(text or "").split()).casefold()
+
+
 def _same_sentence(a: str, b: str) -> bool:
     """Whitespace/case-insensitive sentence identity for teacher-cache validation."""
-    norm = lambda t: " ".join(str(t or "").split()).casefold()  # noqa: E731
-    return norm(a) == norm(b)
+    return _norm_text(a) == _norm_text(b)
+
+
+def teacher_shard_name(text: str) -> str:
+    """Content-addressed cache filename: ``shard_<sha1(normalized text)[:16]>.npz``.
+
+    Addressing shards by *content* rather than position means a corpus change only
+    costs the sentences that are actually new (growing the corpus, reordering it or
+    swapping sources all keep the untouched sentences' caches), which is what makes
+    a multi-session teacher pass cheap.
+    """
+    digest = hashlib.sha1(_norm_text(text).encode("utf-8")).hexdigest()[:16]
+    return f"shard_{digest}.npz"
 
 
 @dataclass
@@ -504,22 +522,63 @@ class TeacherCollector:
                 print(f"[Teacher] DAC re-encode failed: {type(exc).__name__}: {exc}")
             return None
 
+    def _shard_path(self, text: str) -> Path:
+        return self.out_dir / teacher_shard_name(text)
+
+    def _adopt_legacy_shards(self) -> Dict[str, Path]:
+        """Maps normalized text -> path for position-named shards (older caches).
+
+        Before content addressing, shards were ``shard_00000.npz`` and a corpus
+        change silently invalidated them.  Those files are still perfectly good
+        *content*, so they are re-indexed by their sentence text and renamed on
+        first use - a previous session's teacher pass is not wasted.
+        """
+        legacy: Dict[str, Path] = {}
+        for path in sorted(self.out_dir.glob("shard_*.npz")):
+            if re.fullmatch(r"shard_[0-9a-f]{16}", path.stem):
+                continue
+            try:
+                cached = TeacherShard.load(path)
+            except Exception:
+                continue
+            legacy.setdefault(_norm_text(cached.raw_text), path)
+            if len(legacy) >= 5000:
+                break
+        if legacy and self.verbose:
+            print(f"[Teacher] found {len(legacy)} position-named shards from an older cache; "
+                  "adopting the ones that match the current corpus.")
+        return legacy
+
     # -- main loop -----------------------------------------------------------
     def collect(self, corpus: Sequence[str]) -> Tuple[List[TeacherShard], LengthModel]:
         codebook_size = int(self.engine.ar_model.audio_encoder.config.codebook_size)
         total = len(corpus)
         shards: List[TeacherShard] = []
         t_start = _now()
+        legacy = self._adopt_legacy_shards()
+        self.stats["reused"] = sum(1 for text in corpus if self._shard_path(text).exists())
+        if self.verbose:
+            print(f"[Teacher] cache: {self.stats['reused']}/{total} sentences already collected "
+                  f"({total - self.stats['reused']} to go, ~"
+                  f"{_fmt_time(7.9 * (total - self.stats['reused']))} at 7.9 s/sentence)")
         for i, text in enumerate(corpus):
-            shard_path = self.out_dir / f"shard_{i:05d}.npz"
+            shard_path = self._shard_path(text)
+            if not shard_path.exists() and legacy:
+                donor = legacy.pop(_norm_text(text), None)
+                if donor is not None:
+                    try:
+                        donor.replace(shard_path)          # adopt: rename in place
+                        self.stats["adopted"] = self.stats.get("adopted", 0) + 1
+                    except Exception:
+                        pass
             if shard_path.exists():
                 cached = TeacherShard.load(shard_path)
                 if _same_sentence(cached.raw_text, text):
+                    cached.index = i            # position in *this* corpus
                     shards.append(cached)
                     continue
-                # The cache is indexed by position, so a changed corpus would
-                # otherwise train the student on the *previous* sentence's
-                # teacher codes.  Recollect the mismatching positions.
+                # A hash collision (or a hand-edited cache) would otherwise train
+                # the student on another sentence's codes; recollect it.
                 if self.stats.get("stale", 0) == 0:
                     print(f"[Teacher] ⚠ cached shard text differs from the current corpus "
                           f"({shard_path.name}: cached={cached.raw_text[:48]!r} vs "
@@ -595,8 +654,10 @@ class TeacherCollector:
         if self.verbose:
             print(
                 f"[Teacher] collected {len(shards)} shards"
-                + (f" ({self.stats['stale']} recollected after a corpus change)"
-                   if self.stats.get("stale") else "") + " | "
+                + (f" ({self.stats['stale']} recollected: cache text mismatch)"
+                   if self.stats.get("stale") else "")
+                + (f" (adopted {self.stats['adopted']} position-named shards)"
+                   if self.stats.get("adopted") else "") + " | "
                 f"frames: min={min(s.frames for s in shards)} "
                 f"med={int(np.median([s.frames for s in shards]))} "
                 f"max={max(s.frames for s in shards)} | "

@@ -8,7 +8,7 @@ the student sees.  A template-only corpus teaches the draft a handful of
 sentence shapes, which shows up as low CB0 acceptance and unintelligible hybrid
 audio at evaluation time.  This script assembles a wider corpus:
 
-  * ``--templates N``    - the deterministic conversational generator
+  * ``--max-sentences N``- cap the size (teacher time is the budget)
                            (``codeswitch_benchmark_data.build_training_corpus``),
                            which covers the assistant/transit registers the
                            benchmark measures;
@@ -331,7 +331,7 @@ def build_corpus(
     n_templates: int = 2000, n_wikipedia: int = 0, extra_files: Sequence[str] = (),
     code_mix_rate: float = 0.35, romanize_rate: float = 0.30, numeric_rate: float = 0.12,
     seed: int = 7, wiki_cache: str = "wikidata_tamil_sentences.txt", passes: int = 3,
-    balance: Sequence[float] = (0.34, 0.33, 0.33),
+    balance: Sequence[float] = (0.34, 0.33, 0.33), max_sentences: int = 0,
 ) -> Tuple[List[str], Dict[str, int]]:
     """Assembles a register-balanced corpus and returns ``(sentences, counts)``.
 
@@ -339,6 +339,13 @@ def build_corpus(
     the resulting lines are bucketed by their *classified* register and then
     subsampled to the requested quota, so the student sees roughly the same
     register mix the benchmark measures (the benchmark itself is 20/20/20).
+
+    ``max_sentences`` caps the output while keeping that mix - the corpus size is
+    what the teacher pass pays for (~7.9 s/sentence on a T4), so this is the knob
+    that makes a corpus fit one Kaggle session.  Selection is deterministic for a
+    given seed, and a smaller cap is a prefix of a larger one, so raising the cap
+    later only adds sentences (the teacher cache is content-addressed, so only the
+    new lines are collected).
     """
     rng = random.Random(seed)
     sources: List[Tuple[str, List[str]]] = []
@@ -378,12 +385,30 @@ def build_corpus(
         (int(available[r] / w) for r, w in zip(REGISTERS, weights) if w > 0 and available[r]),
         default=0,
     )
+    if max_sentences and max_sentences > 0:
+        capped = min(target_total, int(max_sentences))
+        if capped < target_total:
+            print(f"[Corpus] capping {target_total} -> {capped} sentences (--max-sentences)")
+        target_total = capped
+    # per-register quota: floor first, then hand the flooring remainder out to the
+    # registers with head-room so the corpus hits the requested size exactly
+    quotas = {r: (min(int(target_total * w), available[r]) if target_total else available[r])
+              for r, w in zip(REGISTERS, weights)}
+    if target_total:
+        remainder = target_total - sum(quotas.values())
+        for r in REGISTERS:
+            if remainder <= 0:
+                break
+            room = available[r] - quotas[r]
+            add = min(max(room, 0), remainder)
+            quotas[r] += add
+            remainder -= add
+
     corpus: List[str] = []
     counts: Dict[str, int] = {}
     for r, w in zip(REGISTERS, weights):
         pool = by_register.get(r, [])
-        quota = int(target_total * w) if target_total else len(pool)
-        quota = min(quota, len(pool))
+        quota = quotas[r]
         if w > 0 and available[r] < 10:
             print(f"[Corpus] ⚠ register '{r}' has only {available[r]} lines; "
                   "raise --templates/--wikipedia or lower --romanize-rate/--code-mix-rate.")
@@ -419,6 +444,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "per register before quota balancing).")
     p.add_argument("--balance", type=str, default="0.34,0.33,0.33",
                    help="Target register quota as native,romanized,transit weights.")
+    p.add_argument("--max-sentences", type=int, default=0,
+                   help="Cap the corpus size while keeping the register mix (0 = no cap). "
+                        "The teacher pass costs ~7.9 s/sentence on a T4, so this is how the "
+                        "corpus is made to fit one Kaggle session (e.g. 2000 -> ~4.5 h).")
     p.add_argument("--json-out", type=str, default=None,
                    help="Optional JSON copy ({text, register} objects).")
     return p
@@ -438,6 +467,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         wiki_cache=args.wikipedia_file,
         passes=args.passes,
         balance=balance,
+        max_sentences=args.max_sentences,
     )
     if not corpus:
         print("[Corpus] ❌ no sentences assembled")
