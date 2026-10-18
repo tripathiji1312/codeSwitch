@@ -1389,17 +1389,40 @@ def attach_mcd_from_audio(rows: List[Dict[str, Any]], verbose: bool = True) -> i
 # ===========================================================================
 # Aggregation
 # ===========================================================================
-def _stats(values: Sequence[Optional[float]]) -> Dict[str, Optional[float]]:
+def _stats(values: Sequence[Optional[float]], ci: bool = False,
+           n_boot: int = 2000, seed: int = 20261018) -> Dict[str, Optional[float]]:
+    """Summary statistics, optionally with a bootstrap CI for the median.
+
+    Reviewers of a 60-utterance benchmark ask how much of a gap is noise, so the
+    headline medians carry a percentile-bootstrap interval (fixed seed, no scipy).
+    """
     v = [float(x) for x in values if x is not None and np.isfinite(x)]
     if not v:
-        return {"n": 0, "mean": None, "std": None, "p50": None, "p90": None}
-    return {
+        out: Dict[str, Optional[float]] = {
+            "n": 0, "mean": None, "std": None, "p50": None, "p90": None,
+        }
+        if ci:
+            out.update({"ci_lo": None, "ci_hi": None})
+        return out
+    out = {
         "n": len(v),
         "mean": float(np.mean(v)),
         "std": float(np.std(v, ddof=0)),
         "p50": float(np.percentile(v, 50)),
         "p90": float(np.percentile(v, 90)),
     }
+    if ci:
+        arr = np.asarray(v, dtype=np.float64)
+        if arr.size >= 5:
+            rng = np.random.RandomState(seed)
+            idx = rng.randint(0, arr.size, size=(int(n_boot), arr.size))
+            boots = np.median(arr[idx], axis=1)
+            out["ci_lo"] = float(np.percentile(boots, 2.5))
+            out["ci_hi"] = float(np.percentile(boots, 97.5))
+        else:
+            out["ci_lo"] = None
+            out["ci_hi"] = None
+    return out
 
 
 def _finite_values(subset: Sequence[Dict[str, Any]], key: str) -> List[float]:
@@ -1541,8 +1564,8 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
             "ttfa_e2e": _stats([r.get("ttfa_e2e_ms") for r in ok]),
             "ttfa_compute_cold": first.get("ttfa_compute_ms"),
             "ttfa_e2e_cold": first.get("ttfa_e2e_ms"),
-            "ttfa_compute_warm": _stats([r.get("ttfa_compute_ms") for r in warm]),
-            "ttfa_e2e_warm": _stats([r.get("ttfa_e2e_ms") for r in warm]),
+            "ttfa_compute_warm": _stats([r.get("ttfa_compute_ms") for r in warm], ci=True),
+            "ttfa_e2e_warm": _stats([r.get("ttfa_e2e_ms") for r in warm], ci=True),
             "total": _stats([r.get("total_ms") for r in ok]),
             "rtf": _stats([r.get("rtf") for r in ok]),
             "audio_sec": _stats([r.get("audio_sec") for r in ok]),
@@ -1550,11 +1573,11 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
             "accept_synth": _stats([r.get("accept_synth") for r in ok]),
             "logq_draft": _stats([r.get("logq_draft") for r in ok]),
             "logq_kept": _stats([r.get("logq_kept") for r in ok]),
-            "cer": _stats([r.get("cer") for r in ok]),
+            "cer": _stats([r.get("cer") for r in ok], ci=True),
             "wer": _stats([r.get("wer") for r in ok]),
-            "cer_latin": _stats([r.get("cer_latin") for r in ok]),
-            "utmos": _stats([r.get("utmos") for r in ok]),
-            "mcd_vs_a": _stats([r.get("mcd_vs_a") for r in ok]),
+            "cer_latin": _stats([r.get("cer_latin") for r in ok], ci=True),
+            "utmos": _stats([r.get("utmos") for r in ok], ci=True),
+            "mcd_vs_a": _stats([r.get("mcd_vs_a") for r in ok], ci=True),
             "asr_fail": sum(1 for r in ok if (r.get("cer") or 0.0) > ASR_FAIL_CER),
             "asr_fail_utts": sorted(
                 str(r.get("utt_id")) for r in ok if (r.get("cer") or 0.0) > ASR_FAIL_CER
@@ -2247,6 +2270,17 @@ def figure4_scaling_and_registers(rows: List[Dict[str, Any]], agg: Dict[str, Dic
 # ===========================================================================
 # LaTeX tables
 # ===========================================================================
+def _tex_ci(entry: Optional[Dict[str, Any]], digits: int = 1,
+            scale: float = 1.0) -> str:
+    """``median [lo, hi]`` from a _stats dict when the bootstrap CI exists."""
+    entry = entry or {}
+    p50, lo, hi = entry.get("p50"), entry.get("ci_lo"), entry.get("ci_hi")
+    if p50 is None or lo is None or hi is None:
+        return ""
+    f = lambda v: f"{float(v) * scale:.{digits}f}"  # noqa: E731
+    return f"{f(p50)} [{f(lo)}, {f(hi)}]"
+
+
 def _tex(value: Optional[float], digits: int = 1, suffix: str = "") -> str:
     if value is None:
         return "--"
@@ -2288,6 +2322,7 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         "\\caption{Comparative evaluation of Pure AR, Pure NAR and the proposed CodeSwitch-TTS "
         "hybrid on the 60-utterance Tanglish benchmark (Kaggle T4, fp16). "
         "TTFA-c: component compute latency; TTFA-e2e: wall-clock to first audio buffer; "
+        "median columns carry a 95\\% percentile-bootstrap interval (2{,}000 resamples, fixed seed); "
         "CER medians (ASR-limited); CER$_{\\mathrm{lat}}$ is script-robust; UTMOS and MCD are "
         "perceptual/spectral proxies (no listeners, see text).}",
         "\\label{tab:comparison}",
@@ -2319,13 +2354,13 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         cells = [
             CONFIG_LABELS[cfg],
             _tex(a.get("ttfa_compute_cold"), 0),
-            _tex(_stat("ttfa_compute", "p50"), 0),
+            _tex_ci(a.get("ttfa_compute_warm"), 0) or _tex(_stat("ttfa_compute", "p50"), 0),
             _tex(_stat("ttfa_compute", "p90"), 0),
             _tex(_stat("ttfa_e2e", "p50"), 0),
             _tex(None if total is None else total / 1000.0, 2),
             _tex((a.get("rtf") or {}).get("mean"), 2),
-            _tex(cer_p50, 1),
-            _tex(cer_lat_p50, 1),
+            _tex_ci(cer_stat, 1, scale=100.0) or _tex(cer_p50, 1),
+            _tex_ci(cer_lat, 1, scale=100.0) or _tex(cer_lat_p50, 1),
             _tex(utmos_stat.get("mean"), 2),
             _tex(mcd_stat.get("mean"), 2),
             _pm(a.get("accept_true") or {}),

@@ -186,6 +186,29 @@ def test_clean_for_cer_identical_texts_agree():
     assert a == b
 
 
+def test_stats_bootstrap_ci_brackets_median():
+    vals = [10.0, 11.0, 12.0, 13.0, 30.0, 9.0, 10.5, 11.5]
+    stat = R._stats(vals, ci=True)
+    assert stat["p50"] is not None
+    assert stat["ci_lo"] <= stat["p50"] <= stat["ci_hi"]
+    # deterministic for a fixed seed
+    again = R._stats(vals, ci=True)
+    assert (stat["ci_lo"], stat["ci_hi"]) == (again["ci_lo"], again["ci_hi"])
+    # tiny samples do not pretend to have an interval
+    tiny = R._stats([1.0, 2.0], ci=True)
+    assert tiny["ci_lo"] is None and tiny["ci_hi"] is None
+    # no CI requested -> no CI keys
+    assert "ci_lo" not in R._stats(vals)
+
+
+def test_tex_ci_formats_scaled_brackets():
+    entry = R._stats([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], ci=True)
+    cell = R._tex_ci(entry, 1, scale=100.0)
+    assert cell.startswith("35.0 [") and cell.endswith("]")
+    assert R._tex_ci({}, 1) == ""
+    assert R._tex_ci({"p50": 1.0}, 1) == ""
+
+
 def test_asr_score_zero_for_identical():
     cer, wer = R.ASREvaluator.score("OTP 8421 sollunga", "OTP 8421 sollunga.")
     assert cer == pytest.approx(0.0)
