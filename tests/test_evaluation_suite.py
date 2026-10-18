@@ -383,9 +383,11 @@ def test_tables_and_figures_from_fabricated_rows(tmp_path: Path):
     fig1 = R.figure1_latency_quality(agg, tmp_path)
     fig2 = R.figure2_zone_acceptance(agg, tmp_path)
     fig3 = R.figure3_stream_timeline(rows, tmp_path)
+    fig4 = R.figure4_scaling_and_registers(rows, agg, tmp_path)
     for result, stem in ((fig1, "fig1_latency_quality_tradeoff"),
                          (fig2, "fig2_boundary_acceptance_breakdown"),
-                         (fig3, "fig3_streaming_chunk_timeline")):
+                         (fig3, "fig3_streaming_chunk_timeline"),
+                         (fig4, "fig4_scaling_and_registers")):
         assert result, f"{stem} was not produced"
         for path in result:
             assert Path(path).exists()

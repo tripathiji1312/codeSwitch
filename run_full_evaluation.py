@@ -1024,6 +1024,22 @@ def _stats(values: Sequence[Optional[float]]) -> Dict[str, Optional[float]]:
     }
 
 
+def _finite_values(subset: Sequence[Dict[str, Any]], key: str) -> List[float]:
+    """Raw values of ``key`` for a subset of result rows (finite floats only)."""
+    out: List[float] = []
+    for r in subset:
+        v = r.get(key)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(fv):
+            out.append(fv)
+    return out
+
+
 def aggregate_zones(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[int, Dict[str, Any]] = {}
     for zone in ZONE_ORDER:
@@ -1100,7 +1116,22 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dic
                 "accept_true": _stats([r.get("accept_true") for r in sub]),
                 "accept_synth": _stats([r.get("accept_synth") for r in sub]),
                 "asr_fail": sum(1 for r in sub if (r.get("cer") or 0.0) > ASR_FAIL_CER),
+                "values": {
+                    "cer": _finite_values(sub, "cer"),
+                    "ttfa_compute": _finite_values(sub, "ttfa_compute_ms"),
+                },
             }
+
+        def _raw(key: str, subset: Optional[List[Dict[str, Any]]] = None) -> List[float]:
+            return _finite_values(ok if subset is None else subset, key)
+
+        values = {
+            "ttfa_compute_warm": _raw("ttfa_compute_ms", warm),
+            "ttfa_compute": _raw("ttfa_compute_ms"),
+            "ttfa_e2e": _raw("ttfa_e2e_ms"),
+            "rtf": _raw("rtf"),
+            "cer": _raw("cer"),
+        }
         agg[cfg] = {
             "n": len(ok),
             "errors": len(err),
@@ -1125,6 +1156,7 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str]) -> Dic
             ),
             "verify_modes": sorted({str(r.get("verify_mode")) for r in ok}),
             "registers": registers,
+            "values": values,
             "zones": aggregate_zones(ok),
         }
     return agg
@@ -1169,21 +1201,31 @@ def _ieee_style():
         "font.family": "serif",
         "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"],
         "mathtext.fontset": "stix",
-        "font.size": 10,
-        "axes.labelsize": 10,
-        "axes.titlesize": 10,
-        "legend.fontsize": 8.5,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
+        "font.size": 9.5,
+        "axes.labelsize": 9,
+        "axes.titlesize": 9.5,
+        "legend.fontsize": 7.5,
+        "xtick.labelsize": 8.5,
+        "ytick.labelsize": 8.5,
         "axes.grid": True,
-        "grid.alpha": 0.35,
+        "grid.alpha": 0.28,
         "grid.linewidth": 0.4,
+        "grid.color": "#cccccc",
+        "axes.axisbelow": True,
         "axes.spines.top": False,
         "axes.spines.right": False,
+        "axes.linewidth": 0.7,
+        "xtick.major.width": 0.7,
+        "ytick.major.width": 0.7,
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "legend.frameon": False,
+        "lines.linewidth": 1.0,
+        "patch.linewidth": 0.4,
         "figure.dpi": 120,
         "savefig.dpi": 300,
         "savefig.bbox": "tight",
-        "savefig.pad_inches": 0.02,
+        "savefig.pad_inches": 0.03,
     })
     return plt
 
@@ -1196,8 +1238,47 @@ def _save_fig(fig, out_dir: Path, stem: str) -> List[str]:
     return [str(png), str(pdf)]
 
 
+
+
+
+
+
+
+def _values_for(cfg_agg: Dict[str, Any], key: str) -> List[float]:
+    """Raw per-utterance values recorded by the aggregator (empty for pre-update JSONLs)."""
+    raw = (cfg_agg.get("values") or {}).get(key) or []
+    return [float(v) for v in raw if v is not None and np.isfinite(float(v))]
+
+def _stat_p50(cfg_agg: Dict[str, Any], key: str) -> Optional[float]:
+    entry = cfg_agg.get(key) or {}
+    v = entry.get("p50")
+    return None if v is None else float(v)
+
+def _draw_box(ax, pos: float, vals: Sequence[float], color: str, width: float = 0.44) -> None:
+    """IQR box + median for one group (points are drawn separately)."""
+    if not vals:
+        return
+    bp = ax.boxplot(
+        [list(vals)], positions=[pos], widths=width, showfliers=False, patch_artist=True,
+        manage_ticks=False,
+        medianprops=dict(color="black", linewidth=1.1, zorder=6),
+        whiskerprops=dict(linewidth=0.7, color="#4d4d4d", zorder=2),
+        capprops=dict(linewidth=0.7, color="#4d4d4d", zorder=2),
+        boxprops=dict(linewidth=0.7, edgecolor="#333333", zorder=3),
+    )
+    for patch in bp["boxes"]:
+        patch.set_facecolor(color)
+        patch.set_alpha(0.28)
+
+def _draw_points(ax, pos: float, vals: Sequence[float], color: str, rng,
+                 size: float = 6.0, spread: float = 0.12, alpha: float = 0.85) -> None:
+    if not vals:
+        return
+    xs = pos + rng.uniform(-spread, spread, len(vals))
+    ax.scatter(xs, list(vals), s=size, color=color, alpha=alpha, linewidths=0, zorder=5)
+
 def figure1_latency_quality(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Optional[List[str]]:
-    """Fig. 1: latency vs. quality tradeoff (TTFA + CER)."""
+    """Fig. 1: TTFA / throughput / intelligibility distributions per configuration."""
     try:
         plt = _ieee_style()
     except Exception as exc:
@@ -1206,152 +1287,204 @@ def figure1_latency_quality(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Op
     configs = [c for c in ("A", "B", "C") if agg.get(c, {}).get("n")]
     if not configs:
         return None
-    fig, axes = plt.subplots(1, 2, figsize=(7.0, 2.7))
-    x = np.arange(len(configs))
-    width = 0.36
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
 
-    def _warm_p50(cfg, key):
-        warm = agg[cfg].get(key + "_warm") or {}
-        if warm.get("n"):
-            return warm.get("p50")
-        return agg[cfg].get(key, {}).get("p50")
-
-    compute = [_warm_p50(c, "ttfa_compute") for c in configs]
-    e2e = [_warm_p50(c, "ttfa_e2e") for c in configs]
-    cold_c = [agg[c].get("ttfa_compute_cold") for c in configs]
-    cold_e = [agg[c].get("ttfa_e2e_cold") for c in configs]
-    xs = x
-    bars1 = axes[0].bar(xs - width / 2, [np.nan if v is None else v for v in compute], width,
-                        label="Component compute (warm p50)", color="#9467bd", alpha=0.9)
-    bars2 = axes[0].bar(xs + width / 2, [np.nan if v is None else v for v in e2e], width,
-                        label="End-to-end streamer (warm p50)", color="#1f77b4", alpha=0.9)
-    has_cold = False
-    for xv, val in list(zip(xs - width / 2, cold_c)) + list(zip(xs + width / 2, cold_e)):
-        if val is None:
-            continue
-        axes[0].scatter([xv], [val], marker="x", s=22, color="black", zorder=5)
-        has_cold = True
-    if has_cold:
-        axes[0].scatter([], [], marker="x", s=22, color="black", label="cold (first utterance)")
-    axes[0].set_xticks(xs)
-    axes[0].set_xticklabels([CONFIG_LABELS[c].split(" (")[0].replace("Pure ", "") for c in configs])
-    axes[0].set_ylabel("TTFA (ms)")
-    axes[0].set_title("(a) Time-to-first-audio")
-    valid = [v for v in compute + e2e + cold_c + cold_e if v is not None and v > 0]
-    if valid:
-        if max(valid) / max(min(valid), 1.0) > 15:
-            axes[0].set_yscale("log")
-            axes[0].set_ylim(min(valid) * 0.5, max(valid) * 2.2)
-        else:
-            axes[0].set_ylim(0, max(valid) * 1.35)
-        for rect, val in list(zip(bars1, compute)) + list(zip(bars2, e2e)):
-            if val is None:
-                continue
-            axes[0].annotate(f"{val:.0f}", (rect.get_x() + rect.get_width() / 2, val),
-                             textcoords="offset points", xytext=(0, 3), ha="center", fontsize=8)
-    axes[0].legend(loc="upper center", bbox_to_anchor=(0.5, -0.20), ncol=3,
-                   frameon=False, fontsize=7.5, handletextpad=0.4, columnspacing=1.0)
-
-    cer_p50 = []
+    short = {}
     for c in configs:
-        stat = agg[c].get("cer") or {}
-        cer_p50.append(None if stat.get("p50") is None else float(stat["p50"]) * 100.0)
-    if any(v is not None for v in cer_p50):
-        axes[1].bar(xs, [np.nan if v is None else v for v in cer_p50], 0.55,
-                    color=[CONFIG_COLORS[c] for c in configs], alpha=0.9)
-        for xi, val in zip(xs, cer_p50):
-            if val is not None:
-                axes[1].annotate(f"{val:.1f}%", (xi, val), textcoords="offset points",
-                                 xytext=(0, 3), ha="center", fontsize=8)
-        fails = [int(agg[c].get("asr_fail") or 0) for c in configs]
-        top = max(v for v in cer_p50 if v is not None)
-        axes[1].set_ylim(0, max(top * 1.18, 1.0))
-        if any(fails):
-            axes[1].annotate(
-                "median; ASR failures (CER>200%): "
-                + ", ".join(f"{c} {f}" for c, f in zip(configs, fails)),
-                xy=(0.02, 0.99), xycoords="axes fraction", fontsize=5.5,
-                va="top", ha="left", color="#444444",
-                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
-                          edgecolor="none", alpha=0.85),
-            )
-    else:
-        axes[1].text(0.5, 0.5, "ASR disabled\n(--skip-asr or model load failure)",
-                     ha="center", va="center", transform=axes[1].transAxes, fontsize=9)
-    axes[1].set_xticks(xs)
-    axes[1].set_xticklabels([CONFIG_LABELS[c].split(" (")[0].replace("Pure ", "") for c in configs])
-    axes[1].set_ylabel("CER (%, median, lower is better)")
-    axes[1].set_title("(b) Intelligibility")
+        name = CONFIG_LABELS[c].split(" (")[0]
+        short[c] = {"Pure AR": "AR", "Pure NAR": "NAR"}.get(name, "Hybrid")
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.16, 2.6))
+    rng = np.random.RandomState(20261018)
+
+    def _panel(ax, key, ylabel, title, log: bool = True, floor: Optional[float] = None,
+               pct: bool = False, digits: int = 0, suffix: str = "") -> List[float]:
+        drawn: List[float] = []
+        labels: List[str] = []
+        for i, c in enumerate(configs):
+            raw = _values_for(agg[c], key)
+            if pct:
+                raw = [v * 100.0 for v in raw]
+            plot_vals = [max(v, floor) for v in raw] if floor is not None else raw
+            if plot_vals:
+                _draw_box(ax, i, plot_vals, CONFIG_COLORS[c])
+                _draw_points(ax, i, plot_vals, CONFIG_COLORS[c], rng)
+                drawn.extend(plot_vals)
+                labels.append(f"{short[c]}\np50 {np.median(raw):.{digits}f}{suffix}")
+                continue
+            p50 = _stat_p50(agg[c], key)
+            labels.append(short[c] if p50 is None else
+                          f"{short[c]}\np50 {p50 * (100.0 if pct else 1.0):.{digits}f}{suffix}")
+            if p50 is None:
+                continue
+            if pct:
+                p50 *= 100.0
+            if floor is not None:
+                p50 = max(p50, floor)
+            ax.bar(i, p50, width=0.46, color=CONFIG_COLORS[c], alpha=0.32,
+                   edgecolor="#333333", linewidth=0.7, zorder=3)
+            drawn.append(p50)
+        if log and drawn:
+            ax.set_yscale("log")
+        if drawn:
+            ax.set_ylim(max(min(drawn) * 0.55, 1e-3), max(drawn) * 1.9)
+        ax.set_xticks(range(len(configs)))
+        ax.set_xticklabels(labels, fontsize=8.5)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_title(title, fontsize=9)
+        ax.set_xlim(-0.6, len(configs) - 0.4)
+        ax.set_axisbelow(True)
+        return drawn
+
+    # ---- (a) time to first audio (warm; cold marked with x) -----------------
+    title_a = "(a) Time-to-first-audio"
+    a50 = _stat_p50(agg.get("A") or {}, "ttfa_compute_warm")
+    c50 = _stat_p50(agg.get("C") or {}, "ttfa_compute_warm")
+    if a50 and c50:
+        title_a += f"  ({a50 / c50:.1f}$\\times$ faster than AR)"
+    drawn_a = _panel(axes[0], "ttfa_compute_warm", "TTFA (ms, log scale)", title_a)
+    has_cold = False
+    for i, c in enumerate(configs):
+        cold = agg[c].get("ttfa_compute_cold")
+        if cold is None:
+            continue
+        axes[0].scatter([i + 0.30], [float(cold)], marker="x", s=24, color="black",
+                        linewidths=1.1, zorder=7)
+        drawn_a.append(float(cold))
+        has_cold = True
+    if drawn_a:
+        axes[0].set_ylim(max(min(drawn_a) * 0.55, 1e-3), max(drawn_a) * 2.1)
+
+    # ---- (b) throughput -----------------------------------------------------
+    _panel(axes[1], "rtf", "RTF (compute s per audio s, log)", "(b) Throughput", digits=2)
+    axes[1].axhline(1.0, color="#666666", linestyle=":", linewidth=0.9, zorder=1)
+    axes[1].annotate("real time", xy=(-0.55, 1.0), xytext=(0, 3), textcoords="offset points",
+                     ha="left", va="bottom", fontsize=6.5, color="#666666")
+
+    # ---- (c) intelligibility ------------------------------------------------
+    _panel(axes[2], "cer", "CER (%, log scale, lower better)", "(c) Intelligibility",
+           floor=0.5, pct=True, digits=0, suffix="%")
+    fails = [int(agg[c].get("asr_fail") or 0) for c in configs]
+    if any(fails):
+        axes[2].annotate(
+            "ASR hallucination rows\n(CER>200%): " + " / ".join(str(f) for f in fails),
+            xy=(0.985, 0.02), xycoords="axes fraction", fontsize=6.0, va="bottom", ha="right",
+            color="#555555",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#dddddd",
+                      linewidth=0.4, alpha=0.9),
+        )
+
+    handles = [
+        Patch(facecolor="#888888", alpha=0.28, edgecolor="#333333", linewidth=0.7,
+              label="IQR / median"),
+        Line2D([], [], marker="o", linestyle="none", markersize=4, color="#888888",
+               label="per utterance"),
+    ]
+    if has_cold:
+        handles.append(Line2D([], [], marker="x", linestyle="none", markersize=5,
+                              color="black", label="cold (first utterance)"))
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles), frameon=False,
+               fontsize=7.5, bbox_to_anchor=(0.5, -0.02), handletextpad=0.5,
+               columnspacing=1.8)
     fig.tight_layout()
     paths = _save_fig(fig, out_dir, "fig1_latency_quality_tradeoff")
     plt.close(fig)
     return paths
 
-
 def figure2_zone_acceptance(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Optional[List[str]]:
-    """Fig. 2: Codebook-0 acceptance across linguistic zones (C config)."""
+    """Fig. 2: CB0 acceptance per linguistic zone as true-vs-reference dumbbells (Config C)."""
     try:
         plt = _ieee_style()
     except Exception as exc:
         print(f"[Figures] matplotlib unavailable: {exc}")
         return None
-    c_agg = agg.get("C", {})
-    zones = c_agg.get("zones") or {}
+    from matplotlib.lines import Line2D
+
+    zones = (agg.get("C") or {}).get("zones") or {}
     if not zones or all((zones.get(str(z)) or {}).get("accept_true") is None for z in ZONE_ORDER):
         return None
-    fig, ax = plt.subplots(figsize=(3.5, 2.6))
-    x = np.arange(len(ZONE_ORDER))
-    width = 0.38
-    true_vals, true_errs, synth_vals, synth_errs = [], [], [], []
-    for zone in ZONE_ORDER:
+
+    fig, ax = plt.subplots(figsize=(3.5, 2.5))
+    ys = list(range(len(ZONE_ORDER)))[::-1]  # Pure Tamil on top
+    base = zones.get(str(ZONE_TAMIL)) or {}
+    tamil_true = base.get("accept_true")
+    tamil_std = float(base.get("accept_true_std") or 0.0)
+    if tamil_true is not None and tamil_std > 0:
+        ax.axvspan(max(0.0, float(tamil_true) - tamil_std),
+                   min(105.0, float(tamil_true) + tamil_std),
+                   color="#2ca02c", alpha=0.10, linewidth=0, zorder=0)
+        ax.axvline(float(tamil_true), color="#2ca02c", linestyle="--", linewidth=0.9,
+                   alpha=0.75, zorder=1)
+
+    for y, zone in zip(ys, ZONE_ORDER):
         z = zones.get(str(zone)) or {}
-        true_vals.append(z.get("accept_true"))
-        true_errs.append(z.get("accept_true_std") or 0.0)
-        synth_vals.append(z.get("accept_synth"))
-        synth_errs.append(z.get("accept_synth_std") or 0.0)
+        pts = []
+        for val, err, color, marker in (
+            (z.get("accept_true"), z.get("accept_true_std") or 0.0, "#2ca02c", "o"),
+            (z.get("accept_synth"), z.get("accept_synth_std") or 0.0, "#ff7f0e", "s"),
+        ):
+            if val is None:
+                continue
+            pts.append((float(val), float(err), color, marker))
+        pts.sort(key=lambda p: p[0])
+        for k, (val, err, color, marker) in enumerate(pts):
+            ax.errorbar([val], [y], xerr=[[err], [err]], fmt=marker, ms=4.5,
+                        color=color, ecolor=color, elinewidth=0.8, capsize=2.0,
+                        capthick=0.8, zorder=4)
+        if len(pts) == 2:
+            for val, _, _, _ in pts:
+                ax.annotate(f"{val:.1f}", xy=(val, y), textcoords="offset points",
+                            xytext=(0, 6), ha="center", va="bottom", fontsize=7,
+                            color="#333333")
+        if len(pts) == 2:
+            ax.plot([pts[0][0], pts[1][0]], [y, y], color="#c4c4c4", linewidth=1.1, zorder=2)
+        true_val = z.get("accept_true")
+        if zone != ZONE_TAMIL and true_val is not None and tamil_true is not None:
+            delta = float(true_val) - float(tamil_true)
+            err = float(z.get("accept_true_std") or 0.0)
+            significant = err > 0.0 and abs(delta) > err
+            ax.annotate(f"$\\Delta$ {delta:+.1f}" + ("" if significant else " (n.s.)"),
+                        xy=(104.5, y), ha="right", va="center", fontsize=6.5,
+                        color="#d62728" if significant else "#8c8c8c")
 
-    def _plot_bars(offset, vals, errs, color, label, hatch=None):
-        ax.bar(x + offset, [np.nan if v is None else v for v in vals], width,
-               yerr=[0 if v is None else e for v, e in zip(vals, errs)], capsize=3,
-               color=color, alpha=0.9, label=label, hatch=hatch, edgecolor="black", linewidth=0.4)
+    ylabels = []
+    for zone in ZONE_ORDER:
+        n_frames = int((zones.get(str(zone)) or {}).get("n_frames") or 0)
+        ylabels.append(f"{ZONE_NAMES[zone]}\n({n_frames} frames)")
+    ax.set_yticks(ys)
+    ax.set_yticklabels(ylabels, fontsize=7.5)
+    ax.set_xlim(0, 105)
+    ax.set_ylim(-0.55, len(ZONE_ORDER) - 0.45)
+    ax.set_xlabel("Codebook-0 acceptance (%)", fontsize=9)
+    ax.set_axisbelow(True)
 
-    _plot_bars(-width / 2, true_vals, true_errs, "#2ca02c", "True target (Parler P)", None)
-    _plot_bars(+width / 2, synth_vals, synth_errs, "#ff7f0e", "Mismatched target (ref)", "//")
-    ax.set_xticks(x)
-    ax.set_xticklabels([ZONE_NAMES[z].replace(" ", "\n") for z in ZONE_ORDER], fontsize=8)
-    ax.set_ylabel("CB0 acceptance (%)")
-    ax.set_ylim(0, 105)
-    ax.legend(loc="lower left", frameon=False, fontsize=7.5)
-    b_idx = 3  # cross-lingual boundary
-    if true_vals[b_idx] is not None:
-        base = [v for i, v in enumerate(true_vals) if v is not None and i != b_idx]
-        if base:
-            drop = true_vals[b_idx] - float(np.mean(base))
-            # Colour/mark only if the difference clears the per-utterance std.
-            ref_std = float(true_errs[b_idx] or 0.0)
-            significant = ref_std > 0.0 and abs(drop) > ref_std
-            color = "#d62728" if significant else "#7f7f7f"
-            label = f"{drop:+.1f} pts" + ("" if significant else " (n.s.)")
-            ax.annotate(
-                label,
-                xy=(b_idx - width / 2, true_vals[b_idx]),
-                xytext=(b_idx - 1.5, max(5.0, true_vals[b_idx] + 25)),
-                fontsize=8, arrowprops=dict(arrowstyle="->", linestyle="--", color=color),
-                color=color,
-            )
+    handles = [
+        Line2D([], [], marker="o", ms=4.5, linestyle="none", color="#2ca02c",
+               label="True target (Parler $P$)"),
+        Line2D([], [], marker="s", ms=4.5, linestyle="none", color="#ff7f0e",
+               label="Mismatched target (ref.)"),
+    ]
+    if tamil_true is not None and tamil_std > 0:
+        handles.append(Line2D([], [], color="#2ca02c", linestyle="--", linewidth=0.9,
+                              label="Pure Tamil median $\\pm$ std"))
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.26), ncol=2,
+              frameon=False, fontsize=6.8, handletextpad=0.4, columnspacing=1.0)
     fig.tight_layout()
     paths = _save_fig(fig, out_dir, "fig2_boundary_acceptance_breakdown")
     plt.close(fig)
     return paths
 
-
 def figure3_stream_timeline(rows: List[Dict[str, Any]], out_dir: Path, target_sec: float = 3.0) -> Optional[List[str]]:
-    """Fig. 3: streaming chunk synthesis vs. playback buffer (representative C run)."""
+    """Fig. 3: streaming chunk synthesis vs. playback buffer (representative Config C run)."""
     try:
         plt = _ieee_style()
     except Exception as exc:
         print(f"[Figures] matplotlib unavailable: {exc}")
         return None
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
     candidates = [
         r for r in rows
         if r.get("config") == "C" and not r.get("error") and r.get("chunks")
@@ -1364,11 +1497,12 @@ def figure3_stream_timeline(rows: List[Dict[str, Any]], out_dir: Path, target_se
     draft_ms = float(rep.get("draft_ms") or 0.0)
 
     fig, (ax_top, ax_bot) = plt.subplots(
-        2, 1, figsize=(7.0, 3.6), sharex=True, gridspec_kw={"height_ratios": [2.0, 1.0]}
+        2, 1, figsize=(7.16, 3.3), sharex=True,
+        gridspec_kw={"height_ratios": [1.9, 1.0], "hspace": 0.18},
     )
-    colors = {"draft": "#7f7f7f", "verify": "#1f77b4", "residual": "#ff7f0e", "dac": "#2ca02c"}
+    colors = {"draft": "#8c8c8c", "verify": "#1f77b4", "residual": "#ff7f0e", "dac": "#2ca02c"}
 
-    # --- top: synthesis Gantt ---
+    # --- top: synthesis Gantt -------------------------------------------------
     for i, ch in enumerate(chunks):
         dac_ms = float(ch.get("dac_ms") or 0.0)
         res_ms = float(ch.get("residual_ms") or 0.0)
@@ -1377,65 +1511,204 @@ def figure3_stream_timeline(rows: List[Dict[str, Any]], out_dir: Path, target_se
         dac_start = ready - dac_ms
         res_start = dac_start - res_ms
         ver_start = res_start - ver_ms
-        y = i
         if ver_ms > 0:
-            ax_top.barh(y, ver_ms, left=ver_start, height=0.62, color=colors["verify"], edgecolor="black", linewidth=0.3)
-        ax_top.barh(y, res_ms, left=res_start, height=0.62, color=colors["residual"], edgecolor="black", linewidth=0.3)
-        ax_top.barh(y, dac_ms, left=dac_start, height=0.62, color=colors["dac"], edgecolor="black", linewidth=0.3)
+            ax_top.barh(i, ver_ms, left=ver_start, height=0.60, color=colors["verify"],
+                        edgecolor="black", linewidth=0.3)
+        if res_ms > 0:
+            ax_top.barh(i, res_ms, left=res_start, height=0.60, color=colors["residual"],
+                        edgecolor="black", linewidth=0.3)
+        if dac_ms > 0:
+            ax_top.barh(i, dac_ms, left=dac_start, height=0.60, color=colors["dac"],
+                        edgecolor="black", linewidth=0.3)
         if i == 0 and draft_ms > 0:
-            ax_top.barh(y, draft_ms, left=0.0, height=0.62, color=colors["draft"], edgecolor="black", linewidth=0.3)
-    # playback lane
+            ax_top.barh(i, draft_ms, left=0.0, height=0.60, color=colors["draft"],
+                        edgecolor="black", linewidth=0.3)
+        ax_top.plot([ready], [i], marker="v", ms=3.4, color="black", zorder=6)
+
+    # playback lane: chunks are played back-to-back once the buffer allows it
     play_lane = len(chunks)
     play_time = None
-    for i, ch in enumerate(chunks):
+    for ch in chunks:
         dur_ms = float(ch.get("n_frames") or 0) / 86.1328 * 1000.0
         ready = float(ch.get("ready_ms") or 0.0)
         start = ready if play_time is None else max(play_time, ready)
-        ax_top.barh(play_lane, dur_ms, left=start, height=0.62, color="#c7c7c7", edgecolor="black", linewidth=0.3)
+        ax_top.barh(play_lane, dur_ms, left=start, height=0.60, color="#d9d9d9",
+                    edgecolor="black", linewidth=0.3)
         play_time = start + dur_ms
+
     ttfa = float(rep.get("ttfa_e2e_ms") or (chunks[0].get("ready_ms") or 0.0))
-    ax_top.axvline(ttfa, color="#d62728", linestyle="--", linewidth=1.0)
-    ax_top.annotate(f"TTFA {ttfa:.0f} ms", xy=(ttfa, play_lane), xytext=(ttfa + 60, play_lane - 0.2),
-                    fontsize=8, color="#d62728")
-    ax_top.set_yticks(list(range(len(chunks) + 1)))
-    ax_top.set_yticklabels([f"Chunk {i + 1}" for i in range(len(chunks))] + ["Playback"])
-    ax_top.set_ylabel("Pipeline stage")
-    ax_top.set_ylim(-0.7, play_lane + 1.25)
-    ax_top.set_title(
-        f"Streaming synthesis vs. playback — {rep['utt_id']} "
-        f"({REGISTER_LABELS.get(rep['register'], rep['register'])}), "
-        f"{float(rep['audio_sec']):.2f}s audio"
-    )
-    from matplotlib.patches import Patch
-
-    ax_top.legend(handles=[
-        Patch(facecolor=colors["draft"], edgecolor="black", label="Draft (CB0 NAR)"),
-        Patch(facecolor=colors["verify"], edgecolor="black", label="Verify (AR)"),
-        Patch(facecolor=colors["residual"], edgecolor="black", label="Residual (CB1–8)"),
-        Patch(facecolor=colors["dac"], edgecolor="black", label="DAC decode"),
-        Patch(facecolor="#c7c7c7", edgecolor="black", label="Playback"),
-    ], loc="upper right", frameon=False, fontsize=7.5, ncol=2)
-
-    # --- bottom: buffer occupancy (ms of audio ready but unplayed) ---
     total_ms = float(rep.get("total_ms") or 0.0)
-    horizon = max(total_ms + 1500.0, (play_time or 0.0) + 250.0)
-    ts = np.linspace(0, horizon, 600)
+    horizon = max(total_ms * 1.04, (play_time or 0.0) * 1.06, ttfa * 3.0)
+    ax_top.axvline(ttfa, color="#d62728", linestyle="--", linewidth=1.0, zorder=5)
+    ax_top.annotate(f"TTFA {ttfa:.0f} ms", xy=(ttfa, -0.58), xytext=(6, 0),
+                    textcoords="offset points", ha="left", va="center", fontsize=7.5,
+                    color="#d62728",
+                    bbox=dict(boxstyle="round,pad=0.18", facecolor="white", edgecolor="none",
+                              alpha=0.85))
+    if total_ms > 0:
+        ax_top.axvline(total_ms, color="#555555", linestyle=":", linewidth=0.9, zorder=5)
+        ax_top.annotate(f"synthesis done {total_ms:.0f} ms", xy=(total_ms, play_lane + 0.62),
+                        xytext=(-6, 0), textcoords="offset points", ha="right", va="center",
+                        fontsize=7.5, color="#555555",
+                        bbox=dict(boxstyle="round,pad=0.18", facecolor="white",
+                                  edgecolor="none", alpha=0.85))
+    ax_top.set_yticks(list(range(len(chunks) + 1)))
+    ax_top.set_yticklabels([f"Chunk {i + 1}" for i in range(len(chunks))] + ["Playback"],
+                           fontsize=8.5)
+    ax_top.set_ylabel("Pipeline stage", fontsize=9)
+    ax_top.set_ylim(-0.75, play_lane + 1.05)
+    ax_top.set_title(
+        f"Streaming synthesis vs. playback \u2014 {rep['utt_id']} "
+        f"({REGISTER_LABELS.get(rep['register'], rep['register'])}), "
+        f"{float(rep['audio_sec']):.2f} s audio (Config C)",
+        fontsize=9.5,
+    )
+    ax_top.set_axisbelow(True)
+
+    # --- bottom: buffer occupancy (ms of audio ready but unplayed) -----------
+    ts = np.linspace(0, horizon, 800)
     ready = np.zeros_like(ts)
     for ch in chunks:
         dur_ms = float(ch.get("n_frames") or 0) / 86.1328 * 1000.0
         ready += (ts >= float(ch.get("ready_ms") or 0.0)) * dur_ms
-    played = np.clip(ts - ttfa, 0.0, play_time - ttfa if play_time else 0.0)
+    played = np.clip(ts - ttfa, 0.0, (play_time - ttfa) if play_time else 0.0)
     buffer_ms = ready - played
-    ax_bot.fill_between(ts, buffer_ms, 0, where=buffer_ms >= 0, color="#2ca02c", alpha=0.35)
+    ax_bot.fill_between(ts, buffer_ms, 0, where=buffer_ms >= 0, color="#2ca02c", alpha=0.30)
     ax_bot.fill_between(ts, buffer_ms, 0, where=buffer_ms < 0, color="#d62728", alpha=0.35)
     ax_bot.axhline(0, color="black", linewidth=0.6)
-    ax_bot.set_xlabel("Wall-clock time since synthesis start (ms)")
-    ax_bot.set_ylabel("Buffer (ms)")
-    if (buffer_ms >= 0).all():
-        ax_bot.annotate("no underrun", xy=(0.99, 0.82), xycoords="axes fraction",
-                        ha="right", fontsize=8, color="#2ca02c")
+    ax_bot.axvline(ttfa, color="#d62728", linestyle="--", linewidth=0.8, alpha=0.7)
+    imin = int(np.argmin(buffer_ms))
+    ax_bot.plot([ts[imin]], [buffer_ms[imin]], marker="o", ms=3.0, color="black", zorder=6)
+    ax_bot.annotate(f"min {buffer_ms[imin]:.0f} ms", xy=(ts[imin], buffer_ms[imin]),
+                    xytext=(7, 7 if buffer_ms[imin] >= 0 else -13), textcoords="offset points",
+                    fontsize=7, color="#333333",
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="#dddddd",
+                              linewidth=0.4, alpha=0.9))
+    ax_bot.set_xlabel("Wall-clock time since synthesis start (ms)", fontsize=9)
+    ax_bot.set_ylabel("Buffer (ms)", fontsize=9)
+    ax_bot.set_xlim(0, horizon)
+    ax_bot.set_ylim(min(0.0, buffer_ms.min() * 1.35), max(buffer_ms.max() * 1.30, 50.0))
+    ax_bot.set_axisbelow(True)
+    state = "underrun" if (buffer_ms < 0).any() else "no underrun"
+    ax_bot.annotate(state, xy=(0.99, 0.90), xycoords="axes fraction", ha="right", va="top",
+                    fontsize=7.5, color="#2ca02c" if state == "no underrun" else "#d62728")
+
+    handles = [
+        Patch(facecolor=colors["draft"], edgecolor="black", linewidth=0.3,
+              label="Draft (CB0 NAR)"),
+        Patch(facecolor=colors["verify"], edgecolor="black", linewidth=0.3,
+              label="Verify (AR, teacher-forced)"),
+        Patch(facecolor=colors["residual"], edgecolor="black", linewidth=0.3,
+              label="Residual (CB1\u20138)"),
+        Patch(facecolor=colors["dac"], edgecolor="black", linewidth=0.3, label="DAC decode"),
+        Line2D([], [], marker="v", linestyle="none", ms=3.4, color="black",
+               label="chunk ready"),
+        Patch(facecolor="#d9d9d9", edgecolor="black", linewidth=0.3, label="Playback"),
+    ]
+    fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False, fontsize=7.5,
+               bbox_to_anchor=(0.5, -0.02), handletextpad=0.4, columnspacing=1.2)
     fig.tight_layout()
     paths = _save_fig(fig, out_dir, "fig3_streaming_chunk_timeline")
+    plt.close(fig)
+    return paths
+
+
+def figure4_scaling_and_registers(rows: List[Dict[str, Any]], agg: Dict[str, Dict[str, Any]],
+                                  out_dir: Path) -> Optional[List[str]]:
+    """Fig. 4: (a) total latency vs audio length, (b) CER per linguistic register."""
+    try:
+        plt = _ieee_style()
+    except Exception as exc:
+        print(f"[Figures] matplotlib unavailable: {exc}")
+        return None
+    from matplotlib.lines import Line2D
+
+    configs = [c for c in ("A", "B", "C") if agg.get(c, {}).get("n")]
+    if not configs:
+        return None
+    fig, axes = plt.subplots(1, 2, figsize=(7.16, 2.6))
+    rng = np.random.RandomState(4242)
+
+    # ---- (a) total latency vs. audio duration -------------------------------
+    ax = axes[0]
+    slopes: Dict[str, Optional[float]] = {}
+    for c in configs:
+        sub = [r for r in rows if r.get("config") == c and not r.get("error")
+               and r.get("audio_sec") and r.get("total_ms")]
+        xs = np.asarray([float(r["audio_sec"]) for r in sub], dtype=float)
+        ys = np.asarray([float(r["total_ms"]) for r in sub], dtype=float)
+        slopes[c] = None
+        if xs.size == 0:
+            continue
+        ax.scatter(xs, ys, s=9, color=CONFIG_COLORS[c], alpha=0.75, linewidths=0, zorder=4)
+        if xs.size >= 2 and np.ptp(xs) > 0:
+            slope, intercept = np.polyfit(xs, ys, 1)
+            slopes[c] = float(slope)
+            xf = np.linspace(xs.min(), xs.max(), 20)
+            ax.plot(xf, slope * xf + intercept, color=CONFIG_COLORS[c], linewidth=1.0, zorder=3)
+    ok_y = [float(r["total_ms"]) for r in rows
+            if r.get("config") in configs and not r.get("error") and r.get("total_ms")]
+    ax.set_yscale("log")
+    if ok_y:
+        ax.set_ylim(max(min(ok_y) * 0.5, 1.0), max(ok_y) * 2.0)
+    ax.set_xlabel("Synthesised audio duration (s)", fontsize=9)
+    ax.set_ylabel("Total synthesis latency (ms, log)", fontsize=9)
+    ax.set_title("(a) Latency scaling with utterance length", fontsize=9)
+    ax.set_axisbelow(True)
+
+    handles = []
+    for c in configs:
+        slope = slopes.get(c)
+        name = CONFIG_LABELS[c].split(" (")[0]
+        label = f"{c}: {name}" + ("" if slope is None else f"\n{slope:.0f} ms per audio-s")
+        handles.append(Line2D([], [], marker="o", ms=4, linestyle="none",
+                              color=CONFIG_COLORS[c], label=label))
+    ax.legend(handles=handles, loc="upper left", frameon=True, framealpha=0.9,
+              edgecolor="#dddddd", fontsize=7, handletextpad=0.4, borderpad=0.4,
+              labelspacing=0.8)
+
+    # ---- (b) CER per register ----------------------------------------------
+    ax = axes[1]
+    regs = [r for r in REGISTER_LABELS if ((agg.get(configs[0]) or {}).get("registers") or {}).get(r)
+            or any(((agg.get(c) or {}).get("registers") or {}).get(r) for c in configs)]
+    if not regs:
+        regs = list(REGISTER_LABELS)
+    positions = np.arange(len(regs))
+    n_cfg = len(configs)
+    drawn: List[float] = []
+    for i, reg in enumerate(regs):
+        for k, c in enumerate(configs):
+            entry = ((agg.get(c) or {}).get("registers") or {}).get(reg) or {}
+            vals = [float(v) * 100.0 for v in ((entry.get("values") or {}).get("cer") or [])]
+            vals = [v for v in vals if np.isfinite(v)]
+            pos = i + (k - (n_cfg - 1) / 2.0) * 0.26
+            if vals:
+                plot_vals = [max(v, 0.5) for v in vals]
+                _draw_box(ax, pos, plot_vals, CONFIG_COLORS[c], width=0.20)
+                _draw_points(ax, pos, plot_vals, CONFIG_COLORS[c], rng, size=3.6,
+                             spread=0.07, alpha=0.8)
+                drawn.extend(plot_vals)
+            else:
+                p50 = ((entry.get("cer") or {}).get("p50"))
+                if p50 is None:
+                    continue
+                p50 = max(float(p50) * 100.0, 0.5)
+                ax.bar(pos, p50, width=0.20, color=CONFIG_COLORS[c], alpha=0.32,
+                       edgecolor="#333333", linewidth=0.5, zorder=3)
+                drawn.append(p50)
+    if drawn:
+        ax.set_yscale("log")
+        ax.set_ylim(max(min(drawn) * 0.5, 0.3), max(drawn) * 2.4)
+    ax.set_xticks(positions)
+    ax.set_xticklabels([REGISTER_LABELS[r].replace(" ", "\n") for r in regs], fontsize=8)
+    ax.set_xlim(-0.55, len(regs) - 0.45)
+    ax.set_ylabel("CER (%, log, lower better)", fontsize=9)
+    ax.set_title("(b) Intelligibility per register", fontsize=9)
+    ax.set_axisbelow(True)
+    # colour key is shared with panel (a); no second legend needed
+
+    fig.tight_layout()
+    paths = _save_fig(fig, out_dir, "fig4_scaling_and_registers")
     plt.close(fig)
     return paths
 
@@ -2018,6 +2291,12 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
                 fig_paths[name] = paths
         except Exception as exc:
             print(f"[Figures] {name} failed: {type(exc).__name__}: {exc}")
+    try:
+        paths = figure4_scaling_and_registers(rows, agg, figures_dir)
+        if paths:
+            fig_paths["fig4"] = paths
+    except Exception as exc:
+        print(f"[Figures] fig4 failed: {type(exc).__name__}: {exc}")
     try:
         paths = figure3_stream_timeline(rows, figures_dir)
         if paths:

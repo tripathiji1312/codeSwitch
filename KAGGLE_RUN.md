@@ -7,7 +7,7 @@ between cells except the one-time dependency install.
 |------|---------|-----------------|-----------|
 | 1 | setup cell (below) | 4–8 min + 1 restart | — |
 | 2 | `python train_draft_distill.py` | 35–55 min | `teacher_cache/shard_*.npz`, `codeswitch_ckpt/{draft_cb0.pt,residual_cb1_8.pt,meta.json}` |
-| 3 | `python run_full_evaluation.py --ckpt codeswitch_ckpt` | 25–40 min | `eval_results/{raw_results.jsonl,run_meta.json}`, `paper_figures/{fig1,fig2,fig3}.{png,pdf}`, `paper_figures/{tables.tex,summary.json}`, `eval_audio/{A,B,C}/*.wav` |
+| 3 | `python run_full_evaluation.py --ckpt codeswitch_ckpt` | 25–40 min | `eval_results/{raw_results.jsonl,run_meta.json}`, `paper_figures/{fig1,fig2,fig3,fig4}.{png,pdf}`, `paper_figures/{tables.tex,summary.json}`, `eval_audio/{A,B,C}/*.wav` |
 
 ---
 
@@ -146,9 +146,10 @@ The run writes:
 ```
 eval_results/raw_results.jsonl     # one row per (config, utterance): TTFA, RTF, CER, acceptance, chunk telemetry
 eval_results/run_meta.json         # args, package versions, checkpoint provenance
-paper_figures/fig1_latency_quality_tradeoff.{png,pdf}
-paper_figures/fig2_boundary_acceptance_breakdown.{png,pdf}
-paper_figures/fig3_streaming_chunk_timeline.{png,pdf}
+paper_figures/fig1_latency_quality_tradeoff.{png,pdf}   # TTFA / RTF / CER distributions per config
+paper_figures/fig2_boundary_acceptance_breakdown.{png,pdf} # per-zone CB0 acceptance (true vs ref.)
+paper_figures/fig3_streaming_chunk_timeline.{png,pdf}   # streaming chunk pipeline + playback buffer
+paper_figures/fig4_scaling_and_registers.{png,pdf}      # latency vs audio length + CER per register
 paper_figures/tables.tex           # Tables I (comparative) + II (zones) + III (per-register), IEEE style
 paper_figures/summary.json         # aggregates + figure paths
 eval_audio/{A,B,C}/{utt_id}.wav    # listening samples
