@@ -481,6 +481,55 @@ def test_results_roundtrip_preserves_chunk_telemetry(tmp_path: Path):
     assert json.dumps(c_row, ensure_ascii=False)
 
 
+def test_replay_pushes_to_wandb_when_asked(tmp_path, monkeypatch, capsys):
+    """--replay --wandb rebuilds the artifacts (no GPU) and pushes them once."""
+    import push_to_wandb as W
+
+    rows = _fabricated_rows()
+    results = tmp_path / "eval_results" / "raw_results.jsonl"
+    results.parent.mkdir(parents=True, exist_ok=True)
+    R.save_results(results, rows)
+    calls: dict = {}
+
+    def fake_push(**kwargs):
+        calls.update(kwargs)
+        return {"url": "https://wandb.ai/x/y/runs/z", "n_metrics": 7}
+
+    monkeypatch.setattr(W, "push", fake_push)
+    code = R.main([
+        "--replay", "--results", str(results), "--configs", "A,C",
+        "--figures-dir", str(tmp_path / "paper_figures"), "--no-mcd",
+        "--wandb", "--wandb-project", "proj", "--wandb-run-name", "unit",
+        "--wandb-tags", "a,b", "--wandb-group", "c300",
+    ])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "https://wandb.ai/x/y/runs/z" in out
+    assert calls["project"] == "proj"
+    assert calls["run_name"] == "unit"
+    assert calls["tags"] == ["a", "b"]
+    assert calls["group"] == "c300"
+    assert Path(calls["results"]) == results
+    assert Path(calls["figures_dir"]) == tmp_path / "paper_figures"
+
+
+def test_wandb_failure_does_not_break_the_evaluation(tmp_path, monkeypatch, capsys):
+    import push_to_wandb as W
+
+    results = tmp_path / "raw_results.jsonl"
+    R.save_results(results, _fabricated_rows())
+
+    def boom(**kwargs):
+        raise RuntimeError("no internet")
+
+    monkeypatch.setattr(W, "push", boom)
+    code = R.main(["--replay", "--results", str(results), "--configs", "A,C",
+                   "--figures-dir", str(tmp_path / "paper_figures"), "--no-mcd", "--wandb"])
+    assert code == 0                                  # evaluation artefacts stay valid
+    out = capsys.readouterr().out
+    assert "push failed" in out and "no internet" in out
+
+
 def test_zone_stats_attachment_helper():
     synth = R.EvalSynthesizer.__new__(R.EvalSynthesizer)  # bypass __init__
     frame_zones = np.array([1, 1, 2, 3, 3, 4], dtype=np.int64)

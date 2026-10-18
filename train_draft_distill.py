@@ -175,6 +175,12 @@ class LengthModel:
 # Teacher data collection
 # ===========================================================================
 
+def _same_sentence(a: str, b: str) -> bool:
+    """Whitespace/case-insensitive sentence identity for teacher-cache validation."""
+    norm = lambda t: " ".join(str(t or "").split()).casefold()  # noqa: E731
+    return norm(a) == norm(b)
+
+
 @dataclass
 class TeacherShard:
     """One teacher utterance: normalized text + 9xT DAC codes."""
@@ -507,8 +513,18 @@ class TeacherCollector:
         for i, text in enumerate(corpus):
             shard_path = self.out_dir / f"shard_{i:05d}.npz"
             if shard_path.exists():
-                shards.append(TeacherShard.load(shard_path))
-                continue
+                cached = TeacherShard.load(shard_path)
+                if _same_sentence(cached.raw_text, text):
+                    shards.append(cached)
+                    continue
+                # The cache is indexed by position, so a changed corpus would
+                # otherwise train the student on the *previous* sentence's
+                # teacher codes.  Recollect the mismatching positions.
+                if self.stats.get("stale", 0) == 0:
+                    print(f"[Teacher] ⚠ cached shard text differs from the current corpus "
+                          f"({shard_path.name}: cached={cached.raw_text[:48]!r} vs "
+                          f"now={text[:48]!r}); recollecting the changed sentences.")
+                self.stats["stale"] = self.stats.get("stale", 0) + 1
 
             t0 = _now()
             raw_text, prompt_clean = self._prepare_prompt(text)
@@ -578,7 +594,9 @@ class TeacherCollector:
         )
         if self.verbose:
             print(
-                f"[Teacher] collected {len(shards)} shards | "
+                f"[Teacher] collected {len(shards)} shards"
+                + (f" ({self.stats['stale']} recollected after a corpus change)"
+                   if self.stats.get("stale") else "") + " | "
                 f"frames: min={min(s.frames for s in shards)} "
                 f"med={int(np.median([s.frames for s in shards]))} "
                 f"max={max(s.frames for s in shards)} | "

@@ -3049,6 +3049,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gate-stat", choices=["utt_min", "utt_mean"], default="utt_min",
                    help="Utterance-level draft-confidence statistic compared with the threshold "
                         "(utt_min = worst chunk, the conservative default).")
+    p.add_argument("--wandb", action="store_true",
+                   help="Push the finished run to Weights & Biases (scalars, figures, sweep "
+                        "tables, audio samples + an artifact bundle). Works with --replay too, so "
+                        "figures can be refreshed and re-pushed with zero GPU time.")
+    p.add_argument("--wandb-project", type=str, default="codeswitch-tts")
+    p.add_argument("--wandb-entity", type=str, default=None)
+    p.add_argument("--wandb-run-name", type=str, default=None)
+    p.add_argument("--wandb-tags", type=str, default="codeswitch,kaggle,t4",
+                   help="Comma-separated tags for the W&B run.")
+    p.add_argument("--wandb-group", type=str, default=None,
+                   help="e.g. the corpus size, to group the runs of one paper sweep.")
+    p.add_argument("--wandb-api-key", type=str, default=None,
+                   help="Defaults to the WANDB_API_KEY env var, then to the Kaggle secret of "
+                        "that name (Add-ons -> Secrets).")
     return p
 
 
@@ -3513,6 +3527,28 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
     for name, paths in fig_paths.items():
         for p in paths:
             print(f"  {name}: {p}")
+    if getattr(args, "wandb", False):
+        try:
+            import push_to_wandb
+
+            report = push_to_wandb.push(
+                results=results_path,
+                figures_dir=figures_dir,
+                audio_dir=Path(getattr(args, "audio_dir", "eval_audio")),
+                ckpt_dir=Path(args.ckpt),
+                project=getattr(args, "wandb_project", "codeswitch-tts"),
+                entity=getattr(args, "wandb_entity", None),
+                run_name=getattr(args, "wandb_run_name", None),
+                group=getattr(args, "wandb_group", None),
+                tags=[t.strip() for t in str(getattr(args, "wandb_tags", "")).split(",") if t.strip()],
+                api_key=getattr(args, "wandb_api_key", None),
+            )
+            report.get("url") and print(f"[W&B] done: {report['url']}")
+        except Exception as exc:
+            print(f"[W&B] \u26a0 push failed: {type(exc).__name__}: {exc}")
+            print("[W&B] the evaluation itself is complete - retry just the upload with "
+                  "`python push_to_wandb.py`")
+
     print(f"[Done] total {fmt_time(_now() - t_all)}")
     return 0
 

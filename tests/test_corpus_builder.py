@@ -201,3 +201,68 @@ def test_utmos_scorer_disabled_path():
     scorer = R.UTMOSScorer("cpu", enabled=False)
     assert scorer.available is False
     assert scorer.score(np.zeros(1600, dtype=np.float32), 16000) is None
+
+
+# ===========================================================================
+# Teacher-cache validation (corpus change safety)
+# ===========================================================================
+def test_same_sentence_ignores_whitespace_and_case():
+    import train_draft_distill as T
+
+    assert T._same_sentence("நாளை வருகிறேன்.", "  நாளை   வருகிறேன். ")
+    assert T._same_sentence("Order ready", "order ready")
+    assert not T._same_sentence("நாளை வருகிறேன்.", "இன்று வருகிறேன்.")
+    assert not T._same_sentence("", "x")
+    assert T._same_sentence(None, "")
+
+
+def test_teacher_cache_recollects_when_the_corpus_changes(tmp_path, monkeypatch):
+    """A positional cache must not feed the student the previous corpus's codes."""
+    import numpy as np
+    import train_draft_distill as T
+
+    out_dir = tmp_path / "teacher"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    codes = np.zeros((9, 20), dtype=np.int32)
+    stale = T.TeacherShard(index=0, raw_text="வணக்கம் சார்.", norm_text="வணக்கம் சார்.",
+                           n_chars=12, frames=20, codes=codes, audio_sec=0.5,
+                           target_source="lm", gen_ms=1.0)
+    T.TeacherShard.save(stale, out_dir / "shard_00000.npz")
+
+    collected: list[str] = []
+
+    from types import SimpleNamespace
+
+    class _Collector(T.TeacherCollector):
+        def __init__(self):  # noqa: D107 - bypass the real engine
+            self.out_dir = out_dir
+            self.target_source = "lm"
+            self.verbose = False
+            self.stats: dict = {}
+            self._lm_capture_ok = True
+            self.max_frames = 10000
+            self.engine = SimpleNamespace(ar_model=SimpleNamespace(
+                config=SimpleNamespace(sampling_rate=44100),
+                audio_encoder=SimpleNamespace(
+                    config=SimpleNamespace(codebook_size=1024))))
+
+        def _prepare_prompt(self, text):
+            return text, text
+
+        def _generate_and_capture(self, prompt, index):
+            collected.append(prompt)
+            audio = np.zeros(1600, dtype=np.float32)
+            new_codes = np.ones((9, 24), dtype=np.int64)
+            return audio, new_codes
+
+    shards, _ = _Collector().collect(["மாற்றம் செய்யப்பட்ட வாக்கியம்."])
+    assert collected == ["மாற்றம் செய்யப்பட்ட வாக்கியம்."]     # stale shard recollected
+    assert shards[0].raw_text == "மாற்றம் செய்யப்பட்ட வாக்கியம்."
+    assert shards[0].frames == 24
+    assert shards[0].codes.shape == (9, 24)
+
+    # and an unchanged sentence is reused without touching the engine
+    collected.clear()
+    shards2, _ = _Collector().collect(["மாற்றம் செய்யப்பட்ட வாக்கியம்."])
+    assert collected == []
+    assert shards2[0].raw_text == shards[0].raw_text

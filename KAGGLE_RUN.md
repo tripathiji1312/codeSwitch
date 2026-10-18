@@ -8,6 +8,7 @@ between cells except the one-time dependency install.
 | 1 | setup cell (below) | 4–8 min + 1 restart | — |
 | 2 | `python train_draft_distill.py` | 35–55 min | `teacher_cache/shard_*.npz`, `codeswitch_ckpt/{draft_cb0.pt,residual_cb1_8.pt,meta.json}` |
 | 3 | `python run_full_evaluation.py --ckpt codeswitch_ckpt` | 25–40 min | `eval_results/{raw_results.jsonl,run_meta.json}`, `paper_figures/{fig1,fig2,fig3,fig4}.{png,pdf}`, `paper_figures/{tables.tex,summary.json}`, `eval_audio/{A,B,C}/*.wav` |
+| 3b | `python push_to_wandb.py` (optional) | 1–3 min | one W&B run: scalars + figures + tables + audio + `codeswitch-eval-*` artifact (the off-Kaggle copy of everything above) |
 
 ---
 
@@ -183,7 +184,7 @@ end to end (the run prints a derived-vs-synthesised validation line whenever bot
 * **Smoke test**: `!python run_full_evaluation.py --configs B --limit 3 --skip-asr --allow-untrained`
 * **Options**: `--skip-asr` (no CER/WER, everything else still runs), `--no-save-audio`,
   `--no-true-probs` (unrelated-target acceptance only), `--no-utmos`, `--no-mcd`,
-  `--play-steps 12`, `--boundary-frames 3`, `--dtype fp16`.
+  `--play-steps 12`, `--boundary-frames 3`, `--dtype fp16`, `--wandb` (push at the end).
 * **Runtime**: ≈ 25–40 min from scratch (whisper-small ASR included). With the default derived
   gate sweep no extra synthesis happens; only `--gate-mode synth` pays for the fallbacks
   (≈ 9 s each).
@@ -208,6 +209,57 @@ paper_figures/tables.tex           # Tables I (comparative) + II (zones) + III (
 paper_figures/summary.json         # aggregates + gate_sweep + switch_distance + figure paths
 eval_audio/{A,B,C}/{utt_id}.wav    # listening samples
 ```
+
+All of it (plus the raw JSONL and the checkpoint meta) is mirrored into the W&B artifact by
+§3b, which is what saves a run when a Kaggle session is recycled before the zip is downloaded.
+
+---
+
+## 3b) Push to Weights & Biases (optional, recommended)
+
+Add `WANDB_API_KEY` once as a Kaggle secret (**Add-ons → Secrets**); the pusher resolves it as
+`--api-key` → `$WANDB_API_KEY` → Kaggle secret, so no key ever lands in the notebook or the repo.
+
+```python
+%cd /kaggle/working/codeSwitch
+!pip install -q wandb
+!python push_to_wandb.py --project codeswitch-tts --tags kaggle,t4 \
+    --figures-dir paper_figures --audio-dir eval_audio --ckpt-dir codeswitch_ckpt \
+    --results eval_results/raw_results.jsonl
+```
+
+Or skip the extra cell and let the evaluation push itself:
+
+```python
+!python run_full_evaluation.py --ckpt codeswitch_ckpt --wandb --wandb-group c2500
+```
+
+What lands in the run:
+
+* **scalars** — TTFA-c (warm/cold), TTFA-e2e, total latency, RTF, CER, `CER_lat`, WER, UTMOS, MCD,
+  CB0 acceptance (teacher-forced + mismatched reference), the target-distribution
+  log-likelihoods, the entire gate sweep (`gate/*/tau_*`), the distance-to-switch buckets and
+  the training metrics from `codeswitch_ckpt/meta.json` (draft/residual val, CB0 top-1/top-5,
+  length model, corpus size)
+* **figures** — fig1–fig5 as W&B images (captions match the LaTeX ones)
+* **tables** — configs / gate sweep / distance-to-switch / per-register, read directly in the UI
+* **audio** — best/median/worst-CER sample per config, captioned with utterance, register and CER
+* **artifact** — `codeswitch-eval-<run>` with `raw_results.jsonl`, `tables.tex`, `summary.json`,
+  `run_meta.json`, the figures, the audio and `codeswitch_ckpt/meta.json`
+
+Practical notes:
+
+* **Zero-GPU refresh**: after a code change run `!python run_full_evaluation.py --replay --wandb`
+  (or just re-run the pusher) — tables/figures are rebuilt from the saved JSONL and re-uploaded.
+* **Overwrite/regroup**: `--run-id <wandb-run-id> --group c2500` appends to an existing run
+  (`resume=allow`); `--group` is the natural place for the corpus size, so the 300-sentence and
+  2500-sentence sweeps can be compared side by side.
+* **Preview**: `--dry-run` prints every scalar group, figure, table, audio sample and artifact
+  entry without touching the network (this is also what the test suite exercises).
+* **Offline**: `--offline` sets `WANDB_MODE=offline` and writes the run to disk (sync later with
+  `wandb sync`), useful when the session has no internet.
+* A failed push never invalidates the evaluation: the script warns (`[W&B] ⚠ push failed: ...`)
+  and exits 0 unless you pass `--strict`, and `_finish` still returns success.
 
 ---
 
@@ -315,6 +367,9 @@ Kaggle unless you want to archive them too.)
 | MCD column shows `--` | no saved wavs (`--no-save-audio`) or `soundfile`/`torchaudio` missing. Re-run (or `--replay`) with the wavs in place. |
 | `KeyError: 'residual_sched'`/old CLI flags | pull the latest repo — the corpus builder, scheduled sampling, the derived gate sweep and the new metrics are all post-2026-10. |
 | Session dies mid-run | re-run the same command(s): teacher shards and evaluated rows are resumed. |
+| `[W&B] ⚠ push failed: ...` (e.g. `CommError`, `UsageError: api_key not configured`) | the notebook's *Internet* switch is off, or the key is missing. Add the Kaggle secret `WANDB_API_KEY` (or pass `--api-key`), or `pip install -q wandb` first if the import failed. The evaluation artifacts are unaffected — push afterwards with `!python push_to_wandb.py`. |
+| W&B run shows `undefined` scalars or an empty panel | the metric is legitimately absent (e.g. MCD without saved wavs, UTMOS when both loaders failed, acceptance for A/B). `--dry-run` lists exactly which scalars exist. |
+| A corpus change made the teacher pass recompute everything | expected: cached shards are validated against the sentence text (a positional cache must not train on another corpus's codes), and only changed positions are recollected — the summary line reports `N recollected after a corpus change`. |
 
 ## 7) Where the knobs live
 
@@ -326,4 +381,6 @@ Kaggle unless you want to archive them too.)
 * Synthesis/timing/acceptance/zone/gate/switch-distance logic + metrics + figures + tables:
   `run_full_evaluation.py`.
 * Teacher collection + distillation + scheduled sampling + checkpoints: `train_draft_distill.py`.
-* Local test suite: `python -m pytest tests/ -q` (76 tests, no GPU needed).
+* W&B upload (scalars, panels, tables, media, artifact): `push_to_wandb.py`; `--wandb` on
+  `run_full_evaluation.py` calls it at the end, and the notebook has a dedicated cell (§3b).
+* Local test suite: `python -m pytest tests/ -q` (92 tests, no GPU and no network needed).
