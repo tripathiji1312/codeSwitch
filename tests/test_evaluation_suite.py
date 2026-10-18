@@ -501,7 +501,8 @@ def test_module_arg_parsers_exist():
     assert eval_args.ckpt == "codeswitch_ckpt"
     assert eval_args.configs == "A,B,C"
     assert math.isfinite(eval_args.seed)
-    assert eval_args.gate_thresholds == "0.0"
+    assert eval_args.gate_thresholds == "auto"
+    assert eval_args.gate_mode == "derived"
     assert eval_args.gate_stat in ("utt_min", "utt_mean")
 
     import train_draft_distill as T
@@ -581,6 +582,126 @@ def test_gate_sweep_aggregation_and_fallback_exclusion():
     assert gated["cer"]["p50"] is not None
     # here the gated mixture is slower (fallback cost) on the latency side
     assert gated["total"]["p50"] > open_pt["total"]["p50"]
+
+
+def _gate_rows_fixture(confs=(0.05, 0.10, 0.20, 0.40)) -> list[dict]:
+    """C(tau=0) + A rows with a spread of draft confidences (no gated rows)."""
+    rows: list[dict] = []
+    for i, conf in enumerate(confs):
+        utt = f"g-{i + 1:02d}"
+        rows.append({
+            "schema": R.SCHEMA_VERSION, "config": "A", "utt_id": utt,
+            "register": "native_tamil", "utt_index": i, "text": "x",
+            "normalized_text": "x", "sample_rate": 44100,
+            "ttfa_compute_ms": 330.0, "ttfa_e2e_ms": 340.0, "total_ms": 8000.0,
+            "rtf": 2.6, "audio_sec": 3.0, "accept_true": None, "accept_synth": None,
+            "cer": 0.10 + 0.01 * i, "wer": 0.3, "utmos": 2.5, "cer_latin": 0.06,
+            "zone_stats": {}, "chunks": [], "verify_mode": "none", "error": None,
+            "audio_path": None,
+        })
+        rows.append({
+            "schema": R.SCHEMA_VERSION, "config": "C", "utt_id": utt,
+            "register": "native_tamil", "utt_index": i, "text": "x",
+            "normalized_text": "x", "sample_rate": 44100,
+            "ttfa_compute_ms": 70.0, "ttfa_e2e_ms": 72.0, "total_ms": 220.0,
+            "rtf": 0.07, "audio_sec": 3.0, "accept_true": 40.0, "accept_synth": 25.0,
+            "cer": 0.50 + 0.01 * i, "wer": 0.6, "utmos": 1.5, "cer_latin": 0.30,
+            "zone_stats": {}, "verify_mode": "true", "error": None,
+            "gate_threshold": 0.0, "gate_stat": "utt_min", "fallback": False,
+            "draft_confidence": conf,
+            "chunks": [{"idx": 0, "n_frames": 86, "confidence": conf + 0.05},
+                       {"idx": 1, "n_frames": 86, "confidence": conf}],
+            "audio_path": None,
+        })
+    return rows
+
+
+def test_gate_confidence_table_uses_chunk_telemetry():
+    rows = _gate_rows_fixture(confs=(0.05, 0.40))
+    mins = R.gate_confidence_table(rows, "utt_min")
+    means = R.gate_confidence_table(rows, "utt_mean")
+    assert mins["g-01"] == pytest.approx(0.05) and mins["g-02"] == pytest.approx(0.40)
+    assert means["g-01"] == pytest.approx(0.075)
+
+
+def test_parse_gate_thresholds_auto_and_explicit():
+    rows = _gate_rows_fixture()
+    auto = R.parse_gate_thresholds("auto", rows, "utt_min")
+    assert auto[0] == 0.0 and len(auto) > 1
+    assert auto == sorted(auto)
+    assert 0.05 <= min(auto[1:]) <= 0.40
+    assert R.parse_gate_thresholds("0.2, 0.1,0.2", rows) == [0.1, 0.2]
+    assert R.parse_gate_thresholds("", []) == [0.0]
+    assert R.parse_gate_thresholds("junk", rows) == [0.0]
+
+
+def test_derived_gate_sweep_composes_measured_rows():
+    rows = _gate_rows_fixture(confs=(0.05, 0.40))
+    derived = R.derive_gate_sweep(rows, [0.0, 0.15], "utt_min")
+    by_key = {(r["utt_id"], r["gate_threshold"]): r for r in derived}
+    # tau=0 rows are the speculative rows untouched
+    assert by_key[("g-01", 0.0)]["cer"] == pytest.approx(0.50)
+    assert by_key[("g-01", 0.0)]["fallback"] is False
+    # 0.05 < 0.15 -> AR audio and metrics, latency = draft pass + AR pass
+    fb = by_key[("g-01", 0.15)]
+    assert fb["fallback"] is True and fb["derived"] is True
+    assert fb["cer"] == pytest.approx(0.10)
+    assert fb["utmos"] == pytest.approx(2.5)
+    assert fb["total_ms"] == pytest.approx(8220.0)
+    assert fb["rtf"] == pytest.approx(8220.0 / 1000.0 / 3.0)
+    assert fb["accept_true"] is None
+    # 0.40 >= 0.15 -> stays speculative
+    keep = by_key[("g-02", 0.15)]
+    assert keep["fallback"] is False and keep["cer"] == pytest.approx(0.51)
+    assert keep["accept_true"] == pytest.approx(40.0)
+
+
+def test_derived_sweep_is_offered_as_operating_points_and_warns_when_degenerate():
+    rows = _gate_rows_fixture(confs=(0.05, 0.40))
+    sweep = R.aggregate_gate_sweep(R.derive_gate_sweep(rows, [0.0, 0.15], "utt_min"))
+    rates = {e["threshold"]: e["fallback_rate"] for e in sweep}
+    assert rates[0.0] == 0.0 and rates[0.15] == pytest.approx(0.5)
+    assert R.gate_sweep_warning(sweep, R.gate_confidence_table(rows)) is None
+    # thresholds above every confidence -> every utterance falls back
+    degenerate = R.aggregate_gate_sweep(R.derive_gate_sweep(rows, [0.0, 0.9], "utt_min"))
+    note = R.gate_sweep_warning(degenerate, R.gate_confidence_table(rows))
+    assert note is not None and "no interior point" in note
+    assert "p50=" in note
+
+
+def test_compare_gate_modes_reports_derived_vs_synthesised():
+    rows = _gate_rows_fixture(confs=(0.05, 0.40))
+    # synthesise the tau=0.15 mixture the way the engine would: one AR fallback
+    # (g-01) and one speculative row (g-02), i.e. the same decisions as derived
+    fallback = dict(rows[3])
+    fallback.update({
+        "gate_threshold": 0.15, "fallback": True, "verify_mode": "ar_fallback",
+        "cer": 0.10, "total_ms": 8300.0, "ttfa_compute_ms": 330.0,
+        "accept_true": None, "accept_synth": None, "chunks": [],
+    })
+    speculative = dict(rows[1])
+    speculative.update({"gate_threshold": 0.15, "fallback": False, "total_ms": 222.0})
+    rows_with_gate = rows + [fallback, speculative]
+    checks = R.compare_gate_modes(rows_with_gate,
+                                  R.derive_gate_sweep(rows, [0.15], "utt_min"))
+    assert checks and len(checks) == 1
+    assert checks[0]["threshold"] == 0.15
+    assert checks[0]["fallback_rate"] == pytest.approx(0.5)
+    # derived fallback latency = measured draft pass + measured AR pass
+    assert checks[0]["total_p50_derived_ms"] == pytest.approx((8220.0 + 220.0) / 2.0)
+    assert checks[0]["total_p50_synth_ms"] == pytest.approx((8300.0 + 222.0) / 2.0)
+    assert abs(checks[0]["total_p50_derived_ms"] - checks[0]["total_p50_synth_ms"]) < 200.0
+
+
+def test_table_five_caption_states_the_gate_mode():
+    rows = _gate_rows_fixture(confs=(0.05, 0.40))
+    sweep = R.aggregate_gate_sweep(R.derive_gate_sweep(rows, [0.0, 0.15], "utt_min"))
+    derived_tex = R.build_table_V(sweep, None, derived=True, thresholds=[0.0, 0.15])
+    synth_tex = R.build_table_V(sweep, None, derived=False)
+    assert "derived from the measured per-utterance" in derived_tex
+    assert "Pure-AR results" in derived_tex   # no .capitalize() mangling
+    assert "synthesised end to end" in synth_tex
+    assert "0.15" in derived_tex and "50.0" in derived_tex
 
 
 def test_gate_threshold_filtering_in_aggregate():

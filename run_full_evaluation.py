@@ -1240,26 +1240,53 @@ class UTMOSScorer:
     unavailable the run continues without it (``available=False``).
     """
 
-    def __init__(self, device, enabled: bool = True, model_id: str = "tarepan/SpeechMOS",
+    #: ``tarepan/SpeechMOS`` is a torch.hub *repo* (the canonical UTMOS22-strong
+    #: reimplementation), not a transformers checkpoint - AutoModel can never
+    #: load it.  Tier 1 is the hub loader, tier 2 a transformers mirror in case
+    #: the hub is unreachable.
+    HUB_REPO = "tarepan/SpeechMOS:v1.2.0"
+    HUB_ENTRY = "utmos22_strong"
+
+    def __init__(self, device, enabled: bool = True,
+                 model_id: str = "prj-beatrice/utmos22-torch-native",
                  verbose: bool = True):
         self.model_id = model_id
         self.available = False
         self.reason = "disabled" if not enabled else "not initialised"
+        self.source: Optional[str] = None
         self.model = None
         self.device = torch.device("cpu") if str(device).startswith("cpu") else device
         if not enabled:
             return
+        # --- tier 1: torch.hub (UTMOS22-strong, VoiceMOS Challenge 2022) -------
+        try:
+            self.model = torch.hub.load(
+                self.HUB_REPO, self.HUB_ENTRY, trust_repo=True, verbose=False,
+            )
+            self.model = self.model.to(self.device).eval()
+            self.available = True
+            self.source = f"torch.hub:{self.HUB_REPO}/{self.HUB_ENTRY}"
+            self.reason = "ok"
+            if verbose:
+                print(f"[UTMOS] loaded {self.source} (device={self.device})")
+            return
+        except Exception as exc:
+            hub_reason = f"{type(exc).__name__}: {exc}"
+        # --- tier 2: transformers mirror --------------------------------------
         try:
             from transformers import AutoModel
 
             self.model = AutoModel.from_pretrained(model_id, trust_remote_code=True)
             self.model = self.model.to(self.device).eval()
             self.available = True
+            self.source = f"transformers:{model_id}"
             self.reason = "ok"
             if verbose:
-                print(f"[UTMOS] loaded {model_id} (device={self.device})")
+                print(f"[UTMOS] loaded {self.source} (device={self.device})")
+            return
         except Exception as exc:
-            self.reason = f"{type(exc).__name__}: {exc}"
+            self.reason = (f"torch.hub failed ({hub_reason}); "
+                           f"{type(exc).__name__}: {exc}")
             if verbose:
                 print(f"[UTMOS] ⚠ perceptual proxy unavailable ({self.reason}); "
                       "UTMOS columns will be absent.")
@@ -1597,6 +1624,187 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
 # ===========================================================================
 # Gate sweep + distance-to-switch analyses (config C)
 # ===========================================================================
+def _row_confidence(row: Dict[str, Any], gate_stat: str = "utt_min") -> Optional[float]:
+    """Utterance-level draft confidence recorded on a speculative C row.
+
+    Recomputed from the per-chunk telemetry (``utt_min`` = worst chunk,
+    ``utt_mean`` = average) so it matches exactly what the gate compares;
+    falls back to the row's ``draft_confidence`` field (which is the mean).
+    """
+    confs = [float(c.get("confidence")) for c in (row.get("chunks") or [])
+             if c.get("confidence") is not None]
+    if confs:
+        return float(np.min(confs)) if gate_stat == "utt_min" else float(np.mean(confs))
+    value = row.get("draft_confidence")
+    return None if value is None else float(value)
+
+
+def gate_confidence_table(rows: List[Dict[str, Any]],
+                          gate_stat: str = "utt_min") -> Dict[str, float]:
+    """Per-utterance draft confidence, taken from the *un-gated* C rows."""
+    out: Dict[str, float] = {}
+    for r in rows:
+        if r.get("config") != "C" or r.get("error") or r.get("fallback"):
+            continue
+        if float(r.get("gate_threshold") or 0.0) != 0.0:
+            continue
+        value = _row_confidence(r, gate_stat)
+        if value is not None:
+            out[str(r.get("utt_id"))] = value
+    return out
+
+
+def auto_gate_thresholds(rows: List[Dict[str, Any]], gate_stat: str = "utt_min",
+                         quantiles: Sequence[float] = (0.10, 0.25, 0.50, 0.75, 0.90),
+                         ) -> List[float]:
+    """Thresholds on the *observed* confidence scale (plus the un-gated 0).
+
+    Fixed thresholds are meaningless without knowing the draft's calibration:
+    a draft whose mean top-1 is ~0.1 makes tau >= 0.6 fall back on every
+    utterance, i.e. an empty Pareto curve.  Quantiles guarantee interior points.
+    """
+    conf = sorted(gate_confidence_table(rows, gate_stat).values())
+    if not conf:
+        return [0.0]
+    return [0.0] + [round(float(np.quantile(conf, float(q))), 4) for q in quantiles]
+
+
+def parse_gate_thresholds(spec: Any, rows: Optional[List[Dict[str, Any]]] = None,
+                          gate_stat: str = "utt_min") -> List[float]:
+    """``--gate-thresholds`` parser: explicit list, ``auto``, or empty."""
+    text = str(spec or "").strip()
+    if not text or text.lower() == "auto":
+        return auto_gate_thresholds(rows or [], gate_stat)
+    out: List[float] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(float(part))
+        except ValueError:
+            continue
+    return sorted(set(out)) or [0.0]
+
+
+def derive_gate_sweep(rows: List[Dict[str, Any]], thresholds: Sequence[float],
+                      gate_stat: str = "utt_min") -> List[Dict[str, Any]]:
+    """Builds the C@tau rows by combining the measured C(tau=0) and A rows.
+
+    The gate is an utterance-level decision taken *before* synthesis, so the
+    mixture at threshold tau is exactly: the speculative row for the utterances
+    the draft is confident about, and the AR row for the rest.  Deriving the
+    sweep therefore costs no GPU time and is exact for quality/acceptance; the
+    ``total_ms`` of a fallback is the sum of the two measured passes (the draft
+    pass that produces the gate statistic plus the AR pass), which is what the
+    synthesised fallback path costs as well - ``compare_gate_modes`` reports the
+    difference wherever both sweeps exist.
+    """
+    by_utt: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for r in rows:
+        if r.get("error"):
+            continue
+        utt, cfg = str(r.get("utt_id")), str(r.get("config"))
+        if cfg == "C":
+            if r.get("fallback") or float(r.get("gate_threshold") or 0.0) != 0.0:
+                continue
+            by_utt.setdefault(utt, {})["C"] = r
+        elif cfg in ("A", "B"):
+            by_utt.setdefault(utt, {})[cfg] = r
+    conf = gate_confidence_table(rows, gate_stat)
+    derived: List[Dict[str, Any]] = []
+    for tau in thresholds:
+        for utt in sorted(by_utt):
+            per = by_utt[utt]
+            c0 = per.get("C")
+            if c0 is None:
+                continue
+            value = conf.get(utt)
+            a_row = per.get("A")
+            if tau > 0.0 and value is not None and value < tau and a_row is not None:
+                total = float(a_row.get("total_ms") or 0.0) + float(c0.get("total_ms") or 0.0)
+                audio_sec = a_row.get("audio_sec")
+                derived.append({
+                    "config": "C",
+                    "utt_id": utt,
+                    "utt_index": c0.get("utt_index"),
+                    "register": c0.get("register"),
+                    "gate_threshold": float(tau),
+                    "gate_stat": gate_stat,
+                    "fallback": True,
+                    "derived": True,
+                    "verify_mode": "ar_fallback",
+                    "draft_confidence": value,
+                    "ttfa_compute_ms": a_row.get("ttfa_compute_ms"),
+                    "ttfa_e2e_ms": a_row.get("ttfa_e2e_ms"),
+                    "total_ms": total,
+                    "audio_sec": audio_sec,
+                    "rtf": (total / 1000.0) / max(float(audio_sec or 1e-3), 1e-3),
+                    "cer": a_row.get("cer"),
+                    "wer": a_row.get("wer"),
+                    "cer_latin": a_row.get("cer_latin"),
+                    "wer_latin": a_row.get("wer_latin"),
+                    "asr_text": a_row.get("asr_text"),
+                    "utmos": a_row.get("utmos"),
+                    "mcd_vs_a": 0.0,
+                    "audio_path": a_row.get("audio_path"),
+                    "accept_true": None,
+                    "accept_synth": None,
+                    "chunks": [],
+                    "zone_stats": {},
+                    "switch_frames": [],
+                })
+            else:
+                row = dict(c0)
+                row.update({
+                    "gate_threshold": float(tau),
+                    "gate_stat": gate_stat,
+                    "derived": True,
+                    "fallback": False,
+                    "draft_confidence": value,
+                })
+                derived.append(row)
+    return derived
+
+
+def compare_gate_modes(rows: List[Dict[str, Any]], derived: List[Dict[str, Any]],
+                       ) -> Optional[List[Dict[str, Any]]]:
+    """Validity check for the derived sweep: derived vs synthesised fallbacks."""
+    synth = {e["threshold"]: e for e in aggregate_gate_sweep(rows)}
+    checks: List[Dict[str, Any]] = []
+    for entry in aggregate_gate_sweep(derived):
+        ref = synth.get(entry["threshold"])
+        if ref is None or entry["threshold"] <= 0.0:
+            continue
+        if abs(ref["fallback_rate"] - entry["fallback_rate"]) > 1e-9:
+            continue  # different fallback sets - not the same operating point
+        checks.append({
+            "threshold": entry["threshold"],
+            "fallback_rate": entry["fallback_rate"],
+            "total_p50_synth_ms": (ref.get("total") or {}).get("p50"),
+            "total_p50_derived_ms": (entry.get("total") or {}).get("p50"),
+            "cer_p50_synth": (ref.get("cer") or {}).get("p50"),
+            "cer_p50_derived": (entry.get("cer") or {}).get("p50"),
+        })
+    return checks or None
+
+
+def gate_sweep_warning(gate_rows: List[Dict[str, Any]],
+                       confidence: Dict[str, float]) -> Optional[str]:
+    """Explains a degenerate sweep (every threshold makes the same decision)."""
+    rates = [e["fallback_rate"] for e in gate_rows if e["threshold"] > 0.0]
+    if not rates or any(0.0 < r < 1.0 for r in rates):
+        return None
+    if confidence:
+        p10, p50, p90 = np.percentile(list(confidence.values()), [10, 50, 90])
+        scale = (f"observed draft confidence: p10={p10:.3f} p50={p50:.3f} p90={p90:.3f}")
+    else:
+        scale = "no draft confidence recorded"
+    return (f"every requested threshold makes the same decision ({scale}); the Pareto "
+            "curve has no interior point. Use --gate-thresholds auto (quantiles of the "
+            "observed confidence) or pass thresholds inside that range.")
+
+
 def aggregate_gate_sweep(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Realised latency/quality/fallback statistics per gate threshold (config C).
 
@@ -2693,16 +2901,22 @@ def build_table_IV(switch_rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_table_V(gate_rows: List[Dict[str, Any]], config_a: Optional[Dict[str, Any]] = None) -> str:
+def build_table_V(gate_rows: List[Dict[str, Any]], config_a: Optional[Dict[str, Any]] = None,
+                  derived: bool = True, thresholds: Optional[Sequence[float]] = None) -> str:
     """Table V: confidence-gated operating points (measured latency vs quality)."""
+    how = ("Operating points are derived from the measured per-utterance hybrid and Pure-AR "
+           "results (the gate is decided before synthesis, so the mixture is exact and costs no "
+           "extra synthesis; fallback latency is the sum of the measured draft and AR passes)"
+           if derived else
+           "Each threshold was synthesised end to end, fallback cost included")
     lines = [
         "% Table V: confidence-gated speculative decoding - measured operating points",
         "\\begin{table}[t]",
         "\\centering",
-        "\\caption{Confidence-gated hybrid: the draft runs first and utterances whose worst-chunk "
-        "draft confidence falls below $\\tau$ are handed to the full AR pipeline. Latency/CER are "
-        "the measured end-to-end values of that mixture (fallback cost included); the gate turns "
-        "speculation quality into an explicit operating point rather than an assumption.}",
+        f"\\caption{{Confidence-gated hybrid: utterances whose worst-chunk draft confidence falls "
+        f"below $\\tau$ are handed to the full AR pipeline. {how}. Latency, RTF and "
+        "CER are the resulting mixture's values; the gate turns speculation quality into an "
+        "explicit operating point rather than an assumption.}",
         "\\label{tab:gate}",
         "\\begin{tabular}{cccccccc}",
         "\\toprule",
@@ -2822,10 +3036,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Parler streamer play_steps (smaller = lower TTFA, more decode calls).")
     p.add_argument("--boundary-frames", type=int, default=3,
                    help="Frames after a language switch counted as boundary zone.")
-    p.add_argument("--gate-thresholds", type=str, default="0.0",
-                   help="Comma-separated draft-confidence thresholds for config C. 0 disables the "
-                        "gate; each threshold adds its own (config, utterance, threshold) rows, so "
-                        "a single run produces the whole latency-quality operating curve.")
+    p.add_argument("--gate-thresholds", type=str, default="auto",
+                   help="Draft-confidence thresholds for config C: a comma-separated list, or "
+                        "\"auto\" (default) for quantiles of the confidence the run actually "
+                        "measures. With --gate-mode derived nothing extra is synthesised, so the "
+                        "whole latency/quality curve is free; --gate-mode synth re-synthesises C "
+                        "once per threshold.")
+    p.add_argument("--gate-mode", choices=["derived", "synth"], default="derived",
+                   help="derived (default): build the C@tau operating points from the measured "
+                        "C(tau=0) and Pure-AR rows (exact for quality/acceptance, no extra GPU "
+                        "time). synth: really synthesise the gated mixture for every threshold.")
     p.add_argument("--gate-stat", choices=["utt_min", "utt_mean"], default="utt_min",
                    help="Utterance-level draft-confidence statistic compared with the threshold "
                         "(utt_min = worst chunk, the conservative default).")
@@ -2983,7 +3203,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "residual_trained": residual_trained,
         "scorer_available": bool(scorer and scorer.available),
         "utmos_available": bool(utmos and utmos.available),
-        "utmos_model": (getattr(utmos, "model_id", None) if utmos is not None else None),
+        "utmos_model": (getattr(utmos, "source", None) or getattr(utmos, "model_id", None)
+                        if utmos is not None else None),
         "length_model": (length_model.to_dict() if length_model else None),
     }
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2994,8 +3215,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     done = {(r.get("config"), r.get("utt_id"), float(r.get("gate_threshold") or 0.0))
             for r in rows if not r.get("error")}
     utterances = EVAL_UTTERANCES[: args.limit] if args.limit else EVAL_UTTERANCES
-    gate_thresholds = [float(t) for t in str(args.gate_thresholds).split(",")
-                       if str(t).strip() != ""] or [0.0]
+    gate_mode = str(getattr(args, "gate_mode", "derived") or "derived")
+    all_gate_thresholds = parse_gate_thresholds(
+        getattr(args, "gate_thresholds", "auto"), rows, args.gate_stat)
+    if gate_mode == "derived":
+        # nothing above tau=0 needs synthesising: the sweep is derived from the
+        # measured C/A rows in _finish
+        gate_thresholds = [0.0]
+        if len(all_gate_thresholds) > 1:
+            print(f"[Gate] derived mode: synthesising C at tau=0 only; the "
+                  f"{len(all_gate_thresholds) - 1} gated operating points are computed from "
+                  "the measured rows (no extra GPU time).")
+    else:
+        if len(all_gate_thresholds) > 1 and str(args.gate_thresholds).strip().lower() == "auto":
+            raise SystemExit("[Gate] --gate-thresholds auto needs --gate-mode derived "
+                             "(thresholds cannot be calibrated before synthesis).")
+        gate_thresholds = all_gate_thresholds
 
     # ---------------- synthesis loop ----------------
     n_runs_since_gc = 0
@@ -3090,15 +3325,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: float) -> int:
-    gate_threshold = float(getattr(args, "gate_thresholds", "0.0").split(",")[0] or 0.0)
+    gate_mode = str(getattr(args, "gate_mode", "derived") or "derived")
+    thresholds = parse_gate_thresholds(getattr(args, "gate_thresholds", "auto"), rows,
+                                       getattr(args, "gate_stat", "utt_min"))
+    gate_threshold = 0.0  # Table I always reports the un-gated hybrid
     if not getattr(args, "no_mcd", False):
         attach_mcd_from_audio(rows)
     agg = aggregate_results(rows, configs, gate_threshold=gate_threshold)
-    gate_rows = aggregate_gate_sweep(rows)
+    gate_validation: Optional[List[Dict[str, Any]]] = None
+    if gate_mode == "derived":
+        derived_rows = derive_gate_sweep(rows, thresholds, getattr(args, "gate_stat", "utt_min"))
+        gate_rows = aggregate_gate_sweep(derived_rows)
+        gate_validation = compare_gate_modes(rows, derived_rows)
+    else:
+        gate_rows = aggregate_gate_sweep(rows)
+    gate_note = gate_sweep_warning(gate_rows, gate_confidence_table(
+        rows, getattr(args, "gate_stat", "utt_min")))
     switch_rows = switch_distance_table(rows)
     tables_tex = (
         build_table_I(agg) + "\n\n" + build_table_II(agg) + "\n\n" + build_table_III(agg)
-        + "\n\n" + build_table_IV(switch_rows) + "\n\n" + build_table_V(gate_rows, agg.get("A"))
+        + "\n\n" + build_table_IV(switch_rows)
+        + "\n\n" + build_table_V(gate_rows, agg.get("A"), derived=(gate_mode == "derived"),
+                                   thresholds=thresholds)
     )
     (figures_dir / "tables.tex").write_text(tables_tex, encoding="utf-8")
 
@@ -3175,6 +3423,21 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
             )
 
     print_gate_sweep(gate_rows)
+    if gate_mode == "derived":
+        print(f"[Gate] derived sweep at tau in {[round(t, 4) for t in thresholds]} "
+              f"(un-gated C + measured Pure-AR rows; no extra synthesis)")
+        if gate_validation:
+            for chk in gate_validation:
+                print(f"[Gate] validation tau={chk['threshold']:.4f} "
+                      f"fallback={chk['fallback_rate'] * 100:.1f}%: "
+                      f"total p50 derived={chk['total_p50_derived_ms']:.0f}ms vs "
+                      f"synthesised={chk['total_p50_synth_ms']:.0f}ms | "
+                      f"CER p50 {chk['cer_p50_derived']} vs {chk['cer_p50_synth']}")
+        else:
+            print("[Gate] no synthesised gated rows to validate the derived sweep against "
+                  "(run a few with --gate-mode synth --configs C if you want the check)")
+    if gate_note:
+        print(f"[Gate] ⚠ {gate_note}")
     print_switch_distance(switch_rows)
 
     fig_paths: Dict[str, List[str]] = {}
@@ -3212,6 +3475,11 @@ def _finish(rows, args, configs, results_path: Path, figures_dir: Path, t_all: f
         "configs": configs,
         "aggregates": agg,
         "gate_sweep": gate_rows,
+        "gate_mode": gate_mode,
+        "gate_thresholds": [float(t) for t in thresholds],
+        "gate_stat": getattr(args, "gate_stat", "utt_min"),
+        "gate_validation": gate_validation,
+        "gate_note": gate_note,
         "switch_distance": switch_rows,
         "figures": fig_paths,
         "tables_tex": str(figures_dir / "tables.tex"),

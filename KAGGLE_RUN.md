@@ -163,8 +163,17 @@ evaluation uses for frame sizing). A short sanity WAV is rendered at the end.
 
 ```python
 %cd /kaggle/working/codeSwitch
-!python run_full_evaluation.py --ckpt codeswitch_ckpt --gate-thresholds 0,0.6,0.75,0.9
+!python run_full_evaluation.py --ckpt codeswitch_ckpt          # gate curve comes for free
 ```
+
+Default `--gate-mode derived --gate-thresholds auto`: the run synthesises C only at τ=0 and then
+builds the whole gate curve from the measured C and Pure-AR rows (the gate is decided *before*
+synthesis, so the mixture is exact for quality/acceptance; a fallback's latency is the sum of the
+two measured passes). `auto` takes the thresholds from the confidence the draft actually shows,
+so the curve always has interior operating points — fixed thresholds like `0.6,0.75,0.9` fall
+back on every utterance when the draft's mean top-1 is ≈0.1, which produces an empty curve. Use
+`--gate-mode synth --gate-thresholds 0,0.3,0.34,0.36` if you want the gated mixture synthesised
+end to end (the run prints a derived-vs-synthesised validation line whenever both exist).
 
 * **Resume**: results are written atomically to `eval_results/raw_results.jsonl` after every
   utterance. Re-running the same command skips completed (config, utterance) pairs; broken
@@ -175,15 +184,15 @@ evaluation uses for frame sizing). A short sanity WAV is rendered at the end.
 * **Options**: `--skip-asr` (no CER/WER, everything else still runs), `--no-save-audio`,
   `--no-true-probs` (unrelated-target acceptance only), `--no-utmos`, `--no-mcd`,
   `--play-steps 12`, `--boundary-frames 3`, `--dtype fp16`.
-* **Runtime**: ≈ 35–55 min with the gate sweep — the higher thresholds hand whole utterances
-  back to the full AR path, and each fallback costs the AR path's ≈ 9 s. `--gate-thresholds 0`
-  alone is the ≈ 25–40 min run.
-* **Gate sweep**: `--gate-thresholds 0,0.6,0.75,0.9` synthesises Config C once per threshold
-  (utterance-level confidence gate on the draft's mean top-1 probability, `--gate-stat
-  utt_min|utt_mean`). All rows land in one JSONL, keyed by `(config, utt_id, gate_threshold)`;
-  Table I reports the un-gated hybrid (τ=0) and Fig. 5 + Table V are the Pareto curve.
-  Rows handed to AR are marked `verify_mode="ar_fallback"`, carry no acceptance numbers, and
-  still count for latency and CER.
+* **Runtime**: ≈ 25–40 min from scratch (whisper-small ASR included). With the default derived
+  gate sweep no extra synthesis happens; only `--gate-mode synth` pays for the fallbacks
+  (≈ 9 s each).
+* **Gate**: utterance-level confidence gate on the draft's per-chunk mean top-1 probability
+  (`--gate-stat utt_min|utt_mean`). Table I always reports the un-gated hybrid (τ=0); Fig. 5 +
+  Table V are the Pareto curve. Real `--gate-mode synth` fallback rows are marked
+  `verify_mode="ar_fallback"`, carry no acceptance numbers, and still count for latency and
+  CER. Always look at the printed `[Gate]` lines: they list the thresholds, the derived-vs-
+  synthesised validation and a warning if the curve has no interior point.
 
 The run writes:
 
@@ -257,7 +266,10 @@ Kaggle unless you want to archive them too.)
 * **Uncertainty**: every median column of Table I carries a 95 % percentile-bootstrap interval
   (2 000 resamples, fixed seed, no scipy) because 60 utterances cannot settle a 10-pt gap by
   itself. Quote the interval in the text, not just the point estimate.
-* **UTMOS / MCD**: UTMOS22 (`tarepan/SpeechMOS`, no listeners) scores every saved wav; MCD is
+* **UTMOS / MCD**: UTMOS22 (`torch.hub:tarepan/SpeechMOS:v1.2.0/utmos22_strong`, no listeners)
+  scores every saved wav — it is a torch.hub repo, *not* a transformers checkpoint, so it needs
+  GitHub access (a transformers mirror is tried as a fallback, and `run_meta.json` →
+  `utmos_model` records which loader won). If both fail the columns are simply absent. MCD is
   DTW-aligned mel-cepstral distortion against the Pure-AR rendering of the *same text* (a
   different sampling seed, so it is a distribution-level spectral distance — say so in the
   caption). Both are optional (`--no-utmos`, `--no-mcd`) and are recomputed from the wavs by
@@ -298,9 +310,10 @@ Kaggle unless you want to archive them too.)
 | `[Teacher] DAC re-encode failed: Input type (float) and bias type (c10::Half)...` | fixed — the waveform is now cast to the audio encoder's dtype before `encode()`. Pull the latest repo before re-running. |
 | `[Teacher] LM token capture validation: MISMATCH` | the printed `len_ratio`/`corr` say why; the codec fallback takes over automatically. Capture and decode both try the 3-D and 4-D code layouts now, so a mismatch with `corr ≈ 1` means the trim differs, and `decode failed` means no layout matched. |
 | `[Scorer] forward failed: ... 'last_hidden_state'` or Config C aborts with `operands could not be broadcast ... (1088,) (1024,)` | fixed — the scorer now reads the LM wrapper's `logits` (shape `(9, L, 1088)`, codebook 0 in row 0, valid codes in `[:1024]`). Pull the latest repo; the probe line must print `[Scorer] teacher-forced CB0 scoring: OK` for `acc_true` and Fig. 2 to appear. |
-| `[UTMOS] ⚠ perceptual proxy unavailable (...)` | no internet / the remote code was rejected. Everything else still runs; `run_meta.json` → `utmos_available` says so. Remove `--no-utmos` once online. |
+| `[UTMOS] ⚠ perceptual proxy unavailable (...)` | both loaders failed (hub needs GitHub access; the transformers mirror needs `trust_remote_code`). Everything else still runs; `run_meta.json` → `utmos_available` says so. |
+| `[Gate] ⚠ every requested threshold makes the same decision` | thresholds are outside the draft's confidence range (e.g. `0.6` when the draft's mean top-1 is `0.1`). Re-run with `--gate-thresholds auto` (default), which uses quantiles of the measured confidence. |
 | MCD column shows `--` | no saved wavs (`--no-save-audio`) or `soundfile`/`torchaudio` missing. Re-run (or `--replay`) with the wavs in place. |
-| `KeyError: 'residual_sched'`/old CLI flags | pull the latest repo — the corpus builder, scheduled sampling and gate sweep are all post-2026-10. |
+| `KeyError: 'residual_sched'`/old CLI flags | pull the latest repo — the corpus builder, scheduled sampling, the derived gate sweep and the new metrics are all post-2026-10. |
 | Session dies mid-run | re-run the same command(s): teacher shards and evaluated rows are resumed. |
 
 ## 7) Where the knobs live
@@ -313,4 +326,4 @@ Kaggle unless you want to archive them too.)
 * Synthesis/timing/acceptance/zone/gate/switch-distance logic + metrics + figures + tables:
   `run_full_evaluation.py`.
 * Teacher collection + distillation + scheduled sampling + checkpoints: `train_draft_distill.py`.
-* Local test suite: `python -m pytest tests/ -q` (70 tests, no GPU needed).
+* Local test suite: `python -m pytest tests/ -q` (76 tests, no GPU needed).
