@@ -3193,6 +3193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     results_path = Path(args.results)
     audio_dir = Path(args.audio_dir)
     figures_dir = Path(args.figures_dir)
+    results_path.parent.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     provenance = check_provenance(results_path, args.ckpt, force=args.force, replay=args.replay)
