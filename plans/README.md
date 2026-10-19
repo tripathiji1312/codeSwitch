@@ -59,6 +59,16 @@ matched; only line numbers moved. For 003+ executors: expect `train_draft_distil
 `run_full_evaluation.py`, `tests/*`, `KAGGLE_RUN.md` to show as changed in
 `git diff --stat d69b399..HEAD`; verify by content, never by line number.
 
+**Notebook amendment (2026-10-19, pre-run).** `CodeSwitch_TTS_Kaggle.ipynb` was re-shaped for
+the 2000-line re-run on the same day: the distillation cell is split into phase 1 (teacher) and
+phase 2 (train, now `--min-epochs 300`); new cells add the CB0-only diagnostic and a listening
+step; the evaluation cell uses `--asr-model openai/whisper-large-v3` with fresh `*_2k` output
+dirs; the artifact cell zips those. Cells that were `>= 19` in the pre-big-run layout shift by
+**+4** (plans quoting "markdown cells 21/23" find them at 25/27; cells `< 19` stay put). A new
+standalone `CodeSwitch_BigRun_Kaggle.ipynb` mirrors the flow without the demo cells. Plans
+003/004/005/007/011/012 touch this notebook — their anchors are content strings and still
+match; only the quoted cell indices move.
+
 ## Status table
 
 Statuses: `TODO` · `IN PROGRESS` · `DONE` · `BLOCKED` · `REJECTED`.
