@@ -3012,7 +3012,7 @@ def build_table_V(gate_rows: List[Dict[str, Any]], config_a: Optional[Dict[str, 
             _tex((entry.get("rtf") or {}).get("mean"), 2),
             _tex(None if (entry.get("cer") or {}).get("p50") is None
                  else float(entry["cer"]["p50"]) * 100.0, 1),
-            _mean_pm(entry.get("accept_true") or {}, "mean"),
+            _pm(entry.get("accept_true") or {}),
         ]) + " \\\\")
     if config_a and (config_a.get("n") or 0) > 0:
         lines.append("\\midrule")

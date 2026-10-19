@@ -802,6 +802,16 @@ def test_table_five_caption_states_the_gate_mode():
     assert "0.15" in derived_tex and "50.0" in derived_tex
 
 
+def test_table_five_cb0_reports_std():
+    sweep = [{
+        "threshold": 0.85, "n": 2, "fallback_utts": 0, "fallback_rate": 0.0,
+        "accept_true": R._stats([40.0, 50.0]),
+    }]
+    tex = R.build_table_V(sweep, None, derived=True, thresholds=[0.85])
+    # mean 45.0, population std 5.0 -> real dispersion, not "+/-0.0"
+    assert "45.0$\\pm$5.0" in tex
+
+
 def test_gate_threshold_filtering_in_aggregate():
     rows = _fabricated_rows()
     default = R.aggregate_results(rows, ["C"], gate_threshold=0.0)
