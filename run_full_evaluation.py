@@ -1668,8 +1668,8 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
             "errors": len(err),
             "ttfa_compute": _stats([r.get("ttfa_compute_ms") for r in ok]),
             "ttfa_e2e": _stats([r.get("ttfa_e2e_ms") for r in ok]),
-            "ttfa_compute_cold": first.get("ttfa_compute_ms"),
-            "ttfa_e2e_cold": first.get("ttfa_e2e_ms"),
+            "ttfa_compute_cold": _stats([first.get("ttfa_compute_ms")]),
+            "ttfa_e2e_cold": _stats([first.get("ttfa_e2e_ms")]),
             "ttfa_compute_warm": _stats([r.get("ttfa_compute_ms") for r in warm], ci=True),
             "ttfa_e2e_warm": _stats([r.get("ttfa_e2e_ms") for r in warm], ci=True),
             "total": _stats([r.get("total_ms") for r in ok]),
@@ -2176,7 +2176,7 @@ def figure1_latency_quality(agg: Dict[str, Dict[str, Any]], out_dir: Path) -> Op
     drawn_a = _panel(axes[0], "ttfa_compute_warm", "TTFA (ms, log scale)", title_a)
     has_cold = False
     for i, c in enumerate(configs):
-        cold = agg[c].get("ttfa_compute_cold")
+        cold = (agg[c].get("ttfa_compute_cold") or {}).get("p50")
         if cold is None:
             continue
         axes[0].scatter([i + 0.30], [float(cold)], marker="x", s=24, color="black",
@@ -2640,7 +2640,7 @@ def build_table_I(agg: Dict[str, Dict[str, Any]]) -> str:
         mcd_stat = a.get("mcd_vs_a") or {}
         cells = [
             CONFIG_LABELS[cfg],
-            _tex(a.get("ttfa_compute_cold"), 0),
+            _tex((a.get("ttfa_compute_cold") or {}).get("p50"), 0),
             _tex_ci(a.get("ttfa_compute_warm"), 0) or _tex(_stat("ttfa_compute", "p50"), 0),
             _tex(_stat("ttfa_compute", "p90"), 0),
             _tex(_stat("ttfa_e2e", "p50"), 0),

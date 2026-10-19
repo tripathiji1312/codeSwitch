@@ -351,7 +351,9 @@ def test_aggregation_and_zone_weighting():
     assert agg["A"]["n"] == 3 and agg["C"]["n"] == 3
     assert agg["B"]["n"] == 0
     assert agg["C"]["ttfa_compute"]["p50"] == pytest.approx(265.0)
-    assert agg["C"]["ttfa_compute_cold"] == pytest.approx(260.0)
+    cold = agg["C"]["ttfa_compute_cold"]
+    assert cold["n"] == 1 and cold["p50"] == pytest.approx(260.0)
+    assert agg["C"]["ttfa_e2e_cold"]["p50"] == pytest.approx(300.0)
     # warm excludes the first utterance
     assert agg["C"]["ttfa_compute_warm"]["n"] == 2
     assert agg["C"]["cer"]["mean"] == pytest.approx((0.15 + 0.145 + 0.14) / 3)
