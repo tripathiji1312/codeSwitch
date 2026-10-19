@@ -816,16 +816,21 @@ def test_table_five_cb0_reports_std():
     assert "45.0$\\pm$5.0" in tex
 
 
-def test_gate_threshold_filtering_in_aggregate():
+def test_gate_threshold_filtering_in_aggregate(capsys):
     rows = _fabricated_rows()
     default = R.aggregate_results(rows, ["C"], gate_threshold=0.0)
     gated = R.aggregate_results(rows, ["C"], gate_threshold=0.5)
     assert default["C"]["n"] == 3          # un-gated rows only
+    assert default["C"]["gate_threshold_used"] == pytest.approx(0.0)
     assert gated["C"]["n"] == 3            # 2 speculative + 1 fallback row
     assert gated["C"]["fallback_utts"] == 1
-    # a threshold with no rows at all never empties the comparison (all C rows used)
+    assert gated["C"]["gate_threshold_used"] == pytest.approx(0.5)
+    # a threshold with no rows falls back to the smallest measured tau, warns,
+    # and never pools different taus into one row
     fallback = R.aggregate_results(rows, ["C"], gate_threshold=0.9)
-    assert fallback["C"]["n"] == 6
+    assert fallback["C"]["n"] == 3
+    assert fallback["C"]["gate_threshold_used"] == pytest.approx(0.0)
+    assert "WARNING" in capsys.readouterr().out
 
 
 def test_synth_C_falls_back_below_threshold(monkeypatch):

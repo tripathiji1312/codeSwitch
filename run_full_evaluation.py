@@ -1613,14 +1613,20 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
     for cfg in configs:
         ok = [r for r in rows if r.get("config") == cfg and not r.get("error")]
         err = [r for r in rows if r.get("config") == cfg and r.get("error")]
-        if cfg == "C" and any(float(r.get("gate_threshold") or 0.0) != float(gate_threshold)
-                              for r in ok):
-            filtered = [r for r in ok
-                        if float(r.get("gate_threshold") or 0.0) == float(gate_threshold)]
-            if filtered:  # never let the gate sweep empty the main comparison
-                ok = filtered
+        used_threshold = float(gate_threshold)
+        if cfg == "C" and ok:
+            present = sorted({float(r.get("gate_threshold") or 0.0) for r in ok})
+            if used_threshold not in present:
+                used_threshold = present[0]  # smallest measured tau; never pool tau values
+                print(f"[Gate] WARNING: Table I requested tau={float(gate_threshold):.2f} "
+                      f"but no config-C rows exist at that threshold; using "
+                      f"tau={used_threshold:.2f} (measured: {present}). Refresh rows with "
+                      f"--force or pass a matching --gate-thresholds to get the requested tau.")
+            if any(t != used_threshold for t in present):
+                ok = [r for r in ok
+                      if float(r.get("gate_threshold") or 0.0) == used_threshold]
                 err = [r for r in err
-                       if float(r.get("gate_threshold") or 0.0) == float(gate_threshold)]
+                       if float(r.get("gate_threshold") or 0.0) == used_threshold]
         if not ok:
             agg[cfg] = {"n": 0, "errors": len(err)}
             continue
@@ -1694,6 +1700,7 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
             "fallback_utts": sum(1 for r in ok if r.get("fallback")),
             "fallback_rate": (sum(1 for r in ok if r.get("fallback")) / len(ok)) if ok else None,
             "gate_threshold": float(gate_threshold) if cfg == "C" else None,
+            "gate_threshold_used": used_threshold if cfg == "C" else None,
             "gate_stat": next((r.get("gate_stat") for r in ok if r.get("gate_stat")), None),
             "verify_modes": sorted({str(r.get("verify_mode")) for r in ok}),
             "registers": registers,
