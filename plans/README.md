@@ -69,6 +69,14 @@ standalone `CodeSwitch_BigRun_Kaggle.ipynb` mirrors the flow without the demo ce
 003/004/005/007/011/012 touch this notebook — their anchors are content strings and still
 match; only the quoted cell indices move.
 
+**Command fix (2026-10-19, pre-run).** The `train_draft_distill.py` invocations in both
+notebooks and the launch pack now pass `--num-sentences 2000`. Previously none passed it —
+and the trainer silently caps any external corpus at its 300-sentence default
+(`train_draft_distill.py:1182`), so runs that followed the old commands trained on 300
+sentences, not the full 2 000. (`KAGGLE_RUN.md` §2b still shows the flag-less commands —
+that file is owned by plans 003-012 and was left untouched.) Plans quoting those commands
+should drift-check by content.
+
 ## Status table
 
 Statuses: `TODO` · `IN PROGRESS` · `DONE` · `BLOCKED` · `REJECTED`.
