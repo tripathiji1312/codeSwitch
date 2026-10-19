@@ -42,6 +42,23 @@ descendant) and `d69b399`.
 
 `plans/` is tracked on `main` as of the bundle commit; drift checks have a stable reference.
 
+## Baseline amendment #2 (2026-10-19, post-bundle)
+
+The bundle was followed by three companion commits and then plans 001–002 (all on `main`):
+
+- **`b3167a6`** — `--min-epochs` floor before early stopping in both trainers
+  (`train_draft_distill.py`; +2 tests in `tests/test_corpus_builder.py`).
+- **`0ee2652`** — ASR generation capped by audio length (`run_full_evaluation.py`; +1 test).
+- **`47d8a01`** — `KAGGLE_RUN.md` count sync. **Pre-plan baseline is 101 tests, not 98.**
+- **`70577dd`…`9f1256c`** (plan 001, 5 commits) and **`9cd0f40`** (plan 002, 1 commit) —
+  executed on their branches and merged fast-forward (branches kept). Current count: **103**;
+  terminal sanity check from here: 103 + 23 = 126 (never an assertion).
+
+Both plans' drift checks re-verified every excerpt against the live files **by content** — all
+matched; only line numbers moved. For 003+ executors: expect `train_draft_distill.py`,
+`run_full_evaluation.py`, `tests/*`, `KAGGLE_RUN.md` to show as changed in
+`git diff --stat d69b399..HEAD`; verify by content, never by line number.
+
 ## Status table
 
 Statuses: `TODO` · `IN PROGRESS` · `DONE` · `BLOCKED` · `REJECTED`.
