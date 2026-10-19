@@ -424,4 +424,4 @@ Kaggle unless you want to archive them too.)
 * Teacher collection + distillation + scheduled sampling + checkpoints: `train_draft_distill.py`.
 * W&B upload (scalars, panels, tables, media, artifact): `push_to_wandb.py`; `--wandb` on
   `run_full_evaluation.py` calls it at the end, and the notebook has a dedicated cell (§3b).
-* Local test suite: `python -m pytest tests/ -q` (101 tests, no GPU and no network needed).
+* Local test suite: `python -m pytest tests/ -q` (102 tests, no GPU and no network needed).

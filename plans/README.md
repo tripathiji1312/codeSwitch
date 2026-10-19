@@ -48,7 +48,7 @@ Statuses: `TODO` · `IN PROGRESS` · `DONE` · `BLOCKED` · `REJECTED`.
 
 | # | Plan | Priority | Effort | Δ tests | Branch | Status |
 |---|---|---|---|---|---|---|
-| 001 | [paper-table-stats-fixes](001-paper-table-stats-fixes.md) | P1 | S | +1 | `advisor/001-paper-table-stats` | TODO |
+| 001 | [paper-table-stats-fixes](001-paper-table-stats-fixes.md) | P1 | S | +1 | `advisor/001-paper-table-stats` | DONE |
 | 002 | [residual-window-coverage](002-residual-window-coverage.md) | P1 | S | +1 | `advisor/002-residual-window-coverage` | TODO |
 | 003 | [demo-verifier-honesty](003-demo-verifier-honesty.md) | P1 | M | +3 | `advisor/003-demo-verifier-honesty` | TODO |
 | 004 | [honest-engine-telemetry](004-honest-engine-telemetry.md) | P1 | S–M | +1 | `advisor/004-honest-telemetry` | TODO |
