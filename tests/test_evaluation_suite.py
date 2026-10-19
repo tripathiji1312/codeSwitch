@@ -611,6 +611,28 @@ def test_module_arg_parsers_exist():
     assert train_args.dry_run is False
 
 
+def test_residual_windows_cover_shard_tails(capsys):
+    import train_draft_distill as T
+
+    trainer = T.ResidualTrainer.__new__(T.ResidualTrainer)  # build_windows needs only WINDOW
+
+    def _shard(index, frames):
+        return T.TeacherShard(
+            index=index, raw_text="x", norm_text="x", n_chars=1, frames=frames,
+            codes=np.zeros((9, frames), dtype=np.int32), audio_sec=1.0,
+            target_source="lm", gen_ms=1.0)
+
+    # t=120: the 34-frame tail window is kept -> full coverage, nothing dropped
+    windows = trainer.build_windows([_shard(0, 120)])
+    assert [w[0].shape[0] for w in windows] == [86, 34]
+    assert "frames dropped" not in capsys.readouterr().out
+
+    # t=100: the 14-frame tail is below the 24-frame minimum -> dropped + logged
+    windows = trainer.build_windows([_shard(1, 100)])
+    assert [w[0].shape[0] for w in windows] == [86]
+    assert "14 frames dropped" in capsys.readouterr().out
+
+
 # ===========================================================================
 # Confidence gate, frame telemetry, distance-to-switch analysis
 # ===========================================================================

@@ -908,16 +908,24 @@ class ResidualTrainer:
     def build_windows(self, shards: List[TeacherShard],
                       draft_cb0: Optional[Dict[int, np.ndarray]] = None):
         windows = []
+        total_frames = 0
+        windowed_frames = 0
         for s in shards:
             t = s.frames
+            total_frames += int(t)
             draft_tokens = (draft_cb0 or {}).get(int(s.index))
-            for start in range(0, max(1, t - self.WINDOW + 1), self.WINDOW):
-                end = min(start + self.WINDOW, t)
+            for start in range(0, int(t), self.WINDOW):
+                end = min(start + self.WINDOW, int(t))
                 if end - start < 24:
                     continue
+                windowed_frames += end - start
                 draft_slice = (draft_tokens[start:end]
                                if draft_tokens is not None else None)
                 windows.append((s.codes[0, start:end], s.codes[1:9, start:end], draft_slice))
+        dropped = total_frames - windowed_frames
+        if dropped:
+            print(f"[Residual] windows cover {windowed_frames}/{total_frames} teacher "
+                  f"frames; {dropped} frames dropped (tails shorter than 24 frames)")
         return windows
 
     def _batches(self, windows, shuffle: bool, sched_p: float = 0.0, rng=None):
