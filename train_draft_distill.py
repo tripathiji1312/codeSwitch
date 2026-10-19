@@ -910,22 +910,31 @@ class ResidualTrainer:
         windows = []
         total_frames = 0
         windowed_frames = 0
+        short_shards = 0
         for s in shards:
-            t = s.frames
-            total_frames += int(t)
+            t = int(s.frames)
+            total_frames += t
+            if t < self.WINDOW:
+                # Cannot form even one full window; excluded from residual training.
+                short_shards += 1
+                continue
+            windowed_frames += t  # windows tile [0, t) exactly, so coverage is full
             draft_tokens = (draft_cb0 or {}).get(int(s.index))
-            for start in range(0, int(t), self.WINDOW):
-                end = min(start + self.WINDOW, int(t))
-                if end - start < 24:
-                    continue
-                windowed_frames += end - start
+            for start in range(0, t, self.WINDOW):
+                end = min(start + self.WINDOW, t)
+                if end - start < self.WINDOW:
+                    # Right-align the trailing window: every window must be exactly
+                    # WINDOW frames or batch stacking (_batches) breaks on ragged tails.
+                    start = t - self.WINDOW
+                    end = t
                 draft_slice = (draft_tokens[start:end]
                                if draft_tokens is not None else None)
                 windows.append((s.codes[0, start:end], s.codes[1:9, start:end], draft_slice))
         dropped = total_frames - windowed_frames
         if dropped:
             print(f"[Residual] windows cover {windowed_frames}/{total_frames} teacher "
-                  f"frames; {dropped} frames dropped (tails shorter than 24 frames)")
+                  f"frames; {dropped} frames dropped ({short_shards} shard(s) shorter "
+                  f"than {self.WINDOW} frames)")
         return windows
 
     def _batches(self, windows, shuffle: bool, sched_p: float = 0.0, rng=None):
@@ -942,6 +951,12 @@ class ResidualTrainer:
                     inputs.append(draft_cb0)
                 else:
                     inputs.append(teacher_cb0)
+            lengths = {int(x.shape[0]) for x in inputs}
+            if len(lengths) > 1:
+                raise ValueError(
+                    f"residual batch mixes {sorted(lengths)}-frame windows; "
+                    "build_windows must emit fixed-length windows"
+                )
             cb0 = torch.stack([torch.from_numpy(x).long() for x in inputs]).to(self.device)
             tgt = torch.stack([torch.from_numpy(windows[j][1]).long() for j in idx]).to(self.device)
             yield cb0, tgt

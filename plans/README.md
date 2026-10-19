@@ -77,6 +77,16 @@ sentences, not the full 2 000. (`KAGGLE_RUN.md` §2b still shows the flag-less c
 that file is owned by plans 003-012 and was left untouched.) Plans quoting those commands
 should drift-check by content.
 
+**Hotfix (2026-10-19, post-plan-002).** Plan 002's tail-coverage change kept *ragged
+trailing* windows (`t mod 86` frames, e.g. 75), and `_batches` stacks raw windows — the
+first big run crashed at the first residual batch (`RuntimeError: stack expects each tensor
+to be equal size, but got [86] ... and [75]`, `train_draft_distill.py:945`) after both the
+teacher pass (2 000/2 000 shards, 5 h 36 m) and the draft stage (best val 5.1146, CB0 top-1
+7.45% ≈ 76× chance) had succeeded. `build_windows` now right-aligns the trailing window
+(every window exactly `WINDOW` = 86 frames; full frame coverage; shards shorter than
+`WINDOW` excluded and logged) and `_batches` raises a clear `ValueError` if window lengths
+ever mix again. The plan-002 window test now checks the uniform-length contract.
+
 ## Status table
 
 Statuses: `TODO` · `IN PROGRESS` · `DONE` · `BLOCKED` · `REJECTED`.

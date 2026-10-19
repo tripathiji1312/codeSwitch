@@ -622,15 +622,23 @@ def test_residual_windows_cover_shard_tails(capsys):
             codes=np.zeros((9, frames), dtype=np.int32), audio_sec=1.0,
             target_source="lm", gen_ms=1.0)
 
-    # t=120: the 34-frame tail window is kept -> full coverage, nothing dropped
+    # t=120: the 34-frame tail is right-aligned into a full window -> every window is
+    # exactly WINDOW frames and coverage stays complete (nothing dropped).
     windows = trainer.build_windows([_shard(0, 120)])
-    assert [w[0].shape[0] for w in windows] == [86, 34]
+    assert [w[0].shape[0] for w in windows] == [86, 86]
+    assert [w[1].shape[1] for w in windows] == [86, 86]
     assert "frames dropped" not in capsys.readouterr().out
 
-    # t=100: the 14-frame tail is below the 24-frame minimum -> dropped + logged
-    windows = trainer.build_windows([_shard(1, 100)])
-    assert [w[0].shape[0] for w in windows] == [86]
-    assert "14 frames dropped" in capsys.readouterr().out
+    # Regression: ragged tail windows (86 + 75) used to reach torch.stack in _batches
+    # and crash the residual stage on the 2026-10-19 Kaggle run.
+    windows = trainer.build_windows([_shard(0, 430), _shard(1, 429), _shard(2, 110)])
+    assert len({w[0].shape[0] for w in windows}) == 1
+    assert all(w[0].shape[0] == 86 for w in windows)
+
+    # A shard shorter than one window cannot be trained on -> excluded and logged.
+    windows = trainer.build_windows([_shard(3, 85)])
+    assert windows == []
+    assert "85 frames dropped" in capsys.readouterr().out
 
 
 # ===========================================================================
