@@ -370,11 +370,14 @@ SWITCH_DIST_BUCKETS: List[Tuple[str, int, int]] = [
 def switch_distances(n_frames: int, switch_frames: Sequence[int]) -> np.ndarray:
     """Frames since the most recent Tamil<->Latin switch per frame.
 
-    Frames before the first switch (or in utterances without switches) get the
-    sentinel ``n_frames``, i.e. they fall in the ``16+`` bucket.
+    Frames before the first switch (or in utterances without switches) get a
+    sentinel that is guaranteed to land in the ``16+`` reference bucket:
+    ``max(n_frames, 16)``.  Using ``n_frames`` alone would send short
+    utterances' sentinel frames into the low-distance buckets.
     """
     n = max(0, int(n_frames))
-    dist = np.full(n, n, dtype=np.int64)
+    sentinel = max(n, 16)
+    dist = np.full(n, sentinel, dtype=np.int64)
     if n == 0:
         return dist
     switches = sorted({int(s) for s in (switch_frames or []) if 0 <= int(s) < n})
@@ -384,7 +387,7 @@ def switch_distances(n_frames: int, switch_frames: Sequence[int]) -> np.ndarray:
     for s in switches:
         last[s:] = s
     dist = np.arange(n, dtype=np.int64) - last
-    dist[: switches[0]] = n
+    dist[: switches[0]] = sentinel
     return dist
 
 

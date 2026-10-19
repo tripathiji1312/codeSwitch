@@ -622,7 +622,11 @@ def test_switch_distances_and_buckets():
     assert dist[12] == 0 and dist[19] == 7
     assert dist.dtype.kind == "i"
     # no switches -> everything far
-    assert (R.switch_distances(10, []) == 10).all()
+    # short utterance: sentinel is max(n, 16) so it cannot land in a low bucket
+    assert (R.switch_distances(10, []) == 16).all()
+    short = R.switch_distances(10, [3])
+    assert short[0] == 16 and short[3] == 0
+    assert ((short >= 16) & (short < 10 ** 9)).sum() == 3  # frames 0-2
     # no frames -> empty
     assert R.switch_distances(0, [1]).size == 0
 
