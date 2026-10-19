@@ -87,6 +87,17 @@ teacher pass (2 000/2 000 shards, 5 h 36 m) and the draft stage (best val 5.1146
 `WINDOW` excluded and logged) and `_batches` raises a clear `ValueError` if window lengths
 ever mix again. The plan-002 window test now checks the uniform-length contract.
 
+**W&B artifact backups (2026-10-19, post-hotfix).** `push_artifacts_to_wandb.py` (new) snapshots
+the run's expensive outputs to W&B as artifacts so a dead Kaggle session can no longer cost the
+5.5 h teacher pass: `--group teacher` → `codeswitch-teacher-cache` (`teacher_cache/` + corpus +
+stats), `--group student` → `codeswitch-student` (`codeswitch_ckpt/`), `--group bundle` →
+`codeswitch-artifacts` (final zip). Entry names are fixed, so `--download <group> --dest .`
+(`/kaggle/working` for the bundle) restores the exact repo-relative layout; `:latest` always
+resolves to the newest push. The teacher / train / zip cells of both notebooks now end with the
+push (`!pip install -q wandb` first; a missing key or flaky upload warns and continues), and the
+stale "Save Version" advice was replaced — Quick Save is not a reliable `/kaggle/working`
+backup. Tests: `tests/test_push_artifacts.py` (17 cases; suite 103 → 120).
+
 ## Status table
 
 Statuses: `TODO` · `IN PROGRESS` · `DONE` · `BLOCKED` · `REJECTED`.
