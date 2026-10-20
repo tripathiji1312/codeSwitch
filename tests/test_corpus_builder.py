@@ -221,6 +221,30 @@ def test_code_stats_flags_constant_argmax():
     assert varied["entropy_nats"] > 0.0
 
 
+def test_draft_prior_adjustment_changes_argmax():
+    from tune_draft_prior import apply_prior_adjustment
+
+    logits = np.array([[2.0, 0.0, 0.0]], dtype=np.float32)
+    # token 0 has a strong global prior; token 1 wins after prior correction.
+    log_prior = np.log(np.array([0.8, 0.1, 0.1], dtype=np.float32))
+    adjusted = apply_prior_adjustment(logits, log_prior, alpha=1.0)
+    assert int(adjusted.argmax(axis=-1)[0]) == 1
+    with pytest.raises(ValueError):
+        apply_prior_adjustment(np.zeros((1, 2), dtype=np.float32), log_prior, 1.0)
+
+
+def test_teacher_prior_uses_cb0_only():
+    from tune_draft_prior import teacher_prior
+
+    class _Shard:
+        codes = np.array([[0, 0, 0, 1], [9, 9, 9, 9]], dtype=np.int64)
+
+    log_prior, counts = teacher_prior([_Shard(), _Shard()])
+    assert log_prior.shape == (1024,)
+    assert int(counts[0]) == 6 and int(counts[1]) == 2
+    assert int(log_prior.argmax()) == 0
+
+
 # ===========================================================================
 # Teacher-cache validation (corpus change safety)
 # ===========================================================================

@@ -173,14 +173,36 @@ This is not a ramp or selection miss (`best_epoch_any=149`,
 the residual works on teacher CB0 but not on the draft CB0 it sees at
 inference. The v3 `student_full_argmax` WAV is also near-silent
 (`rms≈0.0098`, `flat≈0.622`, `zcr≈0.199`) while `student_full_sample` and
-`teacher_cb0_student_res_argmax` are normal, so the next diagnostic must
-separate draft-argmax collapse from residual-argmax failure before another
-training run. `diagnose_audio_bug.py` now writes
+`teacher_cb0_student_res_argmax` are normal. `diagnose_audio_bug.py` now writes
 `student_cb0_argmax_teacher_res`, `student_cb0_argmax_res_sample`,
 `student_cb0_sample_res_argmax`, and `student_cb0_only_argmax`, and records
 CB0 uniqueness/top-token/run-length/entropy for draft sample vs argmax.
-Do not run the one-sentence smoke or the 60-utterance suite until that
-isolation is read and the draft path is fixed. Test count is now `132`.
+
+**2026-10-21 argmax isolation result (draft mode collapse).** The new hybrid
+paths are conclusive. On all 4 shards, draft sample and draft argmax are not
+the same sequence:
+
+| stat | sample | argmax |
+|---|---:|---:|
+| unique tokens | 152.25 | 1.50 |
+| top-token fraction | 8.7 % | 99.9 % |
+| longest run | 2.5 frames | 382.75 frames |
+| CB0 entropy | 4.51 nats | 0.01 nats |
+
+The argmax path emits token `568` for the whole utterance. That is why
+`student_cb0_argmax_teacher_res` is muffled (constant coarse code, teacher
+fine codes) and `student_full_argmax` is silent (constant coarse code, v3
+residual trained on the same constant code). It also means the residual-only
+v3 scheduled-sampling input was degenerate: `precompute_draft_cb0` uses
+`sample=False`, so the residual never saw a varied draft-CB0 sequence.
+**Do not run another residual-only v3-style run.** The next step is
+`tune_draft_prior.py`, a no-retrain sweep that subtracts
+`alpha * log p_teacher(token)` from the draft logits and reports CB0 top-1,
+sequence diversity, residual top-1, and teacher-residual WAVs. If no alpha
+produces a varied, intelligible CB0, retrain the draft with a sequence-level
+diversity/regularization objective before touching the residual. Do not run the
+one-sentence smoke or the 60-utterance suite until the draft path is fixed.
+Test count is now `134`.
 
 Before the 60-utterance run, `CodeSwitch_013_RunAll_Kaggle.ipynb` now synthesizes
 one held-out sentence (`ta-01`) in `argmax` mode, prints draft CB0 / residual
