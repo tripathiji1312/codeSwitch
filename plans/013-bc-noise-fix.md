@@ -742,6 +742,10 @@ overwritten; a later `--skip-draft` residual run silently disables scheduled
 sampling (`train_draft_distill.py:1331`). The single training command is Phase
 4f, which trains both stages in order. If you need a draft curve for debugging,
 use `--dry-run` locally or inspect the combined run's `meta.json["draft"]`.
+**Always pass `--ckpt-dir /tmp/codeswitch_dryrun` with `--dry-run`:** the dry run
+writes real checkpoint files to the default `codeswitch_ckpt` and will overwrite
+a restored v1. This happened once during implementation; the v1 artifact remains
+in W&B, but a local copy must be re-restored with a valid `WANDB_API_KEY`.
 
 **3e. Test** — add to `tests/test_corpus_builder.py` (local import, matching the
 file's existing style at `:381,407`):
@@ -1113,7 +1117,8 @@ Phase 2
 
 Phase 3–4
 - [ ] `test_length_bucketed_order_keeps_lengths_together` passes.
-- [ ] `--dry-run` still passes on CPU.
+- [ ] `--dry-run --ckpt-dir /tmp/codeswitch_dryrun` still passes on CPU (never
+      run it with the default checkpoint directory).
 - [ ] On Kaggle, `codeswitch_ckpt_v2/meta.json` `draft.best_epoch` and `draft.val_top1` are recorded and compared against the restored v1 `meta.json` (`0.074269` in the run context); the plan does not hardcode a new top-1 threshold.
 - [ ] `codeswitch_ckpt_v2/meta.json` shows `residual.epochs_run >= 60` and
       `residual.final_sched_p >= 0.95` (the actual epoch-based ramp, not just
