@@ -3390,7 +3390,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     def _mode_key(row: Dict[str, Any], cfg: str) -> str:
         if cfg == "A":
             return "n/a"
-        return str(row.get("sample_mode") or sample_mode)
+        # Rows written before this flag existed were sampled; do not relabel
+        # them as the current run's mode on resume.
+        return str(row.get("sample_mode") or "sample")
 
     done = {(r.get("config"), r.get("utt_id"), float(r.get("gate_threshold") or 0.0),
              _mode_key(r, r.get("config")))

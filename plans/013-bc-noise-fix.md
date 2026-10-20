@@ -636,9 +636,11 @@ the mode at **all** key sites. `_base_row` now writes `"n/a"` for A, so
 # before the loop
 sample_mode = str(getattr(args, "sample_mode", "sample"))
 def _mode_key(row, cfg):
-    return str(row.get("sample_mode") or "n/a") if cfg == "A" else str(
-        row.get("sample_mode") or sample_mode
-    )
+    if cfg == "A":
+        return "n/a"
+    # Rows written before this flag existed were sampled; do not relabel them
+    # as the current run's mode on resume.
+    return str(row.get("sample_mode") or "sample")
 
 done = {(r.get("config"), r.get("utt_id"), float(r.get("gate_threshold") or 0.0),
          _mode_key(r, r.get("config")))
