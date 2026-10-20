@@ -126,6 +126,36 @@ execute 013 first and rebase 006 by content (or drop 006's DAC-loader section).
 Code/tests for Phases 1–4 have landed on `fix/013-bc-noise`; the Kaggle retrain,
 argmax evaluation, and quality gates are still pending.
 
+**2026-10-20 residual-only amendment (post-v2 listening).** The matched v2
+hybrids isolate the residual as the primary bottleneck: `teacher_full` is clear,
+`student_cb0_argmax_teacher_res` is muffled but understandable, and
+`teacher_cb0_student_res_argmax` is robotic. The v2 residual also selected its
+best state on **teacher** CB0 (`best_epoch=11`) and stopped at 3.3 % draft
+scheduled sampling, so the saved state never saw the inference distribution.
+The next run is residual-only from the v2 draft, not another combined run:
+
+```bash
+python train_draft_distill.py --skip-teacher --skip-draft \
+  --draft-ckpt codeswitch_ckpt_v2 \
+  --residual-epochs 150 --residual-ramp-epochs 100 --residual-sched 1.0 \
+  --residual-d-model 512 --residual-layers 6 \
+  --min-epochs 150 --max-minutes-residual 90 \
+  --ckpt-dir codeswitch_ckpt_v3
+```
+
+`train_draft_distill.py` now loads the real draft under `--skip-draft` (fails
+closed without `--draft-ckpt` for a residual run), copies it into the output
+directory, validates on **draft CB0**, and deploys the best state found during
+the **full-draft hold** (not an early pre-ramp state). It records
+`best_sched_p`/`best_val_sched_p`/`best_epoch_any`/teacher-vs-draft top-1,
+supports a 6-block residual (`_RESIDUAL_DILATIONS=(1,2,4,8,16,32)`), and holds
+the full draft for the post-ramp epochs. The Kaggle notebook defaults to
+`DO_TRAIN=False`, `DO_RESIDUAL_RETRAIN=True`, `CKPT_V3`, and uses `EVAL_CKPT`
+in the push/diagnostic/smoke/eval/bundle cells. Tests: `131 passed`
+(`movio/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`). The 5 %
+`rt_a`/`rd_a` gate is unchanged; do not run the 60-utterance suite until the v3
+diagnostic passes and the one-sentence argmax WAV is confirmed intelligible.
+
 Before the 60-utterance run, `CodeSwitch_013_RunAll_Kaggle.ipynb` now synthesizes
 one held-out sentence (`ta-01`) in `argmax` mode, prints draft CB0 / residual
 top-1 against a fresh Parler teacher target, and saves

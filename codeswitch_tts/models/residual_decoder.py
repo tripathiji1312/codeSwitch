@@ -19,6 +19,11 @@ from codeswitch_tts.config import ResidualModelConfig
 from codeswitch_tts.models.draft_transformer import PositionalEncoding
 
 
+# Exponentially growing receptive field.  The original four blocks covered
+# ~61 frames; the capacity-bumped residual uses all six for ~253 frames.
+_RESIDUAL_DILATIONS = (1, 2, 4, 8, 16, 32)
+
+
 @dataclass
 class ResidualOutput:
     """Output container for the Hierarchical Residual Decoder."""
@@ -62,8 +67,13 @@ class ResidualDecoder(nn.Module):
         self.cb0_embedding = nn.Embedding(self.config.codebook_size, self.config.d_model)
         self.pos_encoder = PositionalEncoding(self.config.d_model, max_len=2048)
 
-        # 4 Dilated Residual Blocks with exponentially growing receptive field
-        dilations = [1, 2, 4, 8]
+        # Dilated residual blocks with exponentially growing receptive field.
+        # The config may request up to the six supported dilation rates.
+        if self.config.num_layers > len(_RESIDUAL_DILATIONS):
+            raise ValueError(
+                f"ResidualModelConfig.num_layers={self.config.num_layers} exceeds "
+                f"the {len(_RESIDUAL_DILATIONS)} supported dilations"
+            )
         self.blocks = nn.ModuleList([
             ResidualBlock1D(
                 channels=self.config.d_model,
@@ -71,7 +81,7 @@ class ResidualDecoder(nn.Module):
                 dilation=d,
                 dropout=self.config.dropout,
             )
-            for d in dilations[:self.config.num_layers]
+            for d in _RESIDUAL_DILATIONS[:self.config.num_layers]
         ])
 
         # 8 parallel heads: one for each residual codebook (1 through 8)

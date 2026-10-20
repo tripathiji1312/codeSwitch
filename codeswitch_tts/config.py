@@ -45,7 +45,7 @@ class DraftModelConfig:
 class ResidualModelConfig:
     """Hierarchical Residual Decoder architecture for Codebooks 1-8."""
     d_model: int = 384
-    num_layers: int = 4
+    num_layers: int = 4  # ResidualDecoder supports up to six dilation blocks
     num_residual_codebooks: int = 8  # Codebooks 1 through 8
     codebook_size: int = 1024
     kernel_size: int = 5

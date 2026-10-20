@@ -49,6 +49,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ import numpy as np
 # first (Kaggle stale-protobuf safety net) before parler_tts/transformers load.
 from codeswitch_tts import (  # noqa: E402
     CodeSwitchTTSConfig,
+    DraftModelConfig,
     DraftTransformer,
     ResidualDecoder,
     TanglishNormalizer,
@@ -1020,11 +1022,12 @@ class ResidualTrainer:
         return loss_sum / max(1, n_batches), per_cb_loss
 
     @torch.inference_mode()
-    def evaluate(self, windows) -> Tuple[float, List[float]]:
+    def evaluate(self, windows, sched_p: float = 0.0, rng=None) -> Tuple[float, List[float]]:
+        """CB1-8 top-1 on either teacher (sched_p=0) or draft CB0 (sched_p=1)."""
         self.model.eval()
         top1 = np.zeros(8, dtype=np.float64)
         total = 0
-        for cb0, tgt in self._batches(windows, shuffle=False):
+        for cb0, tgt in self._batches(windows, shuffle=False, sched_p=sched_p, rng=rng):
             out = self.model(cb0_tokens=cb0, sample=False)
             pred = out.residual_codebooks  # (B, 8, T)
             top1 += (pred == tgt).float().sum(dim=(0, 2)).cpu().numpy()
@@ -1039,8 +1042,13 @@ class ResidualTrainer:
         max_minutes: float = 6.0,
         sched_target: float = 0.0,
         min_epochs: int = 0,
-    ) -> Dict[str, float]:
+        ramp_epochs: int = 0,
+    ) -> Dict[str, Any]:
         target = float(max(0.0, min(1.0, sched_target if sched_target > 0 else self.sched_target)))
+        # precompute_draft_cb0 gates on self.sched_target; keep the trainer and
+        # the explicit train() argument in sync.
+        self.sched_target = target
+        ramp_epochs = max(1, min(int(ramp_epochs or epochs), epochs))
         draft_cb0 = self.precompute_draft_cb0(shards) if target > 0 else {}
         train_shards = [s for i, s in enumerate(shards) if i % 10 != 9]
         val_shards = [s for i, s in enumerate(shards) if i % 10 == 9]
@@ -1053,6 +1061,13 @@ class ResidualTrainer:
         if not train_w:
             raise RuntimeError("No residual training windows could be built.")
         sched_rng = random.Random(self.seed + 17)
+        val_rng = random.Random(self.seed + 23)
+        # Checkpoint selection must track the inference distribution.  Before
+        # this fix validation always used teacher CB0 (sched_p=0), so the best
+        # state was an early, teacher-only model even when training had ramped
+        # to draft CB0 later.
+        val_sched_p = 1.0 if (target > 0 and draft_cb0) else 0.0
+        val_label = "draft CB0" if val_sched_p > 0 else "teacher CB0"
         print(
             f"[Residual] {len(train_w) + len(val_w)} windows of {self.WINDOW} frames "
             f"({len(train_w)} train / {len(val_w)} val, shard-disjoint)"
@@ -1064,40 +1079,62 @@ class ResidualTrainer:
             optimizer, mode="min", factor=0.5, patience=3
         )
         scaler = _grad_scaler(self.device)
-        best_val = float("inf")
-        best_state = None
-        best_epoch = 0
+        # Track the best draft-CB0 state over all epochs for diagnostics, and
+        # separately the best state during the full-draft hold.  The latter is
+        # what we deploy: selecting a pre-ramp state is exactly the v2 failure
+        # mode (best_epoch=11 at 3.3 % draft exposure).
+        best_any_val = float("inf")
+        best_any_state = None
+        best_any_epoch = 0
+        best_any_sched_p = 0.0
+        best_full_val = float("inf")
+        best_full_state = None
+        best_full_epoch = 0
         epochs_completed = 0
         stale = 0
         t_start = _now()
-        stats: Dict[str, float] = {}
+        stats: Dict[str, Any] = {}
         if target > 0:
-            if draft_cb0:
-                print(f"[Residual] scheduled sampling: {len(draft_cb0)}/{len(shards)} shards have "
-                      f"draft CB0, ramp 0 -> {target:.2f} over {epochs} epochs")
-            else:
-                print("[Residual] ⚠ scheduled sampling requested but no draft CB0 is available "
-                      "(draft not trained in this run or the draft pass failed) — the residual "
-                      "will train on teacher CB0 only.")
+            if not draft_cb0:
+                raise RuntimeError(
+                    "Scheduled sampling was requested but no draft CB0 is available "
+                    "(the draft pass failed or --skip-draft was used without a usable "
+                    "--draft-ckpt). Refusing to silently train on teacher CB0 only."
+                )
+            print(f"[Residual] scheduled sampling: {len(draft_cb0)}/{len(shards)} shards have "
+                  f"draft CB0, ramp 0 -> {target:.2f} over {ramp_epochs} epochs")
+        print(f"[Residual] checkpoint selection: validation on {val_label}")
         for epoch in range(1, epochs + 1):
             epochs_completed = epoch
-            sched_p = target * (epoch - 1) / max(1, epochs - 1)
+            ramp_frac = (1.0 if ramp_epochs <= 1 else
+                         min(1.0, max(0.0, (epoch - 1) / (ramp_epochs - 1))))
+            sched_p = target * ramp_frac if target > 0 and draft_cb0 else 0.0
             train_loss, _ = self._epoch(train_w, optimizer, scaler, train=True,
                                         sched_p=sched_p, rng=sched_rng)
-            val_loss, _ = self._epoch(val_w, optimizer, scaler, train=False)
+            val_loss, _ = self._epoch(val_w, optimizer, scaler, train=False,
+                                      sched_p=val_sched_p, rng=val_rng)
             scheduler.step(val_loss)
-            improved = val_loss < best_val - 1e-4
+            improved = val_loss < best_any_val - 1e-4
             if improved:
-                best_val = val_loss
-                best_epoch = epoch
+                best_any_val = val_loss
+                best_any_epoch = epoch
+                best_any_sched_p = sched_p
                 stale = 0
-                best_state = {
+                best_any_state = {
                     k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
                 }
             else:
                 stale += 1
+            full_now = bool(target > 0 and draft_cb0 and sched_p >= target - 1e-9)
+            if full_now and val_loss < best_full_val - 1e-4:
+                best_full_val = val_loss
+                best_full_epoch = epoch
+                best_full_state = {
+                    k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
+                }
             print(
-                f"[Residual] epoch {epoch:3d} | train {train_loss:.4f} | val {val_loss:.4f}"
+                f"[Residual] epoch {epoch:3d} | train {train_loss:.4f} (sched {sched_p:.2f}) "
+                f"| val {val_loss:.4f} [{val_label}]"
                 f"{'  *best*' if improved else ''} | total {_fmt_time(_now() - t_start)}"
             )
             if stale >= patience and epoch >= int(min_epochs):
@@ -1106,24 +1143,68 @@ class ResidualTrainer:
             if (_now() - t_start) > max_minutes * 60.0:
                 print(f"[Residual] time budget of {max_minutes:.1f} min reached")
                 break
-        if best_state is not None:
-            self.model.load_state_dict(best_state)
-        _, top1 = self.evaluate(val_w)
-        final_sched_p = float(
-            target * max(0, epochs_completed - 1) / max(1, epochs - 1)
-        ) if epochs else 0.0
+        if best_full_state is not None:
+            selected_state = best_full_state
+            selected_val = best_full_val
+            selected_epoch = best_full_epoch
+            selected_sched_p = float(target)
+            selected_full_draft = True
+        elif best_any_state is not None:
+            selected_state = best_any_state
+            selected_val = best_any_val
+            selected_epoch = best_any_epoch
+            selected_sched_p = best_any_sched_p
+            selected_full_draft = False
+        else:
+            selected_state = None
+            selected_val = float("inf")
+            selected_epoch = 0
+            selected_sched_p = 0.0
+            selected_full_draft = False
+        if selected_state is not None:
+            self.model.load_state_dict(selected_state)
+        _, top1_teacher = self.evaluate(val_w, sched_p=0.0)
+        _, top1_draft = self.evaluate(val_w, sched_p=1.0) if draft_cb0 else (0.0, top1_teacher)
+        val_loss_teacher, _ = self._epoch(val_w, optimizer, scaler, train=False,
+                                          sched_p=0.0, rng=val_rng)
+        final_ramp_frac = (1.0 if ramp_epochs <= 1 else
+                           min(1.0, max(0.0, (epochs_completed - 1) / (ramp_epochs - 1))))
+        final_sched_p = target * final_ramp_frac if target > 0 and draft_cb0 else 0.0
+        selection_metric = "teacher_cb0_val_loss"
+        if val_sched_p > 0:
+            selection_metric = ("draft_cb0_val_loss_full_ramp" if selected_full_draft
+                                else "draft_cb0_val_loss_pre_full_ramp")
         stats.update(
-            best_val_loss=float(best_val),
-            best_epoch=int(best_epoch),
-            final_sched_p=final_sched_p,
+            best_val_loss=float(selected_val),
+            best_val_loss_teacher=float(val_loss_teacher),
+            best_epoch=int(selected_epoch),
+            best_sched_p=float(selected_sched_p),
+            selected_full_draft=bool(selected_full_draft),
+            best_val_sched_p=float(val_sched_p),
+            selection_metric=selection_metric,
+            final_sched_p=float(final_sched_p),
+            ramp_epochs=int(ramp_epochs),
             epochs_run=int(epochs_completed),
-            cb_top1=top1,
-            cb_top1_mean=float(np.mean(top1)),
+            best_val_loss_any=float(best_any_val),
+            best_epoch_any=int(best_any_epoch),
+            best_sched_p_any=float(best_any_sched_p),
+            best_full_epoch=int(best_full_epoch) if best_full_state is not None else 0,
+            best_full_val_loss=(float(best_full_val) if best_full_state is not None else None),
+            cb_top1=top1_teacher,
+            cb_top1_mean=float(np.mean(top1_teacher)),
+            cb_top1_teacher=top1_teacher,
+            cb_top1_teacher_mean=float(np.mean(top1_teacher)),
+            cb_top1_draft=top1_draft,
+            cb_top1_draft_mean=float(np.mean(top1_draft)),
             train_seconds=float(_now() - t_start),
         )
         print(
-            "[Residual] done | best val {:.4f} | mean CB1-8 top-1 {:.2f}%".format(
-                best_val, 100 * float(np.mean(top1))
+            "[Residual] done | selected val {:.4f} @ epoch {} (sched {:.2f}, {}) | "
+            "mean CB1-8 top-1 teacher {:.2f}% draft {:.2f}%".format(
+                selected_val, selected_epoch, selected_sched_p,
+                "full-draft hold" if selected_full_draft else "pre-ramp fallback",
+                100 * float(np.mean(top1_teacher)),
+                100 * float(np.mean(top1_draft)),
             )
         )
         return stats
@@ -1141,6 +1222,64 @@ def save_checkpoint(path: Path, model: torch.nn.Module, config_obj, meta: Dict) 
     }
     torch.save(payload, path)
     print(f"[Save] {path} ({sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params)")
+
+
+def resolve_checkpoint_file(path: str, filename: str) -> Path:
+    """Accept either a checkpoint directory or the checkpoint file itself."""
+    p = Path(path)
+    if p.is_dir():
+        p = p / filename
+    if not p.is_file():
+        raise FileNotFoundError(f"checkpoint not found: {p}")
+    return p
+
+
+def load_draft_checkpoint(path: str, device: torch.device) -> Tuple[DraftTransformer, Path, Dict[str, Any]]:
+    """Load a trained draft for a residual-only run.
+
+    ``--skip-draft`` used to set ``draft_model=None``, silently disabling
+    scheduled sampling and training the residual on teacher CB0 only.  This
+    loader makes the existing v2 draft an explicit, checked input.
+    """
+    file = resolve_checkpoint_file(path, "draft_cb0.pt")
+    payload = torch.load(file, map_location="cpu", weights_only=False)
+    cfg = DraftModelConfig(**payload.get("config", {}))
+    model = DraftTransformer(cfg).to(device)
+    model.load_state_dict({
+        k.removeprefix("module."): v for k, v in payload["state_dict"].items()
+    })
+    model.eval()
+    print(f"[Draft] loaded {file} ({sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params)")
+    return model, file, payload
+
+
+def load_draft_source_meta(file: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Carry the source draft's stats into the residual-only output meta."""
+    meta: Dict[str, Any] = {}
+    parent_meta = file.parent / "meta.json"
+    if parent_meta.is_file():
+        try:
+            doc = json.loads(parent_meta.read_text(encoding="utf-8"))
+            if isinstance(doc.get("draft"), dict):
+                meta.update(doc["draft"])
+        except Exception as exc:  # pragma: no cover - malformed source meta
+            print(f"[Draft] warning: could not read {parent_meta}: {exc}")
+    if not meta and isinstance(payload.get("meta"), dict):
+        meta.update(payload["meta"])
+    meta["loaded_from"] = str(file)
+    meta["reused"] = True
+    return meta
+
+
+def copy_draft_checkpoint(source: Path, ckpt_dir: Path) -> Path:
+    """Keep the residual-only output a complete, evaluable checkpoint dir."""
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    dst = ckpt_dir / "draft_cb0.pt"
+    if source.resolve() == dst.resolve():
+        return dst
+    shutil.copy2(source, dst)
+    print(f"[Save] {dst} (copied from {source})")
+    return dst
 
 
 # ===========================================================================
@@ -1258,11 +1397,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--residual-sched", type=float, default=0.0,
                    help="Scheduled-sampling target fraction (0-1.0). The residual is trained on "
                         "teacher CB0 but runs on draft CB0, so a ramp to 1.0 closes that exposure "
-                        "bias; requires the draft to be trained in the same run (default: off).")
+                        "bias; requires an in-run draft or --draft-ckpt (default: off).")
+    p.add_argument("--residual-ramp-epochs", type=int, default=0,
+                   help="Reach the scheduled-sampling target by this epoch and hold it for the "
+                        "remaining epochs. 0 ramps over all --residual-epochs.")
+    p.add_argument("--residual-d-model", type=int, default=0,
+                   help="Override ResidualModelConfig.d_model (0 keeps the 384 default).")
+    p.add_argument("--residual-layers", type=int, default=0,
+                   help="Override ResidualModelConfig.num_layers (0 keeps the 4 default; "
+                        "the decoder supports up to 6 dilation rates).")
     p.add_argument("--max-minutes-residual", type=float, default=6.0,
                    help="Wall-clock budget for residual training.")
     p.add_argument("--skip-teacher", action="store_true", help="Reuse cached shards only.")
-    p.add_argument("--skip-draft", action="store_true")
+    p.add_argument("--skip-draft", action="store_true",
+                   help="Skip draft training; requires --draft-ckpt for a residual run so the "
+                        "output checkpoint is complete and scheduled sampling is real.")
+    p.add_argument("--draft-ckpt", type=str, default=None,
+                   help="Existing draft checkpoint directory or draft_cb0.pt file to load when "
+                        "--skip-draft. It is copied into --ckpt-dir for evaluation.")
     p.add_argument("--skip-residual", action="store_true")
     p.add_argument("--num-workers-note", action="store_true", help=argparse.SUPPRESS)
     return p
@@ -1287,6 +1439,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     config = CodeSwitchTTSConfig()
     config.system.allow_untrained_fallback = False  # teacher MUST be real speech
+    if args.residual_d_model:
+        if args.residual_d_model < 64:
+            print("[Residual] --residual-d-model must be >= 64")
+            return 2
+        config.residual.d_model = int(args.residual_d_model)
+    if args.residual_layers:
+        if args.residual_layers < 1 or args.residual_layers > 6:
+            print("[Residual] --residual-layers must be between 1 and 6")
+            return 2
+        config.residual.num_layers = int(args.residual_layers)
 
     print("=" * 78)
     print("CodeSwitch-TTS · Draft/Residual Self-Distillation")
@@ -1375,32 +1537,58 @@ def main(argv: Optional[List[str]] = None) -> int:
     length_model = LengthModel.fit([s.n_chars for s in shards], [s.frames for s in shards])
 
     # ---------------- trainers ----------------
-    draft = DraftTransformer(config.draft).to(device)
-    residual = ResidualDecoder(config.residual).to(device)
-    draft_stats: Dict[str, float] = {}
-    residual_stats: Dict[str, float] = {}
+    draft: Optional[DraftTransformer] = None
+    draft_source_path: Optional[Path] = None
+    draft_stats: Dict[str, Any] = {}
+    residual_stats: Dict[str, Any] = {}
+
+    if args.skip_draft and not args.skip_residual and not args.draft_ckpt:
+        print(
+            "[Draft] ❌ --skip-draft requires --draft-ckpt for a residual run: the output\n"
+            "          checkpoint must contain a draft, and scheduled sampling must use the\n"
+            "          real draft rather than silently falling back to teacher CB0."
+        )
+        return 2
 
     if not args.skip_draft:
+        draft = DraftTransformer(config.draft).to(device)
         draft_stats = DraftTrainer(
             draft, device, lr=args.draft_lr, batch_size=args.draft_batch, seed=args.seed
         ).train(shards, epochs=args.draft_epochs, max_minutes=args.max_minutes,
                 min_epochs=args.min_epochs)
+    elif args.draft_ckpt:
+        draft, draft_source_path, draft_source_payload = load_draft_checkpoint(
+            args.draft_ckpt, device
+        )
+        draft_stats = load_draft_source_meta(draft_source_path, draft_source_payload)
+        if Path(args.ckpt_dir).resolve() == draft_source_path.parent.resolve():
+            print(
+                "[Save] ❌ --ckpt-dir resolves to the draft source directory; refusing to "
+                "overwrite the previous checkpoint. Use a new directory (e.g. "
+                "codeswitch_ckpt_v3)."
+            )
+            return 2
+
     if not args.skip_residual:
+        residual = ResidualDecoder(config.residual).to(device)
         residual_stats = ResidualTrainer(
             residual, device, lr=args.residual_lr, batch_size=args.residual_batch, seed=args.seed,
-            draft_model=(draft if not args.skip_draft else None),
+            draft_model=draft,
             sched_target=args.residual_sched,
         ).train(shards, epochs=args.residual_epochs, max_minutes=args.max_minutes_residual,
-                sched_target=args.residual_sched, min_epochs=args.min_epochs)
+                sched_target=args.residual_sched, min_epochs=args.min_epochs,
+                ramp_epochs=args.residual_ramp_epochs)
 
     # ---------------- checkpoints ----------------
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    if not args.skip_draft:
+    if not args.skip_draft and draft is not None:
         save_checkpoint(
             ckpt_dir / "draft_cb0.pt", draft, config.draft,
             {"param_count": sum(p.numel() for p in draft.parameters()), **draft_stats},
         )
+    elif draft_source_path is not None:
+        copy_draft_checkpoint(draft_source_path, ckpt_dir)
     if not args.skip_residual:
         save_checkpoint(
             ckpt_dir / "residual_cb1_8.pt", residual, config.residual,
@@ -1413,6 +1601,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "target_source": args.target_source,
         "target_stats": getattr(engine, "backend", "n/a"),
         "residual_scheduled_sampling": args.residual_sched,
+        "residual_ramp_epochs": int(args.residual_ramp_epochs or args.residual_epochs),
+        "residual_only": bool(args.skip_draft),
+        "draft_source": str(draft_source_path) if draft_source_path is not None else None,
+        "residual_capacity": {
+            "d_model": int(config.residual.d_model),
+            "num_layers": int(config.residual.num_layers),
+        },
         "length_model": length_model.to_dict(),
         "draft": draft_stats,
         "residual": residual_stats,

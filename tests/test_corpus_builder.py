@@ -413,7 +413,7 @@ def test_min_epochs_blocks_premature_early_stopping():
             return 6.9, []          # never improves -> `stale` grows immediately
 
         @torch.inference_mode()
-        def evaluate(self, windows):
+        def evaluate(self, windows, sched_p=0.0, rng=None):
             return float(len(windows)), [0.0] * 8
 
     plain = _Residual(T.ResidualDecoder(), torch.device("cpu"), batch_size=4)
@@ -435,6 +435,193 @@ def test_min_epochs_blocks_premature_early_stopping():
     draft = _Draft(T.DraftTransformer(), torch.device("cpu"), batch_size=4)
     stats = draft.train(shards, epochs=30, patience=1, max_minutes=5.0, min_epochs=5)
     assert stats["epochs_run"] == 5
+
+
+def test_residual_selects_on_draft_cb0_and_records_full_ramp():
+    """The saved residual must be selected on the inference distribution.
+
+    v2 selected the best checkpoint on teacher-CB0 validation, so the saved
+    state was an early epoch that had never seen the draft CB0 it runs on.
+    """
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import ResidualModelConfig
+
+    shards = _fake_teacher_shards()
+
+    class _Residual(T.ResidualTrainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.seen = []
+            self.val_calls = 0
+
+        def precompute_draft_cb0(self, shards_):
+            return {int(s.index): np.zeros(s.frames, dtype=np.int64) for s in shards_}
+
+        def _epoch(self, windows, optimizer, scaler, train, sched_p=0.0, rng=None):
+            self.seen.append((train, sched_p))
+            if train:
+                return 1.0, []
+            self.val_calls += 1
+            # Draft validation improves every epoch; teacher validation is
+            # deliberately worse and flat.
+            return (4.0 - 0.1 * self.val_calls) if sched_p >= 1.0 else 9.0, []
+
+        @torch.inference_mode()
+        def evaluate(self, windows, sched_p=0.0, rng=None):
+            return float(len(windows)), [0.1] * 8
+
+    model = T.ResidualDecoder(ResidualModelConfig(d_model=32, num_layers=4))
+    trainer = _Residual(
+        model, torch.device("cpu"), batch_size=4,
+        draft_model=object(), sched_target=1.0,
+    )
+    stats = trainer.train(
+        shards, epochs=4, patience=10, max_minutes=5.0,
+        sched_target=1.0, min_epochs=4, ramp_epochs=3,
+    )
+
+    train_ps = [p for is_train, p in trainer.seen if is_train]
+    val_ps = [p for is_train, p in trainer.seen if not is_train]
+    assert train_ps == pytest.approx([0.0, 0.5, 1.0, 1.0])
+    assert val_ps[:4] == [1.0, 1.0, 1.0, 1.0]
+    assert stats["best_epoch"] == 4
+    assert stats["best_sched_p"] == pytest.approx(1.0)
+    assert stats["final_sched_p"] == pytest.approx(1.0)
+    assert stats["ramp_epochs"] == 3
+    assert stats["selected_full_draft"] is True
+    assert stats["selection_metric"] == "draft_cb0_val_loss_full_ramp"
+    assert stats["best_val_sched_p"] == pytest.approx(1.0)
+    assert stats["best_epoch_any"] == 4
+    assert stats["best_full_epoch"] == 4
+    assert stats["cb_top1_draft_mean"] == pytest.approx(0.1)
+
+
+def test_residual_deploys_full_draft_state_even_if_pre_ramp_val_is_better():
+    """Deployment must use the full-draft hold, not an early teacher-ish state."""
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import ResidualModelConfig
+
+    shards = _fake_teacher_shards()
+
+    class _Residual(T.ResidualTrainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.val_calls = 0
+
+        def precompute_draft_cb0(self, shards_):
+            return {int(s.index): np.zeros(s.frames, dtype=np.int64) for s in shards_}
+
+        def _epoch(self, windows, optimizer, scaler, train, sched_p=0.0, rng=None):
+            if train:
+                return 1.0, []
+            self.val_calls += 1
+            # The un-ramped state looks best, but only the final epoch is at
+            # 100% draft; the selected checkpoint must be that full-draft state.
+            return float(self.val_calls), []
+
+        @torch.inference_mode()
+        def evaluate(self, windows, sched_p=0.0, rng=None):
+            return float(len(windows)), [0.1] * 8
+
+    model = T.ResidualDecoder(ResidualModelConfig(d_model=32, num_layers=4))
+    trainer = _Residual(
+        model, torch.device("cpu"), batch_size=4,
+        draft_model=object(), sched_target=1.0,
+    )
+    stats = trainer.train(
+        shards, epochs=5, patience=10, max_minutes=5.0,
+        sched_target=1.0, min_epochs=5, ramp_epochs=5,
+    )
+
+    assert stats["best_epoch_any"] == 1
+    assert stats["best_val_loss_any"] == pytest.approx(1.0)
+    assert stats["best_epoch"] == 5
+    assert stats["best_val_loss"] == pytest.approx(5.0)
+    assert stats["best_sched_p"] == pytest.approx(1.0)
+    assert stats["best_full_epoch"] == 5
+    assert stats["selected_full_draft"] is True
+    assert stats["selection_metric"] == "draft_cb0_val_loss_full_ramp"
+
+
+def test_residual_refuses_scheduled_sampling_without_a_draft():
+    """A missing --draft-ckpt must fail, not silently train on teacher CB0."""
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import ResidualModelConfig
+
+    trainer = T.ResidualTrainer(
+        T.ResidualDecoder(ResidualModelConfig(d_model=32, num_layers=4)),
+        torch.device("cpu"), batch_size=4,
+        draft_model=None, sched_target=1.0,
+    )
+    with pytest.raises(RuntimeError, match="no draft CB0"):
+        trainer.train(
+            _fake_teacher_shards(), epochs=1, patience=10, max_minutes=5.0,
+            sched_target=1.0, min_epochs=1, ramp_epochs=1,
+        )
+
+
+def test_residual_capacity_and_draft_checkpoint_flags(tmp_path):
+    """The residual-only retrain can load v2 and use a larger 6-block decoder."""
+    import dataclasses
+    import inspect
+
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import ResidualModelConfig
+
+    args = T.build_arg_parser().parse_args([
+        "--skip-draft", "--draft-ckpt", "codeswitch_ckpt_v2",
+        "--residual-d-model", "512", "--residual-layers", "6",
+        "--residual-ramp-epochs", "100",
+    ])
+    assert args.skip_draft is True
+    assert args.draft_ckpt == "codeswitch_ckpt_v2"
+    assert args.residual_d_model == 512
+    assert args.residual_layers == 6
+    assert args.residual_ramp_epochs == 100
+    assert "requires --draft-ckpt" in inspect.getsource(T.main)
+
+    model = T.ResidualDecoder(ResidualModelConfig(d_model=32, num_layers=6))
+    assert len(model.blocks) == 6
+    with torch.inference_mode():
+        out = model(cb0_tokens=torch.zeros(1, 86, dtype=torch.long))
+    assert out.residual_codebooks.shape == (1, 8, 86)
+    with pytest.raises(ValueError):
+        T.ResidualDecoder(ResidualModelConfig(d_model=32, num_layers=7))
+
+    cfg = T.DraftModelConfig(
+        d_model=32, n_heads=4, num_layers=1, d_ff=64, max_text_len=64,
+    )
+    source_model = T.DraftTransformer(cfg)
+    src_dir = tmp_path / "v2"
+    src_dir.mkdir()
+    torch.save(
+        {
+            "state_dict": source_model.state_dict(),
+            "config": dataclasses.asdict(cfg),
+            "meta": {"best_epoch": 13},
+        },
+        src_dir / "draft_cb0.pt",
+    )
+    (src_dir / "meta.json").write_text(
+        json.dumps({"draft": {"best_epoch": 13, "val_top1": 0.082483}}),
+        encoding="utf-8",
+    )
+
+    loaded, path, payload = T.load_draft_checkpoint(str(src_dir), torch.device("cpu"))
+    assert path == src_dir / "draft_cb0.pt"
+    assert loaded.config.d_model == 32
+    meta = T.load_draft_source_meta(path, payload)
+    assert meta["best_epoch"] == 13
+    assert meta["val_top1"] == pytest.approx(0.082483)
+    assert meta["reused"] is True
+    assert meta["loaded_from"] == str(path)
+
+    dst = T.copy_draft_checkpoint(path, tmp_path / "v3")
+    assert dst.read_bytes() == path.read_bytes()
 
 
 def test_length_bucketed_order_keeps_lengths_together():

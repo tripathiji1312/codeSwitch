@@ -888,6 +888,29 @@ codeswitch_ckpt_v2` must report `rd_a >= 5 %` and `rt_a >= 5 %`. If `rt_a` is
 healthy but `rd_a < 5 %`, the draft CB0 is still the bottleneck — do not proceed
 to the B/C quality claim; go back to Phase 3.
 
+**4g. Residual-only amendment (2026-10-20, after the v2 listening check).**
+The matched v2 hybrids showed the residual is the primary bottleneck, so the
+combined 4f command is **not** the next run. Use the v2 draft explicitly and
+write a complete v3 directory:
+
+```bash
+movio/.venv/bin/python train_draft_distill.py \
+  --skip-teacher --skip-draft --draft-ckpt codeswitch_ckpt_v2 \
+  --residual-epochs 150 --residual-ramp-epochs 100 --residual-sched 1.0 \
+  --residual-d-model 512 --residual-layers 6 \
+  --min-epochs 150 --max-minutes-residual 90 \
+  --teacher-cache teacher_cache --ckpt-dir codeswitch_ckpt_v3
+```
+
+The residual is validated on draft CB0, but the deployed state is the best one
+from the **full-draft hold** (the final 50 epochs), not an early pre-ramp state.
+`best_sched_p` records the selected epoch's schedule, and
+`best_epoch_any`/`best_sched_p_any` preserve the all-epoch best for diagnosis.
+`--skip-draft` fails closed unless `--draft-ckpt` is supplied; the draft is
+copied into the output directory. Do not lower the 5 % gate; if v3 still misses
+it, inspect `best_sched_p`, `cb_top1_teacher_mean`, and `cb_top1_draft_mean`
+before choosing a stronger residual or draft soft targets.
+
 ### Phase 5 — Kaggle diagnostic + evaluation (user-driven session)
 
 **Session/path rule.** Training writes `codeswitch_ckpt_v2` in the **current**
@@ -1125,6 +1148,12 @@ Phase 3–4
       the configured `residual_scheduled_sampling == 1.0`). If the run stopped
       at the wall-clock cap with `final_sched_p < 0.95`, the residual has not
       seen enough draft-CB0 input — retrain before evaluating.
+- [ ] Residual-only amendment: `codeswitch_ckpt_v3/meta.json` records
+      `residual_only=true`, `selected_full_draft=true`, `best_sched_p=1.0`,
+      `best_val_sched_p`, `best_epoch_any`, `cb_top1_teacher_mean`, and
+      `cb_top1_draft_mean`; the copied `draft_cb0.pt` matches the v2 source;
+      `diagnose_audio_bug.py --ckpt codeswitch_ckpt_v3` still passes the
+      unchanged 5 % `rt_a`/`rd_a` gate.
 - [ ] `--skip-teacher` validation rejects a shard whose `frames !=
       codes.shape[1]`, whose codes fall outside `[0, 1024)`, or whose `index`
       duplicates another shard.
