@@ -203,6 +203,24 @@ def test_utmos_scorer_disabled_path():
     assert scorer.score(np.zeros(1600, dtype=np.float32), 16000) is None
 
 
+def test_code_stats_flags_constant_argmax():
+    from diagnose_audio_bug import code_stats
+
+    constant = code_stats(np.full(100, 7, dtype=np.int64))
+    assert constant["n"] == 100
+    assert constant["unique"] == 1
+    assert constant["top_token"] == 7
+    assert constant["top_frac"] == 1.0
+    assert constant["longest_run"] == 100
+    assert constant["entropy_nats"] == 0.0
+
+    varied = code_stats(np.array([7, 7, 8, 8, 8, 9], dtype=np.int64))
+    assert varied["unique"] == 3
+    assert varied["top_frac"] == pytest.approx(0.5)
+    assert varied["longest_run"] == 3
+    assert varied["entropy_nats"] > 0.0
+
+
 # ===========================================================================
 # Teacher-cache validation (corpus change safety)
 # ===========================================================================

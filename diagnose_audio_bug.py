@@ -136,6 +136,36 @@ def stats(w: np.ndarray) -> Dict[str, float]:
             "zcr": round(float(np.mean(np.abs(np.diff(np.signbit(w).astype(np.int8))))), 4)}
 
 
+def code_stats(tokens: np.ndarray) -> Dict[str, float]:
+    """Summarize a CB0 sequence for mode-collapse debugging.
+
+    A high top-token fraction with few unique values means argmax decoded the
+    per-frame marginal mode over and over; per-frame top-1 accuracy can look
+    acceptable even when the sequence is a constant token.  That is a different
+    failure from a residual that cannot map CB0 to CB1-8, so record both.
+    """
+    tokens = np.asarray(tokens, dtype=np.int64).reshape(-1)
+    if tokens.size == 0:
+        return {"n": 0, "unique": 0, "top_token": -1, "top_frac": 0.0,
+                "longest_run": 0, "entropy_nats": 0.0}
+    counts = np.bincount(tokens, minlength=1024).astype(np.float64)
+    probs = counts / counts.sum()
+    top_token = int(np.argmax(counts))
+    longest = run = 1
+    for prev, cur in zip(tokens[:-1], tokens[1:]):
+        run = run + 1 if cur == prev else 1
+        longest = max(longest, run)
+    nz = probs[probs > 0]
+    return {
+        "n": int(tokens.size),
+        "unique": int((counts > 0).sum()),
+        "top_token": top_token,
+        "top_frac": round(float(probs[top_token]), 4),
+        "longest_run": int(longest),
+        "entropy_nats": round(float(-(nz * np.log(nz)).sum()), 3),
+    }
+
+
 def pad9(cb0: np.ndarray) -> np.ndarray:
     out = np.zeros((9, cb0.shape[-1]), dtype=np.int64)
     out[0] = cb0
@@ -200,11 +230,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         row = {"shard": shard.norm_text[:60], "frames": T, "source": shard.target_source,
                "cb0_s": mean([w["cb0_s"] for w in win]), "cb0_a": mean([w["cb0_a"] for w in win]),
                "rt_s": mean([w["rt_s"] for w in win]), "rt_a": mean([w["rt_a"] for w in win]),
-               "rd_s": mean([w["rd_s"] for w in win]), "rd_a": mean([w["rd_a"] for w in win])}
+               "rd_s": mean([w["rd_s"] for w in win]), "rd_a": mean([w["rd_a"] for w in win]),
+               "code_stats": {"teacher": code_stats(tcb0), "draft_sample": code_stats(ds),
+                              "draft_argmax": code_stats(da)}}
         rows.append(row)
+        cs_s, cs_a = row["code_stats"]["draft_sample"], row["code_stats"]["draft_argmax"]
         print(f"[shard {shard.index:4d}] T={T:3d} draft CB0 s/a={row['cb0_s']:.2f}/{row['cb0_a']:.2f}% "
               f"res teacher s/a={row['rt_s']:.2f}/{row['rt_a']:.2f}% "
               f"res draft s/a={row['rd_s']:.2f}/{row['rd_a']:.2f}%")
+        print(f"  [code] draft sample  unique={cs_s['unique']:4d} top={cs_s['top_token']:4d} "
+              f"({cs_s['top_frac']:.1%}) run={cs_s['longest_run']:3d} H={cs_s['entropy_nats']:.2f}")
+        print(f"  [code] draft argmax  unique={cs_a['unique']:4d} top={cs_a['top_token']:4d} "
+              f"({cs_a['top_frac']:.1%}) run={cs_a['longest_run']:3d} H={cs_a['entropy_nats']:.2f}")
 
         if processor is None:
             continue
@@ -214,6 +251,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fta, _ = residual_tokens(residual, codes[0, :A], False, device)
         fds, _ = residual_tokens(residual, dsA, True, device)
         fda, _ = residual_tokens(residual, daA, False, device)
+        fda_s, _ = residual_tokens(residual, daA, True, device)
+        fds_a, _ = residual_tokens(residual, dsA, False, device)
+        # Decode-path isolation: keep the teacher CB1-8 fixed while swapping
+        # only the draft CB0, and keep each CB0 fixed while swapping only the
+        # residual mode.  This separates draft mode-collapse from residual
+        # argmax failure; student_full_* changes both at once.
         variants = {
             "teacher_full": codes[:, :A],
             "student_full_sample": fds,
@@ -221,7 +264,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "teacher_cb0_student_res_sample": fts,
             "teacher_cb0_student_res_argmax": fta,
             "student_cb0_teacher_res_sample": np.vstack([dsA, codes[1:9, :A]]),
+            "student_cb0_argmax_teacher_res": np.vstack([daA, codes[1:9, :A]]),
+            "student_cb0_argmax_res_sample": fda_s,
+            "student_cb0_sample_res_argmax": fds_a,
             "student_cb0_only_sample": pad9(dsA),
+            "student_cb0_only_argmax": pad9(daA),
             "teacher_cb0_only": pad9(codes[0, :A]),
         }
         prefix = f"shard_{shard.index:04d}"
@@ -238,10 +285,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"flat={st['flatness']:.3f} zcr={st['zcr']:.3f}")
 
     summary = {k: mean([r[k] for r in rows]) for k in ("cb0_s", "cb0_a", "rt_s", "rt_a", "rd_s", "rd_a")}
+    code_summary = {}
+    for mode in ("draft_sample", "draft_argmax", "teacher"):
+        for key in ("unique", "top_frac", "longest_run", "entropy_nats"):
+            code_summary[f"{mode}_{key}"] = mean(
+                [r["code_stats"][mode][key] for r in rows]
+            )
     print(f"\n=== SUMMARY ({len(rows)} shards) === chance={CHANCE:.4f}%")
     print(f"draft CB0        sample={summary['cb0_s']:.3f}% argmax={summary['cb0_a']:.3f}%")
     print(f"residual teacher sample={summary['rt_s']:.3f}% argmax={summary['rt_a']:.3f}%")
     print(f"residual draft   sample={summary['rd_s']:.3f}% argmax={summary['rd_a']:.3f}%")
+    print(f"draft code       sample unique={code_summary['draft_sample_unique']:.0f} "
+          f"top={code_summary['draft_sample_top_frac']:.1%} "
+          f"run={code_summary['draft_sample_longest_run']:.0f} "
+          f"H={code_summary['draft_sample_entropy_nats']:.2f}")
+    print(f"draft code       argmax unique={code_summary['draft_argmax_unique']:.0f} "
+          f"top={code_summary['draft_argmax_top_frac']:.1%} "
+          f"run={code_summary['draft_argmax_longest_run']:.0f} "
+          f"H={code_summary['draft_argmax_entropy_nats']:.2f}")
     print("\n=== VERDICT ===")
     if summary["rt_a"] < 0.5:
         print("- Residual is at chance on its OWN training shards -> it never learned CB1-8. "
@@ -259,7 +320,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if abs(summary["rt_s"] - summary["rt_a"]) > 2:
         print("- Residual sampling changes CB1-8 top-1 by more than 2 points.")
 
-    report = {"summary": summary, "per_shard": rows, "wavs": wav_rows,
+    report = {"summary": summary, "code_summary": code_summary, "per_shard": rows,
+              "wavs": wav_rows,
               "dac_backend": getattr(getattr(processor, "dac", None), "backend", None),
               "meta": meta}
     (out / "diagnostic_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))

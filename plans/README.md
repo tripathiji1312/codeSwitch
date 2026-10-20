@@ -156,6 +156,32 @@ in the push/diagnostic/smoke/eval/bundle cells. Tests: `131 passed`
 `rt_a`/`rd_a` gate is unchanged; do not run the 60-utterance suite until the v3
 diagnostic passes and the one-sentence argmax WAV is confirmed intelligible.
 
+**2026-10-21 v3 diagnostic result (gate failed).** The residual-only run
+completed in 31m14s and selected the full-draft state at epoch 139
+(`best_sched_p=1.0`, `selected_full_draft=true`, `cb_top1_teacher=2.03 %`,
+`cb_top1_draft=1.56 %`). On the unchanged 4-shard diagnostic the teacher path
+cleared the gate but the draft path did not:
+
+| metric | v2 | v3 | gate |
+|---|---:|---:|---:|
+| `cb0_s` / `cb0_a` | — | 2.364 / 9.942 % | — |
+| `rt_s` / `rt_a` | 3.195 / — | 1.773 / **5.594 %** | `rt_a >= 5 %` PASS |
+| `rd_s` / `rd_a` | 1.640 / — | 0.094 / **1.834 %** | `rd_a >= 5 %` FAIL |
+
+This is not a ramp or selection miss (`best_epoch_any=149`,
+`best_sched_p_any=1.0`). It is the draft-CB0 bottleneck the plan predicted:
+the residual works on teacher CB0 but not on the draft CB0 it sees at
+inference. The v3 `student_full_argmax` WAV is also near-silent
+(`rms≈0.0098`, `flat≈0.622`, `zcr≈0.199`) while `student_full_sample` and
+`teacher_cb0_student_res_argmax` are normal, so the next diagnostic must
+separate draft-argmax collapse from residual-argmax failure before another
+training run. `diagnose_audio_bug.py` now writes
+`student_cb0_argmax_teacher_res`, `student_cb0_argmax_res_sample`,
+`student_cb0_sample_res_argmax`, and `student_cb0_only_argmax`, and records
+CB0 uniqueness/top-token/run-length/entropy for draft sample vs argmax.
+Do not run the one-sentence smoke or the 60-utterance suite until that
+isolation is read and the draft path is fixed. Test count is now `132`.
+
 Before the 60-utterance run, `CodeSwitch_013_RunAll_Kaggle.ipynb` now synthesizes
 one held-out sentence (`ta-01`) in `argmax` mode, prints draft CB0 / residual
 top-1 against a fresh Parler teacher target, and saves
