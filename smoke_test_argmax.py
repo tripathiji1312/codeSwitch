@@ -56,14 +56,14 @@ REAL_BACKENDS = {
 PARLER_BACKENDS = {"parler_audio_encoder", "passed_model"}
 
 
-def _audio_stats(wave: np.ndarray) -> Dict[str, float]:
+def _audio_stats(wave: np.ndarray, sample_rate: int = 44100) -> Dict[str, float]:
     """Cheap descriptive stats; high flatness/ZCR is a symptom of static/noise."""
     w = np.asarray(wave, dtype=np.float64).reshape(-1)
     if w.size == 0:
         return {"sec": 0.0, "rms": 0.0, "peak": 0.0, "flatness": 0.0, "zcr": 0.0}
     spec = np.abs(np.fft.rfft(w)) + 1e-12
     return {
-        "sec": float(len(w) / 44100.0),
+        "sec": float(len(w) / float(sample_rate)),
         "rms": float(np.sqrt(np.mean(w * w))),
         "peak": float(np.max(np.abs(w))),
         "flatness": float(np.exp(np.mean(np.log(spec))) / np.mean(spec)),
@@ -290,8 +290,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     wave = np.asarray(wave, dtype=np.float32).reshape(-1)
-    save_wav(out_path, wave, sample_rate=int(row.get("sample_rate", 44100)), normalize=False)
-    stats = _audio_stats(wave)
+    sample_rate = int(row.get("sample_rate", 44100))
+    save_wav(out_path, wave, sample_rate=sample_rate, normalize=False)
+    stats = _audio_stats(wave, sample_rate=sample_rate)
     backend = str(row.get("dac_backend") or "unknown")
 
     print("\n" + "-" * 78)
@@ -347,6 +348,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "rtf": row.get("rtf"),
         "dac_backend": backend,
         "audio_path": str(out_path.resolve()),
+        "sample_rate": sample_rate,
         "audio_stats": stats,
         "top1_cb0_pct": cb0_acc,
         "draft_confidence_pct": None if cb0_conf is None else cb0_conf * 100.0,
