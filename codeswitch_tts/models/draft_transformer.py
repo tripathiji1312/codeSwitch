@@ -219,6 +219,7 @@ class DraftTransformer(nn.Module):
         text: Union[str, List[str]],
         num_frames: Optional[int] = None,
         temperature: float = 1.0,
+        sample: bool = True,
         device: Optional[Union[str, torch.device]] = None,
     ) -> DraftOutput:
         """Helper method to generate draft Codebook 0 tokens directly from raw text string(s)."""
@@ -235,4 +236,5 @@ class DraftTransformer(nn.Module):
             attention_mask=mask,
             num_frames=num_frames,
             temperature=temperature,
+            sample=sample,
         )

@@ -671,6 +671,22 @@ class TeacherCollector:
 # Draft CB0 training
 # ===========================================================================
 
+def length_bucketed_order(lengths: Sequence[int], batch_size: int,
+                          shuffle: bool = False, rng: Optional[random.Random] = None
+                          ) -> List[int]:
+    """Group indices with similar frame counts so ``_collate``'s max_t is close
+    to every sample's own length.
+
+    Shuffle-only batching padded short sentences up to the longest sentence in
+    the batch, training them against a longer frame axis than their own target.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: int(lengths[i]))
+    blocks = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
+    if shuffle:
+        (rng or random).shuffle(blocks)
+    return [i for block in blocks for i in block]
+
+
 class DraftTrainer:
     def __init__(
         self,
@@ -704,9 +720,10 @@ class DraftTrainer:
 
     def _run_epoch(self, shards, optimizer, scaler, train: bool):
         self.model.train(train)
-        order = list(range(len(shards)))
-        if train:
-            random.shuffle(order)
+        order = length_bucketed_order(
+            [s.frames for s in shards], self.batch_size,
+            shuffle=train, rng=random,
+        )
         total_loss, total_frames = 0.0, 0
         use_amp = self.device.type == "cuda"
         for start in range(0, len(order), self.batch_size):
@@ -750,8 +767,11 @@ class DraftTrainer:
     def evaluate_topk(self, shards, k: int = 5) -> Tuple[float, float]:
         self.model.eval()
         top1 = topk = total = 0
-        for start in range(0, len(shards), self.batch_size):
-            batch = shards[start:start + self.batch_size]
+        order = length_bucketed_order(
+            [s.frames for s in shards], self.batch_size, shuffle=False
+        )
+        for start in range(0, len(order), self.batch_size):
+            batch = [shards[j] for j in order[start:start + self.batch_size]]
             input_ids, attn, targets, max_t = self._collate(batch)
             out = self.model(
                 input_ids=input_ids, attention_mask=attn, num_frames=max_t, sample=False
@@ -878,7 +898,7 @@ class ResidualTrainer:
         # *draft* CB0 at inference.  Feeding it draft-produced CB0 for a growing
         # fraction of windows closes that exposure bias (target 0 disables it).
         self.draft = draft_model
-        self.sched_target = float(max(0.0, min(0.9, sched_target)))
+        self.sched_target = float(max(0.0, min(1.0, sched_target)))
 
     def precompute_draft_cb0(self, shards: List[TeacherShard]) -> Dict[int, np.ndarray]:
         """One NAR draft pass per shard: the CB0 the residual will actually see.
@@ -895,7 +915,7 @@ class ResidualTrainer:
                 with torch.inference_mode():
                     draft_out = self.draft.generate_chunk(
                         text=shard.norm_text, num_frames=int(shard.frames),
-                        temperature=1.0, device=self.device,
+                        temperature=1.0, sample=False, device=self.device,
                     )
                 tokens = draft_out.tokens[0].detach().cpu().numpy().astype(np.int64)
                 if tokens.shape[0] >= int(shard.frames):
@@ -1020,17 +1040,22 @@ class ResidualTrainer:
         sched_target: float = 0.0,
         min_epochs: int = 0,
     ) -> Dict[str, float]:
-        target = float(max(0.0, min(0.9, sched_target if sched_target > 0 else self.sched_target)))
+        target = float(max(0.0, min(1.0, sched_target if sched_target > 0 else self.sched_target)))
         draft_cb0 = self.precompute_draft_cb0(shards) if target > 0 else {}
-        windows = self.build_windows(shards, draft_cb0)
-        if not windows:
+        train_shards = [s for i, s in enumerate(shards) if i % 10 != 9]
+        val_shards = [s for i, s in enumerate(shards) if i % 10 == 9]
+        train_w = self.build_windows(train_shards, draft_cb0)
+        val_w = self.build_windows(val_shards, draft_cb0)
+        if not val_w and train_w:
+            # Degenerate corpus: keep at least one validation window rather than
+            # dividing by zero. This is the only allowed train/val overlap.
+            val_w = train_w[-1:]
+        if not train_w:
             raise RuntimeError("No residual training windows could be built.")
         sched_rng = random.Random(self.seed + 17)
-        train_w = [w for i, w in enumerate(windows) if i % 10 != 9]
-        val_w = [w for i, w in enumerate(windows) if i % 10 == 9] or windows[-1:]
         print(
-            f"[Residual] {len(windows)} windows of {self.WINDOW} frames "
-            f"({len(train_w)} train / {len(val_w)} val)"
+            f"[Residual] {len(train_w) + len(val_w)} windows of {self.WINDOW} frames "
+            f"({len(train_w)} train / {len(val_w)} val, shard-disjoint)"
         )
         optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=self.lr, weight_decay=0.01, betas=(0.9, 0.95)
@@ -1041,6 +1066,8 @@ class ResidualTrainer:
         scaler = _grad_scaler(self.device)
         best_val = float("inf")
         best_state = None
+        best_epoch = 0
+        epochs_completed = 0
         stale = 0
         t_start = _now()
         stats: Dict[str, float] = {}
@@ -1053,6 +1080,7 @@ class ResidualTrainer:
                       "(draft not trained in this run or the draft pass failed) — the residual "
                       "will train on teacher CB0 only.")
         for epoch in range(1, epochs + 1):
+            epochs_completed = epoch
             sched_p = target * (epoch - 1) / max(1, epochs - 1)
             train_loss, _ = self._epoch(train_w, optimizer, scaler, train=True,
                                         sched_p=sched_p, rng=sched_rng)
@@ -1061,6 +1089,7 @@ class ResidualTrainer:
             improved = val_loss < best_val - 1e-4
             if improved:
                 best_val = val_loss
+                best_epoch = epoch
                 stale = 0
                 best_state = {
                     k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
@@ -1080,9 +1109,14 @@ class ResidualTrainer:
         if best_state is not None:
             self.model.load_state_dict(best_state)
         _, top1 = self.evaluate(val_w)
+        final_sched_p = float(
+            target * max(0, epochs_completed - 1) / max(1, epochs - 1)
+        ) if epochs else 0.0
         stats.update(
             best_val_loss=float(best_val),
-            epochs_run=int(epoch),
+            best_epoch=int(best_epoch),
+            final_sched_p=final_sched_p,
+            epochs_run=int(epochs_completed),
             cb_top1=top1,
             cb_top1_mean=float(np.mean(top1)),
             train_seconds=float(_now() - t_start),
@@ -1222,8 +1256,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--residual-batch", type=int, default=32)
     p.add_argument("--residual-lr", type=float, default=3e-4)
     p.add_argument("--residual-sched", type=float, default=0.0,
-                   help="Scheduled-sampling target fraction (0-0.9). The residual is trained on "
-                        "teacher CB0 but runs on draft CB0, so a ramp to ~0.5 closes that exposure "
+                   help="Scheduled-sampling target fraction (0-1.0). The residual is trained on "
+                        "teacher CB0 but runs on draft CB0, so a ramp to 1.0 closes that exposure "
                         "bias; requires the draft to be trained in the same run (default: off).")
     p.add_argument("--max-minutes-residual", type=float, default=6.0,
                    help="Wall-clock budget for residual training.")
@@ -1284,7 +1318,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not shard_files:
             print(f"[Teacher] --skip-teacher set but no shards in {teacher_dir}")
             return 2
-        shards = [TeacherShard.load(f) for f in shard_files]
+        seen: Dict[int, str] = {}
+        for f in shard_files:
+            s = TeacherShard.load(f)
+            if s.codes.ndim != 2 or s.codes.shape[0] != 9:
+                raise SystemExit(
+                    f"[Teacher] {f.name}: codes shape {s.codes.shape}; expected (9, T)"
+                )
+            if int(s.frames) != int(s.codes.shape[1]):
+                raise SystemExit(
+                    f"[Teacher] {f.name}: frames={s.frames} but codes has "
+                    f"{s.codes.shape[1]} timesteps; target would be truncated"
+                )
+            if int(s.codes.min()) < 0 or int(s.codes.max()) >= 1024:
+                raise SystemExit(
+                    f"[Teacher] {f.name}: codes outside [0, 1024): "
+                    f"min={int(s.codes.min())} max={int(s.codes.max())}"
+                )
+            if int(s.index) in seen:
+                raise SystemExit(
+                    f"[Teacher] duplicate shard index {s.index}: "
+                    f"{f.name} and {seen[int(s.index)]}"
+                )
+            seen[int(s.index)] = f.name
+            shards.append(s)
+        if len({s.target_source for s in shards}) > 1:
+            print("[Teacher] ⚠ mixed target_source in cache; targets were captured "
+                  "with different methods")
         print(f"[Teacher] loaded {len(shards)} cached shards")
     else:
         from codeswitch_tts import SpeculativeEngine

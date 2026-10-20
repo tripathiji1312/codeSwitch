@@ -863,6 +863,30 @@ def test_gate_threshold_filtering_in_aggregate(capsys):
     assert "WARNING" in capsys.readouterr().out
 
 
+def test_aggregate_rejects_mixed_sample_modes():
+    rows = _fabricated_rows()
+    for r in rows:
+        if r.get("config") in ("B", "C"):
+            r["sample_mode"] = "argmax"
+    rows[1]["sample_mode"] = "sample"  # first C row, same results file
+    with pytest.raises(SystemExit, match="mix sample and argmax"):
+        R.aggregate_results(rows, ["C"], gate_threshold=0.0)
+
+
+def test_base_row_records_mode_and_placeholder_backend():
+    synth = R.EvalSynthesizer.__new__(R.EvalSynthesizer)
+    synth.args = type("A", (), {"sample_mode": "argmax"})()
+    synth.sample_rate = 44100
+    synth._speech_backend = True
+    synth.draft_trained = True
+    synth.residual_trained = True
+    utt = {"id": "ta-01", "register": "native_tamil", "text": "x"}
+    assert synth._base_row("A", utt, 0, "x")["sample_mode"] == "n/a"
+    row = synth._base_row("B", utt, 0, "x")
+    assert row["sample_mode"] == "argmax"
+    assert row["dac_backend"] is None
+
+
 def test_synth_C_falls_back_below_threshold(monkeypatch):
     """The gate hands low-confidence utterances to the AR path and labels it."""
     synth = R.EvalSynthesizer.__new__(R.EvalSynthesizer)
@@ -892,6 +916,8 @@ def test_synth_C_falls_back_below_threshold(monkeypatch):
     assert row["config"] == "C" and row["fallback"] is True
     assert row["verify_mode"] == "ar_fallback"
     assert row["gate_threshold"] == 0.5
+    assert row["sample_mode"] == "sample"
+    assert row["dac_backend"] == "parler_streamer"
     assert row["accept_true"] is None and row["zone_stats"] == {}
 
     # high confidence -> normal speculative path, no fallback

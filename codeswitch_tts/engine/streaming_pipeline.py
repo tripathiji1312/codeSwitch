@@ -104,7 +104,19 @@ class ChunkedStreamingPipeline:
 
         # 5. Audio Processor & DAC Decoder (reuses AR audio_encoder if available to save VRAM)
         dac_model = getattr(self.speculative_engine.ar_model, "audio_encoder", None)
-        self.audio_processor = AudioProcessor(self.config.audio, dac_model=dac_model)
+        try:
+            self.audio_processor = AudioProcessor(
+                self.config.audio,
+                dac_model=dac_model,
+                allow_fallback=self.config.system.allow_untrained_fallback,
+            )
+        except RuntimeError as exc:
+            # Construction should still succeed so the pipeline can explain the
+            # missing backend; stream_synthesize refuses before using this.
+            if self.config.system.allow_untrained_fallback:
+                raise
+            self.audio_processor = None
+            print(f"[ChunkedStreamingPipeline] DAC unavailable: {exc}")
 
         self.speech_available = bool(self.speculative_engine.speech_available)
         self._fallback_warned = False

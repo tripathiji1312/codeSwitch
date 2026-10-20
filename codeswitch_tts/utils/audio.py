@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional, Union, List, Tuple
+from typing import Any, Optional, Union, List, Tuple
 
 import numpy as np
 import scipy.signal
@@ -20,6 +20,9 @@ import torch
 import torch.nn as nn
 
 from codeswitch_tts.config import AudioConfig, DEFAULT_CONFIG
+
+
+DAC_PRETRAINED_ID = "ylacombe/dac_44khz"
 
 
 def apply_highpass_filter(
@@ -89,10 +92,10 @@ def save_wav(
 
 class DACWrapper:
     """Neural codec decoder wrapping DAC 44.1kHz.
-    
+
     Decodes full 9-codebook discrete tokens (B, 9, T) into 44.1kHz audio waveforms.
-    Includes automatic graceful fallbacks if Hugging Face or descript-audio-codec weights
-    are missing or running offline.
+    Pretrained weights are mandatory unless the caller explicitly opts into the
+    synthetic telemetry-only fallback.
     """
 
     def __init__(
@@ -101,10 +104,13 @@ class DACWrapper:
         device: Optional[Union[str, torch.device]] = None,
         dtype: Optional[torch.dtype] = None,
         model: Optional[Any] = None,
+        allow_fallback: bool = False,
     ):
         self.config = config or DEFAULT_CONFIG.audio
         self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype or torch.float32
+        self.allow_fallback = bool(allow_fallback)
+        self.load_error: Optional[str] = None
         if model is not None:
             self.model = model
             self.backend = "passed_model"
@@ -114,46 +120,50 @@ class DACWrapper:
             self._load_dac()
 
     def _load_dac(self):
-        """Attempts to load DAC via transformers, descript-audio-codec, or initializes
-        an architecture with graceful fallback.
-        """
-        # Attempt 1: HuggingFace transformers DacModel
-        try:
-            from transformers import DacModel, DacConfig
-            # Check if pretrained weights exist or instantiate config
-            model_id = "ylacombe/dac_44khZ_8kbps"
-            try:
-                self.model = DacModel.from_pretrained(model_id).to(self.device)
-                self.backend = "hf_pretrained"
-            except Exception:
-                # Initialize local DacConfig matching 44.1kHz 9-codebook specification
-                cfg = DacConfig(
-                    sampling_rate=self.config.sample_rate,
-                    n_codebooks=self.config.num_codebooks,
-                    codebook_size=self.config.codebook_size,
-                    hop_length=self.config.dac_hop_length,
-                    upsampling_ratios=[8, 8, 4, 2],
-                )
-                self.model = DacModel(cfg).to(self.device)
-                self.backend = "hf_local"
-            self.model.eval()
-            return
-        except Exception:
-            pass
+        """Load a real DAC decoder, or refuse/opt into the synthetic fallback.
 
-        # Attempt 2: Official descript-audio-codec package
+        Never silently installs random weights: the previous ``hf_local`` branch
+        produced white noise for every diagnostic wav.
+        """
+        errors: List[str] = []
+
+        # Attempt 1: transformers-native DAC (223-tensor layout; the same weights
+        # Parler's audio_encoder carries, but loadable without Parler).
+        try:
+            from transformers import DacModel
+
+            self.model = DacModel.from_pretrained(DAC_PRETRAINED_ID).to(self.device)
+            self.model.eval()
+            self.backend = "hf_pretrained"
+            return
+        except Exception as exc:
+            errors.append(
+                f"transformers DacModel({DAC_PRETRAINED_ID}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # Attempt 2: official descript-audio-codec package (DAC package layout).
         try:
             import dac
             from dac.model import DAC
+
             model_path = dac.utils.download(model_type="44khz")
             self.model = DAC.load(model_path).to(self.device)
             self.model.eval()
             self.backend = "dac_official"
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(f"descript-audio-codec: {type(exc).__name__}: {exc}")
 
-        # Attempt 3: Standalone lightweight neural vocoder decoder
+        self.model = None
+        self.load_error = "; ".join(errors)
+        if not self.allow_fallback:
+            self.backend = "unavailable"
+            raise RuntimeError(
+                "No pretrained DAC weights available; refusing to install random "
+                f"weights. Tried: {self.load_error}. Pass allow_fallback=True only "
+                "for telemetry-only runs."
+            )
         self.backend = "fallback_neural"
 
     @torch.inference_mode()
@@ -172,7 +182,7 @@ class DACWrapper:
         batch_size, num_cbs, num_frames = codebooks.shape
         codebooks = codebooks.to(self.device)
 
-        if self.backend in ("passed_model", "hf_pretrained", "hf_local") and self.model is not None:
+        if self.backend in ("passed_model", "hf_pretrained") and self.model is not None:
             try:
                 out = self.model.decode(audio_codes=codebooks)
                 if hasattr(out, "audio_values"):
@@ -199,6 +209,12 @@ class DACWrapper:
                 return audio_tensor[0, 0].cpu().float().numpy()
             except Exception:
                 pass
+
+        if self.backend != "fallback_neural":
+            raise RuntimeError(
+                "DACWrapper has no usable DAC backend: "
+                f"{self.backend} ({self.load_error or 'no loader details'})"
+            )
 
         # Graceful synthetic acoustic decoder fallback:
         # Generates smooth continuous harmonic audio driven by Codebook 0 (pitch/harmonics)
@@ -229,9 +245,12 @@ class DACWrapper:
 class AudioProcessor:
     """End-to-end audio post-processor."""
 
-    def __init__(self, config: Optional[AudioConfig] = None, dac_model: Optional[Any] = None):
+    def __init__(self, config: Optional[AudioConfig] = None,
+                 dac_model: Optional[Any] = None, allow_fallback: bool = False):
         self.config = config or DEFAULT_CONFIG.audio
-        self.dac = DACWrapper(config=self.config, model=dac_model)
+        self.dac = DACWrapper(
+            config=self.config, model=dac_model, allow_fallback=allow_fallback
+        )
 
     def process_and_filter(self, raw_audio: np.ndarray) -> np.ndarray:
         """Applies 60Hz high-pass filtering and peak normalization."""

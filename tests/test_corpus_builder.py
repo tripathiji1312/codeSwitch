@@ -437,6 +437,15 @@ def test_min_epochs_blocks_premature_early_stopping():
     assert stats["epochs_run"] == 5
 
 
+def test_length_bucketed_order_keeps_lengths_together():
+    import train_draft_distill as T
+
+    lengths = [100, 5, 90, 7]
+    order = T.length_bucketed_order(lengths, batch_size=2, shuffle=False)
+    assert order == [1, 3, 2, 0]
+    assert [lengths[i] for i in order] == [5, 7, 90, 100]
+
+
 def test_min_epochs_flag_is_wired_into_both_trainers():
     import inspect
 

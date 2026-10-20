@@ -167,10 +167,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     shards = load_shards(Path(args.teacher_cache), args.shards)
     processor = None
     if not args.no_audio:
-        processor = AudioProcessor(CodeSwitchTTSConfig().audio)
-        print(f"[audio] DAC backend: {processor.dac.backend}")
-        if processor.dac.backend == "fallback_neural":
-            print("[audio] ⚠ DAC weights unavailable; wavs are synthetic tones (code metrics still valid)")
+        try:
+            processor = AudioProcessor(CodeSwitchTTSConfig().audio)
+            print(f"[audio] DAC backend: {processor.dac.backend}")
+            if processor.dac.backend not in ("hf_pretrained", "dac_official"):
+                print("[audio] ⚠ DAC backend is not a pretrained decoder; "
+                      "skipping wavs (code metrics below are still valid)")
+                processor = None
+        except Exception as exc:
+            print(f"[audio] DAC unavailable ({type(exc).__name__}: {exc}); "
+                  "skipping wavs (code metrics below are still valid)")
+            processor = None
     rows, wav_rows = [], []
     for shard in shards:
         codes = np.asarray(shard.codes, dtype=np.int64)
@@ -252,7 +259,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if abs(summary["rt_s"] - summary["rt_a"]) > 2:
         print("- Residual sampling changes CB1-8 top-1 by more than 2 points.")
 
-    report = {"summary": summary, "per_shard": rows, "wavs": wav_rows, "meta": meta}
+    report = {"summary": summary, "per_shard": rows, "wavs": wav_rows,
+              "dac_backend": getattr(getattr(processor, "dac", None), "backend", None),
+              "meta": meta}
     (out / "diagnostic_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"\n[done] {out / 'diagnostic_report.json'}")
     return 0

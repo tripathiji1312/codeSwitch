@@ -11,7 +11,9 @@ from codeswitch_tts.models.draft_transformer import DraftTransformer, DraftOutpu
 from codeswitch_tts.models.residual_decoder import ResidualDecoder, ResidualOutput
 from codeswitch_tts.engine.speculative_engine import SpeculativeEngine
 from codeswitch_tts.engine.streaming_pipeline import ChunkedStreamingPipeline
-from codeswitch_tts.utils.audio import AudioProcessor, crossfade_chunks, apply_highpass_filter, save_wav
+from codeswitch_tts.utils.audio import (
+    AudioProcessor, DACWrapper, crossfade_chunks, apply_highpass_filter, save_wav
+)
 
 
 def test_normalizer_native_tamil():
@@ -59,6 +61,22 @@ def test_draft_transformer_forward():
     assert torch.allclose(probs_sum, torch.ones_like(probs_sum), atol=1e-4)
 
 
+def test_generate_chunk_argmax_is_deterministic():
+    model = DraftTransformer()
+    model.eval()
+    out_a = model.generate_chunk("Hello", num_frames=8, sample=False)
+    out_b = model.generate_chunk("Hello", num_frames=8, sample=False)
+    assert torch.equal(out_a.tokens, out_b.tokens)
+    assert torch.equal(out_a.tokens, out_a.probabilities.argmax(dim=-1))
+
+
+def test_arg_parser_exposes_sample_mode():
+    import run_full_evaluation as R
+
+    assert R.build_arg_parser().parse_args([]).sample_mode == "sample"
+    assert R.build_arg_parser().parse_args(["--sample-mode", "argmax"]).sample_mode == "argmax"
+
+
 def test_residual_decoder_forward():
     decoder = ResidualDecoder()
     decoder.eval()
@@ -95,9 +113,46 @@ def test_audio_crossfade_and_filter():
     assert len(filtered) == len(blended)
 
 
-def test_end_to_end_streaming_pipeline(tmp_path):
+def test_dacwrapper_refuses_random_hf_local_weights(monkeypatch):
+    """A missing pretrained DAC must fail, not silently install random weights."""
+    from transformers import DacModel
+
+    monkeypatch.setattr(
+        DacModel, "from_pretrained",
+        classmethod(lambda cls, *a, **k: (_ for _ in ()).throw(RuntimeError("offline"))),
+    )
+    try:  # make the test hermetic when descript-audio-codec is installed
+        import dac
+
+        monkeypatch.setattr(
+            dac.utils, "download",
+            lambda **k: (_ for _ in ()).throw(RuntimeError("offline")),
+        )
+    except ImportError:
+        pass
+
+    with pytest.raises(RuntimeError):
+        DACWrapper()
+    wrapper = DACWrapper(allow_fallback=True)
+    assert wrapper.backend == "fallback_neural"
+    assert wrapper.model is None
+    assert "offline" in (wrapper.load_error or "")
+
+
+def test_audioprocessor_passed_model_skips_loading():
+    ap = AudioProcessor(dac_model=object())
+    assert ap.dac.backend == "passed_model"
+
+
+def test_end_to_end_streaming_pipeline(tmp_path, monkeypatch):
     # Local/CPU runs have no Indic Parler-TTS weights, so explicitly allow the
-    # telemetry-only fallback (its audio is random-weight noise, not speech).
+    # telemetry-only fallback (its audio is synthetic, not speech). Stub the DAC
+    # loader so this test never downloads the 306 MB pretrained checkpoint.
+    monkeypatch.setattr(
+        DACWrapper, "_load_dac",
+        lambda self: (setattr(self, "backend", "fallback_neural"),
+                      setattr(self, "model", None)),
+    )
     config = CodeSwitchTTSConfig()
     config.system.allow_untrained_fallback = True
     pipeline = ChunkedStreamingPipeline(config=config)

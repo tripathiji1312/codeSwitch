@@ -714,6 +714,7 @@ class EvalSynthesizer:
         self.frames_per_chunk = int(config.audio.frames_per_chunk)
         self.normalizer = TanglishNormalizer()
         self._dac_fallback = None
+        self._last_dac_backend: Optional[str] = None
         self._speech_backend = bool(getattr(engine, "speech_available", False)) if engine else False
 
     # -- shared helpers ------------------------------------------------------
@@ -745,12 +746,26 @@ class EvalSynthesizer:
         if self._speech_backend:
             audio = _decode_codes(self.engine.ar_model.audio_encoder, codes)
             if audio is not None:
+                self._last_dac_backend = "parler_audio_encoder"
                 return audio
         if self._dac_fallback is None:
             from codeswitch_tts.utils.audio import AudioProcessor
 
-            self._dac_fallback = AudioProcessor(self.config.audio, dac_model=None)
-        return np.asarray(self._dac_fallback.decode_and_postprocess(codes.unsqueeze(0)), dtype=np.float32)
+            dac_model = getattr(
+                getattr(self.engine, "ar_model", None), "audio_encoder", None
+            )
+            self._dac_fallback = AudioProcessor(
+                self.config.audio,
+                dac_model=dac_model,
+                allow_fallback=bool(getattr(self.args, "allow_untrained", False)),
+            )
+        audio = np.asarray(
+            self._dac_fallback.decode_and_postprocess(codes.unsqueeze(0)), dtype=np.float32
+        )
+        self._last_dac_backend = getattr(
+            getattr(self._dac_fallback, "dac", None), "backend", "unknown"
+        )
+        return audio
 
     def _base_row(self, cfg: str, utt: Dict[str, str], utt_index: int, normalized: str) -> Dict[str, Any]:
         return {
@@ -763,6 +778,12 @@ class EvalSynthesizer:
             "text": utt["text"],
             "normalized_text": normalized,
             "sample_rate": self.sample_rate,
+            "sample_mode": (
+                str(getattr(self.args, "sample_mode", "sample"))
+                if cfg in ("B", "C")
+                else "n/a"
+            ),
+            "dac_backend": None,
             "untrained_modules": bool(
                 (not self._speech_backend) or (not self.draft_trained) or (not self.residual_trained)
             ),
@@ -885,6 +906,7 @@ class EvalSynthesizer:
             "verify_ms_total": None,
             "residual_ms_total": None,
             "dac_ms_total": None,
+            "dac_backend": "parler_streamer",
             "accept_true": None,
             "accept_synth": None,
             "n_frames": None,
@@ -900,6 +922,8 @@ class EvalSynthesizer:
     def _chunked_synthesis(self, utt: Dict[str, str], utt_index: int, seed: int,
                            verify: bool) -> Tuple[Dict[str, Any], np.ndarray]:
         cfg = "C" if verify else "B"
+        self._last_dac_backend = None
+        draw_sample = str(getattr(self.args, "sample_mode", "sample")) != "argmax"
         normalized = self.normalize(utt["text"])
         row = self._base_row(cfg, utt, utt_index, normalized)
         prompt_clean = self._prompt_clean(normalized)
@@ -925,7 +949,11 @@ class EvalSynthesizer:
         set_seed(seed)
         with torch.inference_mode():
             draft_out = self.draft.generate_chunk(
-                text=normalized, num_frames=n_frames, temperature=1.0, device=self.device
+                text=normalized,
+                num_frames=n_frames,
+                temperature=1.0,
+                sample=draw_sample,
+                device=self.device,
             )
         cuda_sync(self.device)
         draft_ms = (_now() - t0) * 1000.0
@@ -1003,7 +1031,7 @@ class EvalSynthesizer:
                 res_out = self.residual(
                     cb0_tokens=torch.from_numpy(kept).unsqueeze(0).to(self.device),
                     temperature=1.0,
-                    sample=True,
+                    sample=draw_sample,
                 )
             cuda_sync(self.device)
             residual_ms = (_now() - t_r) * 1000.0
@@ -1065,6 +1093,7 @@ class EvalSynthesizer:
             "verify_ms_total": verify_ms_total,
             "residual_ms_total": residual_ms_total,
             "dac_ms_total": dac_ms_total,
+            "dac_backend": self._last_dac_backend or "unknown",
             "accept_true": acceptance_rate(accept_true),
             "accept_synth": acceptance_rate(accept_synth),
             "logq_draft": float(np.mean(logq_draft_parts)) if logq_draft_parts else None,
@@ -1117,7 +1146,11 @@ class EvalSynthesizer:
         set_seed(seed)
         with torch.inference_mode():
             draft_out = self.draft.generate_chunk(
-                text=normalized, num_frames=n_frames, temperature=1.0, device=self.device
+                text=normalized,
+                num_frames=n_frames,
+                temperature=1.0,
+                sample=str(getattr(self.args, "sample_mode", "sample")) != "argmax",
+                device=self.device,
             )
         probs = draft_out.probabilities[0].detach().float().cpu().numpy()
         per_chunk: List[float] = []
@@ -1157,6 +1190,8 @@ class EvalSynthesizer:
             row.update({
                 "config": "C",
                 "config_label": CONFIG_LABELS["C"],
+                "sample_mode": str(getattr(self.args, "sample_mode", "sample")),
+                "dac_backend": row.get("dac_backend") or "parler_streamer",
                 "verify_mode": "ar_fallback",
                 "fallback": True,
                 "gate_threshold": threshold,
@@ -1594,6 +1629,16 @@ def aggregate_results(rows: List[Dict[str, Any]], configs: Sequence[str],
     un-gated hybrid).
     """
     agg: Dict[str, Dict[str, Any]] = {}
+    modes = {
+        str(r.get("sample_mode") or "sample")
+        for r in rows
+        if not r.get("error") and r.get("config") in ("B", "C")
+    }
+    if len(modes) > 1:
+        raise SystemExit(
+            "results mix sample and argmax rows; use a fresh --results file "
+            f"(modes={sorted(modes)})"
+        )
     # Session cold start: the very first successful synthesis of the process
     # (configurations are interleaved per utterance, so this is the only row
     # whose latency includes a fully cold CUDA context).
@@ -3114,6 +3159,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Skip mel-cepstral distortion against the Pure-AR rendering "
                         "(computed from the saved wavs, no GPU needed).")
     p.add_argument("--asr-model", type=str, default="openai/whisper-small")
+    p.add_argument("--sample-mode", choices=["sample", "argmax"], default="sample",
+                   help="Token selection for B/C draft CB0 and residual CB1-8: 'sample' "
+                        "(seeded multinomial, current behaviour) or 'argmax' (greedy).")
     p.add_argument("--allow-untrained", action="store_true",
                    help="Permit random-weight modules (local smoke tests only).")
     p.add_argument("--no-true-probs", action="store_true",
@@ -3337,7 +3385,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         json.dumps(run_meta, indent=2, default=str), encoding="utf-8"
     )
 
-    done = {(r.get("config"), r.get("utt_id"), float(r.get("gate_threshold") or 0.0))
+    sample_mode = str(getattr(args, "sample_mode", "sample"))
+
+    def _mode_key(row: Dict[str, Any], cfg: str) -> str:
+        if cfg == "A":
+            return "n/a"
+        return str(row.get("sample_mode") or sample_mode)
+
+    done = {(r.get("config"), r.get("utt_id"), float(r.get("gate_threshold") or 0.0),
+             _mode_key(r, r.get("config")))
             for r in rows if not r.get("error")}
     utterances = EVAL_UTTERANCES[: args.limit] if args.limit else EVAL_UTTERANCES
     gate_mode = str(getattr(args, "gate_mode", "derived") or "derived")
@@ -3362,7 +3418,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for utt_index, utt in enumerate(utterances):
         for cfg in configs:
             for threshold in (gate_thresholds if cfg == "C" else [0.0]):
-                if (cfg, utt["id"], threshold) in done and not args.force:
+                expected_mode = "n/a" if cfg == "A" else sample_mode
+                if (cfg, utt["id"], threshold, expected_mode) in done and not args.force:
                     continue
                 seed = args.seed * 100003 + utt_index * 7 + {"A": 0, "B": 1, "C": 2}[cfg]
                 label = f"[{cfg}][{utt['id']}]" + (f"[g{threshold:.2f}]" if threshold > 0 else "")
@@ -3416,13 +3473,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if row.get("utt_index") is None:
                     row["utt_index"] = utt_index
 
-                # replace any previous row for (cfg, utt, gate) then persist
+                # replace any previous row for (cfg, utt, gate, mode) then persist
                 rows = [r for r in rows
                         if not (r.get("config") == cfg and r.get("utt_id") == utt["id"]
-                                and float(r.get("gate_threshold") or 0.0) == float(threshold))]
+                                and float(r.get("gate_threshold") or 0.0) == float(threshold)
+                                and _mode_key(r, cfg) == expected_mode)]
                 rows.append(row)
                 save_results(results_path, rows)
-                done.add((cfg, utt["id"], float(threshold)))
+                done.add((cfg, utt["id"], float(threshold), expected_mode))
 
                 elapsed = _now() - t0
                 if row.get("error"):
