@@ -1,8 +1,9 @@
 # Plans — CodeSwitch-TTS "paper-critical + trust" bundle
 
 Twelve self-contained implementation plans produced by the 2026-10-18 `improve` audit of this
-repository. Every plan was written for a zero-context executor agent: exact anchors, exact
-old/new strings, exact commands with expected outputs, STOP conditions, done criteria.
+repository, plus plan 013 (the 2026-10-20 B/C noise fix). Every plan was written for a zero-context
+executor agent: exact anchors, exact old/new strings, exact commands with expected outputs, STOP
+conditions, done criteria.
 **Read the plan; follow it literally; do not improvise.**
 
 Evidence base: `plans/research/findings-2026-10-18.md` (all six audit reports + subagent reports
@@ -116,6 +117,14 @@ Statuses: `TODO` · `IN PROGRESS` · `DONE` · `BLOCKED` · `REJECTED`.
 | 010 | [dx-onboarding](010-dx-onboarding.md) | P2 | S–M | ±0 | `advisor/010-dx-onboarding` | TODO |
 | 011 | [docs-truth-pass](011-docs-truth-pass.md) | Medium | ~1 h | ±0 | `advisor/011-docs-truth-pass` | TODO |
 | 012 | [perf-quick-wins](012-perf-quick-wins.md) | Medium-High | ~2–3 h | +3 | `advisor/012-perf-quick-wins` | TODO |
+| 013 | [bc-noise-fix](013-bc-noise-fix.md) | P0 | L | +5 | `fix/013-bc-noise` | IN PROGRESS |
+
+Plan 013 is the 2026-10-20 follow-up to the B/C noise diagnosis. Its evidence base is
+`research/findings-2026-10-20.md` (repo-root `research/`, not `plans/research/`). It
+conflicts with plan 006 on `codeswitch_tts/utils/audio.py::DACWrapper._load_dac`;
+execute 013 first and rebase 006 by content (or drop 006's DAC-loader section).
+Code/tests for Phases 1–4 have landed on `fix/013-bc-noise`; the Kaggle retrain,
+argmax evaluation, and quality gates are still pending.
 
 ## Execution order & hard gates
 
