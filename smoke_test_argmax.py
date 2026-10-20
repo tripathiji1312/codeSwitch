@@ -203,6 +203,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         seed=args.seed,
     )
     scorer = TeacherForcedScorer(engine) if args.config == "C" else None
+    if args.config == "C" and (scorer is None or not scorer.available):
+        print("\n[smoke] ❌ Config C needs true teacher-forced CB0 scoring, but the "
+              f"scorer is unavailable ({getattr(scorer, 'reason', 'not created')}). "
+              "Refusing to call a synthetic-target run a Config-C smoke test.")
+        return 2
     synth = EvalSynthesizer(
         synth_args, config, engine, draft_model, residual_model, length_model,
         scorer, device, draft_trained, residual_trained,
@@ -275,6 +280,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if wave is None or np.asarray(wave).size == 0:
         print("[smoke] ❌ pipeline returned no audio.")
         return 1
+    if str(row.get("sample_mode")) != "argmax":
+        print(f"[smoke] ❌ pipeline wrote sample_mode={row.get('sample_mode')!r}, "
+              "not 'argmax'.")
+        return 1
+    if args.config == "C" and row.get("verify_mode") != "true":
+        print(f"[smoke] ❌ config C did not use true teacher-forced CB0 verification "
+              f"(verify_mode={row.get('verify_mode')!r}); refusing to certify it.")
+        return 1
 
     wave = np.asarray(wave, dtype=np.float32).reshape(-1)
     save_wav(out_path, wave, sample_rate=int(row.get("sample_rate", 44100)), normalize=False)
@@ -286,6 +299,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("-" * 78)
     print(f"  utterance            : {utt['id']} ({utt['register']})")
     print(f"  sample mode          : {row.get('sample_mode')}")
+    print(f"  verify mode          : {row.get('verify_mode')}")
+    print(f"  draft acceptance     : {row.get('accept_true')}")
     print(f"  pipeline frames      : {row.get('n_frames')}")
     if teacher_meta:
         print(f"  teacher frames       : {teacher_meta.get('teacher_frames')} "
@@ -321,6 +336,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "text": utt["text"],
         "config": args.config,
         "sample_mode": row.get("sample_mode"),
+        "verify_mode": row.get("verify_mode"),
+        "accept_true_pct": row.get("accept_true"),
         "checkpoint": str(args.ckpt),
         "eval_seed": eval_seed,
         "pipeline_frames": row.get("n_frames"),

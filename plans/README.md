@@ -126,6 +126,13 @@ execute 013 first and rebase 006 by content (or drop 006's DAC-loader section).
 Code/tests for Phases 1–4 have landed on `fix/013-bc-noise`; the Kaggle retrain,
 argmax evaluation, and quality gates are still pending.
 
+Before the 60-utterance run, `CodeSwitch_013_RunAll_Kaggle.ipynb` now synthesizes
+one held-out sentence (`ta-01`) in `argmax` mode, prints draft CB0 / residual
+top-1 against a fresh Parler teacher target, and saves
+`output_audio/test_fixed_argmax.wav`. The full evaluation flags default to
+`False`; flip them only after that WAV is confirmed intelligible. The standalone
+driver is `smoke_test_argmax.py`.
+
 ## Execution order & hard gates
 
 Locked order: **001 → 002 → 003 → 004 → 005 → 006 → 007 → 008 → 009 → 010 → 011 → 012.**
