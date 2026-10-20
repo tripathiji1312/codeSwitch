@@ -675,6 +675,44 @@ def test_length_bucketed_order_keeps_lengths_together():
     assert [lengths[i] for i in order] == [5, 7, 90, 100]
 
 
+def test_sequence_diversity_stats_flags_constant_and_varied_argmax():
+    import train_draft_distill as T
+
+    constant = T.sequence_diversity_stats(np.full(100, 568, dtype=np.int64))
+    assert constant["unique"] == 1
+    assert constant["top_frac"] == 1.0
+    assert constant["longest_run"] == 100
+    assert constant["entropy_nats"] == 0.0
+
+    varied = T.sequence_diversity_stats(np.array([1, 1, 2, 3, 3, 3], dtype=np.int64))
+    assert varied["unique"] == 3
+    assert varied["top_frac"] == pytest.approx(0.5)
+    assert varied["longest_run"] == 3
+    assert varied["entropy_nats"] > 0.0
+
+
+def test_draft_collate_carries_per_sample_frame_lengths():
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import DraftModelConfig
+
+    model = T.DraftTransformer(
+        DraftModelConfig(d_model=16, n_heads=2, num_layers=1, d_ff=32)
+    )
+    shards = _fake_teacher_shards(n=3)
+    shards[0].frames = 40
+    shards[0].codes = shards[0].codes[:, :40]
+    shards[1].frames = 80
+    shards[1].codes = shards[1].codes[:, :80]
+    shards[2].frames = 120
+    trainer = T.DraftTrainer(model, torch.device("cpu"), batch_size=3)
+    input_ids, attn, targets, max_t, lengths = trainer._collate(shards)
+    assert max_t == 120
+    assert lengths.tolist() == [40, 80, 120]
+    assert targets.shape == (3, 120)
+    assert int((targets[0] != -100).sum()) == 40
+
+
 def test_min_epochs_flag_is_wired_into_both_trainers():
     import inspect
 

@@ -204,6 +204,85 @@ diversity/regularization objective before touching the residual. Do not run the
 one-sentence smoke or the 60-utterance suite until the draft path is fixed.
 Test count is now `134`.
 
+**2026-10-21 prior sweep rejected; true per-sample draft repair implemented.**
+`tune_draft_prior.py` completed on the cached shards. Subtracting
+`alpha * log p_teacher(token)` from the draft logits did not rescue the path:
+
+| alpha | cb0 top-1 | `rd_a` | argmax unique | top frac | longest run |
+|---:|---:|---:|---:|---:|---:|
+| 0.00 | 10.019 % | 1.834 % | 1.5 | 99.9 % | 383 |
+| 0.25 | 11.240 % | 1.827 % | 1.5 | 99.9 % | 383 |
+| 0.50 | 11.433 % | 1.797 % | 1.5 | 99.9 % | 383 |
+| 0.75 | 7.927 % | 1.398 % | 2.0 | 99.5 % | 300 |
+| 1.00 | 0.663 % | 0.225 % | 20.0 | 25.6 % | 60 |
+
+Only `alpha=1.0` diversifies CB0, and it does so by moving to rare tokens while
+CB0 accuracy falls to chance. The listener confirmed that every
+prior-adjusted WAV is muffled/weird. **Prior correction is rejected; do not use
+it as the fix.**
+
+The actual identified defect was only partially fixed by plan 013 Phase 3.
+`length_bucketed_order` reduced the batch-max padding, but every sample was
+still interpolated to `max_t`, so short sentences were trained on a stretched
+text→frame alignment. This is now fixed:
+
+- `TemporalLengthProjector` accepts a per-sample `frame_lengths` tensor. Each
+  sample is interpolated to its own DAC frame count; padded tails are masked
+  after each convolution/norm so a batch's valid tail is identical to a
+  one-sample forward.
+- `DraftTransformer.forward(..., frame_lengths=...)` returns logits padded to
+  the batch maximum; `generate_chunk(..., num_frames=...)` is unchanged.
+- `DraftTrainer._collate` returns per-sample lengths, and both `_run_epoch` and
+  `evaluate_topk` pass them to the model.
+- Draft validation now records `val_argmax_unique`, `val_argmax_top_frac`,
+  `val_argmax_longest_run`, and `val_argmax_entropy_nats` in `meta.json`, so a
+  draft-only retrain can be rejected before spending residual time.
+
+Tests: `137 passed` with
+`movio/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`.
+
+The next run is **draft-only** on the existing 2 000-shard cache. It must not
+rerun the teacher pass, and it writes a separate directory so v3 is untouched:
+
+```bash
+python train_draft_distill.py \
+  --corpus-json codeswitch_corpus.txt \
+  --num-sentences 2000 \
+  --skip-teacher --skip-residual \
+  --draft-epochs 300 --draft-batch 24 \
+  --min-epochs 300 --max-minutes 60 \
+  --teacher-cache teacher_cache \
+  --ckpt-dir codeswitch_ckpt_v4_draft
+```
+
+Inspect `codeswitch_ckpt_v4_draft/meta.json`:
+
+- if `val_argmax_unique` is still ~1–2 and `val_argmax_longest_run` is still
+  near the utterance length, stop. The per-sample fix did not repair the
+  conditioning; the next lever is a stronger draft objective/architecture
+  (class-balanced/focal loss or frame cross-attention), not another residual
+  run.
+- if the argmax is materially diverse and `val_top1` improves on v2's
+  `0.082483`, train the residual from the repaired draft:
+
+```bash
+python train_draft_distill.py \
+  --corpus-json codeswitch_corpus.txt \
+  --num-sentences 2000 \
+  --skip-teacher --skip-draft \
+  --draft-ckpt codeswitch_ckpt_v4_draft \
+  --residual-epochs 150 --residual-ramp-epochs 100 \
+  --residual-sched 1.0 \
+  --residual-d-model 512 --residual-layers 6 \
+  --min-epochs 150 --max-minutes-residual 90 \
+  --teacher-cache teacher_cache \
+  --ckpt-dir codeswitch_ckpt_v4
+```
+
+Then run the unchanged 4-shard diagnostic. The 5 % `rt_a`/`rd_a` gate is
+unchanged: do not run the one-sentence smoke or the 60-utterance suite until
+both pass and the v4 argmax WAV is intelligible.
+
 Before the 60-utterance run, `CodeSwitch_013_RunAll_Kaggle.ipynb` now synthesizes
 one held-out sentence (`ta-01`) in `argmax` mode, prints draft CB0 / residual
 top-1 against a fresh Parler teacher target, and saves

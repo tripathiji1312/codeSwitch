@@ -99,17 +99,56 @@ class TemporalLengthProjector(nn.Module):
         self.act = nn.GELU()
         self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
 
-    def forward(self, x: torch.Tensor, target_frames: int) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, target_frames: Union[int, torch.Tensor]
+    ) -> torch.Tensor:
         # x: (batch, text_len, d_model)
         # Transpose for 1D convolution: (batch, d_model, text_len)
         x_trans = x.transpose(1, 2)
-        # Continuous interpolation to target audio frame rate
-        interpolated = F.interpolate(x_trans, size=target_frames, mode="linear", align_corners=False)
-        # Refinement convolutions
+        mask: Optional[torch.Tensor] = None
+        if isinstance(target_frames, torch.Tensor):
+            lengths = target_frames.to(device=x.device, dtype=torch.long).flatten()
+            if lengths.numel() != x.shape[0]:
+                raise ValueError(
+                    f"target_frames has {lengths.numel()} entries for batch size "
+                    f"{x.shape[0]}"
+                )
+            max_t = int(lengths.max().item())
+            if max_t <= 0:
+                raise ValueError("target_frames must be positive")
+            # Each sample is interpolated to its own duration.  Padding after the
+            # valid region is masked after every convolution (not just zeroed in
+            # the input) so a batch's valid tail is identical to a one-sample run.
+            interpolated = x_trans.new_zeros((x_trans.shape[0], x_trans.shape[1], max_t))
+            for i, n in enumerate(lengths.tolist()):
+                if n <= 0:
+                    continue
+                interpolated[i:i + 1, :, :n] = F.interpolate(
+                    x_trans[i:i + 1], size=int(n), mode="linear", align_corners=False
+                )
+            mask = (
+                torch.arange(max_t, device=x.device).unsqueeze(0)
+                < lengths.unsqueeze(1)
+            ).unsqueeze(1)  # (B, 1, T)
+        else:
+            target_frames = int(target_frames)
+            if target_frames <= 0:
+                raise ValueError("target_frames must be positive")
+            interpolated = F.interpolate(
+                x_trans, size=target_frames, mode="linear", align_corners=False
+            )
+        # Refinement convolutions.  A conv's bias would otherwise leak into the
+        # padded tail and change the last valid frame of the next conv.
         h = self.conv1(interpolated)
+        if mask is not None:
+            h = h * mask
         h = h.transpose(1, 2)
         h = self.act(self.norm(h))
+        if mask is not None:
+            h = h * mask.transpose(1, 2)
         h = self.conv2(h.transpose(1, 2))
+        if mask is not None:
+            h = h * mask
         return h.transpose(1, 2) + interpolated.transpose(1, 2)
 
 
@@ -166,20 +205,30 @@ class DraftTransformer(nn.Module):
         num_frames: Optional[int] = None,
         temperature: float = 1.0,
         sample: bool = True,
+        frame_lengths: Optional[torch.Tensor] = None,
     ) -> DraftOutput:
         """Forward pass generating Codebook 0 categorical distributions.
         
         Args:
             input_ids: (batch, seq_len) token IDs
             attention_mask: (batch, seq_len) boolean mask
-            num_frames: Target number of audio frames (default: config.frames_per_chunk = 86)
+            num_frames: Target number of audio frames for every sample
+                (default: config.frames_per_chunk = 86)
             temperature: Sampling temperature
             sample: Whether to sample from categorical distribution or take argmax
+            frame_lengths: Optional (batch,) per-sample target frame counts.
+                When supplied, each sample is projected to its own duration and
+                the output is padded to the batch maximum.  Training must use
+                this instead of ``num_frames=max_t`` to avoid text stretching.
             
         Returns:
             DraftOutput with logits, probabilities, and discrete draft tokens
         """
-        target_frames = num_frames or self.config.frames_per_chunk
+        target_frames: Union[int, torch.Tensor]
+        if frame_lengths is not None:
+            target_frames = torch.as_tensor(frame_lengths, device=input_ids.device)
+        else:
+            target_frames = num_frames or self.config.frames_per_chunk
         
         # 1. Text embedding & positional encoding
         x = self.text_embedding(input_ids)  # (batch, seq_len, d_model)

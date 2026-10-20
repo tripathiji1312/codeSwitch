@@ -681,12 +681,36 @@ def length_bucketed_order(lengths: Sequence[int], batch_size: int,
 
     Shuffle-only batching padded short sentences up to the longest sentence in
     the batch, training them against a longer frame axis than their own target.
+    Per-sample ``frame_lengths`` is the actual fix; bucketing still keeps the
+    padded tail small and makes batches cheaper.
     """
     order = sorted(range(len(lengths)), key=lambda i: int(lengths[i]))
     blocks = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
     if shuffle:
         (rng or random).shuffle(blocks)
     return [i for block in blocks for i in block]
+
+
+def sequence_diversity_stats(tokens: np.ndarray) -> Dict[str, float]:
+    """Measure whether an argmax sequence is a sequence or one repeated token."""
+    flat = np.asarray(tokens, dtype=np.int64).reshape(-1)
+    n = int(flat.size)
+    if n == 0:
+        return {"unique": 0.0, "top_frac": 1.0, "longest_run": 0.0,
+                "entropy_nats": 0.0}
+    counts = np.bincount(flat, minlength=1024).astype(np.float64)
+    probs = counts[counts > 0] / n
+    entropy = float(-(probs * np.log(probs)).sum())
+    longest = run = 1
+    for i in range(1, n):
+        run = run + 1 if flat[i] == flat[i - 1] else 1
+        longest = max(longest, run)
+    return {
+        "unique": float(np.count_nonzero(counts)),
+        "top_frac": float(counts.max() / n),
+        "longest_run": float(longest),
+        "entropy_nats": entropy,
+    }
 
 
 class DraftTrainer:
@@ -710,14 +734,20 @@ class DraftTrainer:
         input_ids, attn = self.tokenizer.batch_encode(texts)
         max_t = max(s.frames for s in batch)
         targets = torch.full((len(batch), max_t), -100, dtype=torch.long)
+        frame_lengths = torch.tensor([int(s.frames) for s in batch], dtype=torch.long)
         for i, s in enumerate(batch):
             t = s.codes[0]
+            if int(t.shape[0]) != int(s.frames):
+                raise ValueError(
+                    f"shard {s.index}: frames={s.frames} but CB0 has {t.shape[0]}"
+                )
             targets[i, : t.shape[0]] = torch.from_numpy(t).long()
         return (
             input_ids.to(self.device),
             attn.to(self.device),
             targets.to(self.device),
             max_t,
+            frame_lengths.to(self.device),
         )
 
     def _run_epoch(self, shards, optimizer, scaler, train: bool):
@@ -730,7 +760,7 @@ class DraftTrainer:
         use_amp = self.device.type == "cuda"
         for start in range(0, len(order), self.batch_size):
             batch = [shards[j] for j in order[start:start + self.batch_size]]
-            input_ids, attn, targets, max_t = self._collate(batch)
+            input_ids, attn, targets, max_t, frame_lengths = self._collate(batch)
             with torch.set_grad_enabled(train):
                 with torch.autocast(
                     device_type=self.device.type,
@@ -740,7 +770,7 @@ class DraftTrainer:
                     out = self.model(
                         input_ids=input_ids,
                         attention_mask=attn,
-                        num_frames=max_t,
+                        frame_lengths=frame_lengths,
                         sample=False,
                     )
                     loss = torch.nn.functional.cross_entropy(
@@ -769,29 +799,39 @@ class DraftTrainer:
     def evaluate_topk(self, shards, k: int = 5) -> Tuple[float, float]:
         self.model.eval()
         top1 = topk = total = 0
+        diversities: List[Dict[str, float]] = []
         order = length_bucketed_order(
             [s.frames for s in shards], self.batch_size, shuffle=False
         )
         for start in range(0, len(order), self.batch_size):
             batch = [shards[j] for j in order[start:start + self.batch_size]]
-            input_ids, attn, targets, max_t = self._collate(batch)
+            input_ids, attn, targets, max_t, frame_lengths = self._collate(batch)
             out = self.model(
-                input_ids=input_ids, attention_mask=attn, num_frames=max_t, sample=False
+                input_ids=input_ids,
+                attention_mask=attn,
+                frame_lengths=frame_lengths,
+                sample=False,
             )
             logits = out.logits
             for i, s in enumerate(batch):
                 t = s.codes[0]
                 lg = logits[i, : t.shape[0]]
                 pred1 = lg.argmax(dim=-1)
-                top1 += int((pred1 == torch.from_numpy(t).long().to(pred1.device)).sum().item())
+                target = torch.from_numpy(t).long().to(pred1.device)
+                top1 += int((pred1 == target).sum().item())
                 topk_pred = lg.topk(min(k, lg.shape[-1]), dim=-1).indices
-                topk += int(
-                    (topk_pred == torch.from_numpy(t).long().to(pred1.device).unsqueeze(-1))
-                    .any(dim=-1)
-                    .sum()
-                    .item()
+                topk += int((topk_pred == target.unsqueeze(-1)).any(dim=-1).sum().item())
+                diversities.append(
+                    sequence_diversity_stats(pred1.detach().cpu().numpy())
                 )
                 total += t.shape[0]
+        if diversities:
+            self.last_argmax_stats = {
+                key: float(np.mean([d[key] for d in diversities]))
+                for key in ("unique", "top_frac", "longest_run", "entropy_nats")
+            }
+        else:
+            self.last_argmax_stats = {}
         if total == 0:
             return 0.0, 0.0
         return top1 / total, topk / total
@@ -859,17 +899,26 @@ class DraftTrainer:
         if best_state is not None:
             self.model.load_state_dict(best_state)
         top1, top5 = self.evaluate_topk(val_shards)
+        diversity = getattr(self, "last_argmax_stats", {})
         stats.update(
             best_val_loss=float(best_val),
             best_epoch=int(best_epoch),
             epochs_run=int(epoch),
             val_top1=float(top1),
             val_top5=float(top5),
+            val_argmax_unique=float(diversity.get("unique", 0.0)),
+            val_argmax_top_frac=float(diversity.get("top_frac", 1.0)),
+            val_argmax_longest_run=float(diversity.get("longest_run", 0.0)),
+            val_argmax_entropy_nats=float(diversity.get("entropy_nats", 0.0)),
             train_seconds=float(_now() - t_start),
         )
         print(
             f"[Draft] done | best val {best_val:.4f} @ epoch {best_epoch} | "
-            f"CB0 top-1 {top1 * 100:.2f}% | top-5 {top5 * 100:.2f}%"
+            f"CB0 top-1 {top1 * 100:.2f}% | top-5 {top5 * 100:.2f}% | "
+            f"argmax unique {stats['val_argmax_unique']:.1f}, "
+            f"top {stats['val_argmax_top_frac']:.1%}, "
+            f"run {stats['val_argmax_longest_run']:.0f}, "
+            f"H {stats['val_argmax_entropy_nats']:.2f}"
         )
         return stats
 

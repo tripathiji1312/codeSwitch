@@ -70,6 +70,33 @@ def test_generate_chunk_argmax_is_deterministic():
     assert torch.equal(out_a.tokens, out_a.probabilities.argmax(dim=-1))
 
 
+def test_draft_forward_uses_per_sample_frame_lengths():
+    """Short samples must not be stretched over a longer batch-mate's frames."""
+    from codeswitch_tts import DraftModelConfig
+
+    config = DraftModelConfig(d_model=16, n_heads=2, num_layers=1, d_ff=32)
+    model = DraftTransformer(config).eval()
+    input_ids, mask = model.tokenizer.batch_encode(["Hello", "Hello there"])
+    with torch.no_grad():
+        batched = model(
+            input_ids=input_ids,
+            attention_mask=mask,
+            frame_lengths=torch.tensor([4, 7]),
+            sample=False,
+        )
+        one = model(
+            input_ids=input_ids[:1],
+            attention_mask=mask[:1],
+            num_frames=4,
+            sample=False,
+        )
+    assert batched.logits.shape == (2, 7, 1024)
+    assert batched.tokens.shape == (2, 7)
+    # The first sample's four valid frames must match a dedicated four-frame
+    # forward pass; only the padded tail may differ.
+    assert torch.allclose(batched.logits[0, :4], one.logits[0], atol=1e-5)
+
+
 def test_arg_parser_exposes_sample_mode():
     import run_full_evaluation as R
 
