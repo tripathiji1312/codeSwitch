@@ -9,6 +9,8 @@ conditions, done criteria.
 Evidence base: `plans/research/findings-2026-10-18.md` (all six audit reports + subagent reports
 verbatim, plus 2026-10-19 addenda) · index: `plans/research/INDEX.md`.
 
+Detailed 013 status, exact metrics, and run commands: `plans/013-bc-noise-status.md`.
+
 ## Ground rules (apply to every plan)
 
 - Repo: `/home/tripathiji/projects/all_work`. One plan → one branch (`git checkout -b
