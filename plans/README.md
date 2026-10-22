@@ -239,10 +239,38 @@ text→frame alignment. This is now fixed:
   draft-only retrain can be rejected before spending residual time.
 
 Tests: `137 passed` with
-`movio/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`.
+`movio/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` for the
+per-sample slice; the full suite is `140 passed` after the v5 decoder tests.
 
-The next run is **draft-only** on the existing 2 000-shard cache. It must not
-rerun the teacher pass, and it writes a separate directory so v3 is untouched:
+**2026-10-22 v4 draft-only result (triage failed).** The draft-only run completed
+in 23m54s and used the existing 2 000-shard cache (`--skip-teacher
+--skip-residual`). Best validation loss was `5.0542 @ epoch 12`; the final draft
+block was:
+
+| metric | v2 | v4 | triage |
+|---|---:|---:|---:|
+| `val_top1` | 8.2483 % | 8.26 % | `< 10 %` FAIL |
+| `val_top5` | — | 23.07 % | — |
+| `val_argmax_unique` | — | 2.1 | `< 16` FAIL |
+| `val_argmax_top_frac` | — | 98.8 % | `> 40 %` FAIL |
+| `val_argmax_longest_run` | — | 332 | `> 100` FAIL |
+| `val_argmax_entropy_nats` | — | 0.05 | — |
+
+Per-sample frame lengths were necessary but not sufficient: the argmax path is
+still the teacher prior, not text conditioning. **Do not train the residual from
+`codeswitch_ckpt_v4_draft`.**
+
+**2026-10-22 v5 draft repair: text-conditioned frame decoder.** The next lever
+is architectural, not another residual or loss-only tweak. `DraftModelConfig`
+now has `frame_decoder_layers: int = 0`; nonzero creates a `FrameDecoder` with
+learned frame queries, sinusoidal frame positions, a whole-utterance length
+embedding, frame self-attention, and cross-attention to the text encoder memory.
+Per-sample frame lengths use `tgt_key_padding_mask`; text padding uses
+`memory_key_padding_mask`. The default `0` keeps the legacy
+`TemporalLengthProjector` path, so v2/v3/v4 checkpoints load without new keys.
+The CLI flag is `--draft-frame-decoder-layers`.
+
+Run the v5 draft only, on the existing cache, into a new directory:
 
 ```bash
 python train_draft_distill.py \
@@ -250,18 +278,18 @@ python train_draft_distill.py \
   --num-sentences 2000 \
   --skip-teacher --skip-residual \
   --draft-epochs 300 --draft-batch 24 \
+  --draft-frame-decoder-layers 2 \
   --min-epochs 300 --max-minutes 60 \
   --teacher-cache teacher_cache \
-  --ckpt-dir codeswitch_ckpt_v4_draft
+  --ckpt-dir codeswitch_ckpt_v5_draft
 ```
 
-Inspect `codeswitch_ckpt_v4_draft/meta.json`:
+Inspect `codeswitch_ckpt_v5_draft/meta.json` with the same triage:
 
 - if `val_argmax_unique` is still ~1–2 and `val_argmax_longest_run` is still
-  near the utterance length, stop. The per-sample fix did not repair the
-  conditioning; the next lever is a stronger draft objective/architecture
-  (class-balanced/focal loss or frame cross-attention), not another residual
-  run.
+  near the utterance length, stop. Cross-attention did not repair conditioning;
+  the next levers are class-balanced/focal loss or multi-sample teacher targets,
+  not another residual run.
 - if the argmax is materially diverse and `val_top1` improves on v2's
   `0.082483`, train the residual from the repaired draft:
 
@@ -270,18 +298,18 @@ python train_draft_distill.py \
   --corpus-json codeswitch_corpus.txt \
   --num-sentences 2000 \
   --skip-teacher --skip-draft \
-  --draft-ckpt codeswitch_ckpt_v4_draft \
+  --draft-ckpt codeswitch_ckpt_v5_draft \
   --residual-epochs 150 --residual-ramp-epochs 100 \
   --residual-sched 1.0 \
   --residual-d-model 512 --residual-layers 6 \
   --min-epochs 150 --max-minutes-residual 90 \
   --teacher-cache teacher_cache \
-  --ckpt-dir codeswitch_ckpt_v4
+  --ckpt-dir codeswitch_ckpt_v5
 ```
 
 Then run the unchanged 4-shard diagnostic. The 5 % `rt_a`/`rd_a` gate is
 unchanged: do not run the one-sentence smoke or the 60-utterance suite until
-both pass and the v4 argmax WAV is intelligible.
+both pass and the v5 argmax WAV is intelligible.
 
 Before the 60-utterance run, `CodeSwitch_013_RunAll_Kaggle.ipynb` now synthesizes
 one held-out sentence (`ta-01`) in `argmax` mode, prints draft CB0 / residual

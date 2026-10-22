@@ -39,6 +39,12 @@ class DraftModelConfig:
     codebook_size: int = 1024  # Codebook 0 vocabulary
     max_text_len: int = 512
     frames_per_chunk: int = 86
+    # 0 keeps the legacy TemporalLengthProjector path so existing checkpoints
+    # load unchanged.  A positive value adds a frame-query decoder whose
+    # self-attention runs over acoustic frames and whose cross-attention reads
+    # the text encoder memory.
+    frame_decoder_layers: int = 0
+    max_frames: int = 2048
 
 
 @dataclass

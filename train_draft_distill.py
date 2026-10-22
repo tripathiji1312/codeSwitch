@@ -1432,6 +1432,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft-epochs", type=int, default=80)
     p.add_argument("--draft-batch", type=int, default=24)
     p.add_argument("--draft-lr", type=float, default=3e-4)
+    p.add_argument("--draft-frame-decoder-layers", type=int, default=0,
+                   help="Add a text-conditioned frame decoder with this many layers. "
+                        "0 keeps the legacy temporal projector (default).")
     p.add_argument("--max-minutes", type=float, default=12.0,
                    help="Wall-clock budget for draft training.")
     p.add_argument("--min-epochs", type=int, default=0,
@@ -1488,6 +1491,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     config = CodeSwitchTTSConfig()
     config.system.allow_untrained_fallback = False  # teacher MUST be real speech
+    if args.draft_frame_decoder_layers < 0 or args.draft_frame_decoder_layers > 6:
+        print("[Draft] --draft-frame-decoder-layers must be between 0 and 6")
+        return 2
+    config.draft.frame_decoder_layers = int(args.draft_frame_decoder_layers)
     if args.residual_d_model:
         if args.residual_d_model < 64:
             print("[Residual] --residual-d-model must be >= 64")

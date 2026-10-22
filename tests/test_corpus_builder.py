@@ -724,3 +724,16 @@ def test_min_epochs_flag_is_wired_into_both_trainers():
     assert source.count("min_epochs=args.min_epochs") == 2, (
         "--min-epochs must be passed to both the draft and the residual trainer"
     )
+
+
+def test_draft_frame_decoder_layers_flag_is_wired():
+    import inspect
+
+    import train_draft_distill as T
+
+    args = T.build_arg_parser().parse_args(
+        ["--draft-frame-decoder-layers", "2"]
+    )
+    assert args.draft_frame_decoder_layers == 2
+    source = inspect.getsource(T.main)
+    assert "config.draft.frame_decoder_layers = int(args.draft_frame_decoder_layers)" in source

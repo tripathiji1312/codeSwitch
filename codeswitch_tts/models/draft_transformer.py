@@ -4,7 +4,9 @@ Architecture:
   - Text Tokenization & Character/Subword Embedding (vocab_size=4096, d_model=512)
   - Positional Encodings
   - 4-layer Transformer Encoder (d_model=512, 8 heads, d_ff=2048, ~65M parameters)
-  - Temporal Length Projector (aligns text to 86 DAC frames per 1-second chunk)
+  - Temporal alignment: either the legacy nearest-neighbour length projector or
+    an opt-in frame-query decoder that self-attends over acoustic frames and
+    cross-attends to the text encoder memory
   - Categorical Classification Head predicting DAC Codebook-0 distributions P̂(y_t)
 """
 
@@ -152,6 +154,92 @@ class TemporalLengthProjector(nn.Module):
         return h.transpose(1, 2) + interpolated.transpose(1, 2)
 
 
+class FrameDecoder(nn.Module):
+    """Text-conditioned non-autoregressive acoustic-frame decoder.
+
+    Each acoustic frame starts as a learned query plus a positional code and a
+    whole-utterance length embedding.  Decoder self-attention lets frames see
+    one another, while cross-attention reads the text encoder memory.  This is
+    deliberately opt-in: the legacy length projector is kept byte-for-byte so
+    older checkpoints continue to load without new keys.
+    """
+
+    def __init__(self, config: DraftModelConfig):
+        super().__init__()
+        if config.frame_decoder_layers < 1:
+            raise ValueError("FrameDecoder requires frame_decoder_layers >= 1")
+        if config.max_frames < 1:
+            raise ValueError("max_frames must be positive")
+
+        self.d_model = config.d_model
+        self.max_frames = config.max_frames
+        self.frame_queries = nn.Parameter(
+            torch.empty(1, self.max_frames, self.d_model)
+        )
+        nn.init.normal_(self.frame_queries, mean=0.0, std=0.02)
+
+        self.pos_encoder = PositionalEncoding(
+            self.d_model, max_len=self.max_frames
+        )
+        self.length_embedding = nn.Embedding(self.max_frames + 1, self.d_model)
+        nn.init.normal_(self.length_embedding.weight, mean=0.0, std=0.02)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,
+            nhead=config.n_heads,
+            dim_feedforward=config.d_ff,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=config.frame_decoder_layers,
+            norm=nn.LayerNorm(self.d_model),
+        )
+
+    def forward(
+        self,
+        memory: torch.Tensor,
+        memory_key_padding_mask: Optional[torch.Tensor],
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode frames for a batch.
+
+        Args:
+            memory: (batch, text_len, d_model) encoded text.
+            memory_key_padding_mask: (batch, text_len) True for text padding.
+            lengths: (batch,) positive, per-sample frame counts.
+        """
+        if lengths.ndim != 1 or lengths.numel() != memory.shape[0]:
+            raise ValueError(
+                f"lengths must have shape ({memory.shape[0]},), got "
+                f"{tuple(lengths.shape)}"
+            )
+        if int(lengths.min().item()) <= 0:
+            raise ValueError("frame lengths must be positive")
+        max_t = int(lengths.max().item())
+        if max_t > self.max_frames:
+            raise ValueError(
+                f"frame length {max_t} exceeds max_frames={self.max_frames}"
+            )
+
+        batch = memory.shape[0]
+        queries = self.frame_queries[:, :max_t, :].expand(batch, -1, -1)
+        queries = self.pos_encoder(queries)
+        queries = queries + self.length_embedding(lengths).unsqueeze(1)
+
+        positions = torch.arange(max_t, device=memory.device).unsqueeze(0)
+        tgt_key_padding_mask = positions >= lengths.unsqueeze(1)
+        return self.decoder(
+            queries,
+            memory,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+        )
+
+
 class DraftTransformer(nn.Module):
     """Discrete Codebook-0 NAR Draft Model (~65M parameters).
     
@@ -186,6 +274,13 @@ class DraftTransformer(nn.Module):
         # Temporal expansion module (Text -> Audio Frame Domain)
         self.temporal_projector = TemporalLengthProjector(self.config.d_model)
 
+        # Optional text-conditioned frame decoder.  None on legacy checkpoints.
+        self.frame_decoder: Optional[FrameDecoder] = None
+        if self.config.frame_decoder_layers < 0:
+            raise ValueError("frame_decoder_layers must be >= 0")
+        if self.config.frame_decoder_layers > 0:
+            self.frame_decoder = FrameDecoder(self.config)
+
         # Codebook 0 Categorical Head (vocab = 1024)
         self.cb0_head = nn.Linear(self.config.d_model, self.config.codebook_size)
 
@@ -217,9 +312,10 @@ class DraftTransformer(nn.Module):
             temperature: Sampling temperature
             sample: Whether to sample from categorical distribution or take argmax
             frame_lengths: Optional (batch,) per-sample target frame counts.
-                When supplied, each sample is projected to its own duration and
-                the output is padded to the batch maximum.  Training must use
-                this instead of ``num_frames=max_t`` to avoid text stretching.
+                When supplied, each sample is decoded/projected to its own
+                duration and the output is padded to the batch maximum.
+                Training must use this instead of ``num_frames=max_t`` to avoid
+                text stretching.
             
         Returns:
             DraftOutput with logits, probabilities, and discrete draft tokens
@@ -238,8 +334,26 @@ class DraftTransformer(nn.Module):
         src_key_padding_mask = ~attention_mask if attention_mask is not None else None
         h = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
 
-        # 3. Temporal Projector to 1-second audio frame rate (~86 frames)
-        frame_features = self.temporal_projector(h, target_frames=target_frames)
+        # 3. Text -> acoustic-frame alignment.
+        # The legacy projector interpolates text features.  The opt-in decoder
+        # instead gives every frame its own query and cross-attends to text.
+        if self.frame_decoder is not None:
+            if isinstance(target_frames, torch.Tensor):
+                lengths = target_frames.to(device=input_ids.device, dtype=torch.long).flatten()
+            else:
+                lengths = torch.full(
+                    (input_ids.shape[0],), int(target_frames),
+                    device=input_ids.device, dtype=torch.long,
+                )
+            frame_features = self.frame_decoder(
+                h,
+                memory_key_padding_mask=src_key_padding_mask,
+                lengths=lengths,
+            )
+        else:
+            if not isinstance(target_frames, torch.Tensor) and int(target_frames) <= 0:
+                raise ValueError("target_frames must be positive")
+            frame_features = self.temporal_projector(h, target_frames=target_frames)
 
         # 4. Predict Codebook 0 categorical distributions
         logits = self.cb0_head(frame_features)  # (batch, target_frames, 1024)

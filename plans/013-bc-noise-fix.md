@@ -1190,3 +1190,44 @@ Phase 6
    006 first and adapt 013 to its pinned loader? Recommendation: 013 first — 006's
    current text expects the old broken behavior and would need rewriting either
    way.
+
+---
+
+## 9. Amendment — 2026-10-22: v4 triage failed; v5 uses a frame decoder
+
+**Result.** The v4 draft-only run (true per-sample frame lengths, legacy
+`TemporalLengthProjector`) finished in 23m54s using the cached 2 000 shards.
+Best val was `5.0542 @ epoch 12`; CB0 `top-1=8.26 %`, `top-5=23.07 %`,
+argmax `unique=2.1`, `top_frac=98.8 %`, `longest_run=332`, entropy `0.05`.
+That is still the teacher prior, not text conditioning. The v4 draft fails the
+triage and **must not** be used to train the residual.
+
+**Why this is not a gate change.** The paper gate is still `rt_a >= 5 %` and
+`rd_a >= 5 %`, measured by `diagnose_audio_bug.py`. The draft triage is only a
+time-saving check before residual training.
+
+**v5 design.** `DraftModelConfig.frame_decoder_layers` defaults to `0` (legacy
+checkpoint compatibility). A positive value adds `FrameDecoder`:
+
+- learned frame queries + sinusoidal frame positions + whole-utterance length
+  embedding;
+- decoder self-attention over acoustic frames;
+- cross-attention to the existing text-encoder memory;
+- `tgt_key_padding_mask` for per-sample frame counts and
+  `memory_key_padding_mask` for text padding.
+
+The interface is unchanged: `DraftTransformer.forward(..., frame_lengths=...)`
+still returns logits padded to the batch maximum. `train_draft_distill.py`
+exposes `--draft-frame-decoder-layers` (0–6; 0 default). Old checkpoints load
+because the default config creates no new modules.
+
+**Verification.** `movio/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+→ `140 passed, 3 warnings`. New tests cover opt-in decoder shape, deterministic
+argmax, per-sample masking equivalence, the legacy state-dict path, and CLI
+plumbing.
+
+**Next run.** Draft-only into `codeswitch_ckpt_v5_draft` with
+`--draft-frame-decoder-layers 2`; inspect `val_top1`, `val_argmax_unique`,
+`val_argmax_top_frac`, and `val_argmax_longest_run` before any residual. If the
+draft still collapses, the next lever is class-balanced/focal loss or
+multi-sample teacher targets, not another residual-only run.
