@@ -1,9 +1,9 @@
 # Plans — CodeSwitch-TTS "paper-critical + trust" bundle
 
 Twelve self-contained implementation plans produced by the 2026-10-18 `improve` audit of this
-repository, plus plan 013 (the 2026-10-20 B/C noise fix). Every plan was written for a zero-context
-executor agent: exact anchors, exact old/new strings, exact commands with expected outputs, STOP
-conditions, done criteria.
+repository, plus plan 013 (the 2026-10-20 B/C noise fix) and plan 014 (the 2026-10-24 real-data
+scale + duration work). Every plan was written for a zero-context executor agent: exact anchors,
+exact old/new strings, exact commands with expected outputs, STOP conditions, done criteria.
 **Read the plan; follow it literally; do not improvise.**
 
 Evidence base: `plans/research/findings-2026-10-18.md` (all six audit reports + subagent reports
@@ -120,6 +120,7 @@ Statuses: `TODO` · `IN PROGRESS` · `DONE` · `BLOCKED` · `REJECTED`.
 | 011 | [docs-truth-pass](011-docs-truth-pass.md) | Medium | ~1 h | ±0 | `advisor/011-docs-truth-pass` | TODO |
 | 012 | [perf-quick-wins](012-perf-quick-wins.md) | Medium-High | ~2–3 h | +3 | `advisor/012-perf-quick-wins` | TODO |
 | 013 | [bc-noise-fix](013-bc-noise-fix.md) | P0 | L | +5 | `fix/013-bc-noise` | IN PROGRESS |
+| 014 | [real-data-duration](014-real-data-duration.md) | P0 | L | +30 | `fix/013-bc-noise` | IN PROGRESS |
 
 Plan 013 is the 2026-10-20 follow-up to the B/C noise diagnosis. Its evidence base is
 `research/findings-2026-10-20.md` (repo-root `research/`, not `plans/research/`). It
@@ -127,6 +128,15 @@ conflicts with plan 006 on `codeswitch_tts/utils/audio.py::DACWrapper._load_dac`
 execute 013 first and rebase 006 by content (or drop 006's DAC-loader section).
 Code/tests for Phases 1–4 have landed on `fix/013-bc-noise`; the Kaggle retrain,
 argmax evaluation, and quality gates are still pending.
+
+Plan 014 is the 2026-10-24 data-scale follow-up on the same branch. It adds a
+real-speech → DAC shard pipeline, optional CTC per-character durations, a
+duration-predicted v6 draft, and `CodeSwitch_DataScale_Kaggle.ipynb`. The code
+and tests are complete, and a public FLEURS Tamil smoke has produced real
+duration shards plus a duration-conditioned checkpoint. Rasa/IndicVoices-R are
+gated and were not downloaded; full v6 training, the unchanged 5% gate, and the
+60-utterance evaluation remain unverified. See
+[`014-real-data-duration.md`](014-real-data-duration.md).
 
 **2026-10-20 residual-only amendment (post-v2 listening).** The matched v2
 hybrids isolate the residual as the primary bottleneck: `teacher_full` is clear,

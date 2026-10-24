@@ -75,6 +75,7 @@ from codeswitch_benchmark_data import (  # noqa: E402
     build_training_corpus,
     load_corpus_json,
 )
+from codeswitch_tts.data.shards import SpeechShard  # noqa: E402
 
 try:  # torch is imported through codeswitch_tts already, but keep it explicit
     import torch
@@ -201,48 +202,9 @@ def teacher_shard_name(text: str) -> str:
     return f"shard_{digest}.npz"
 
 
-@dataclass
-class TeacherShard:
-    """One teacher utterance: normalized text + 9xT DAC codes."""
-
-    index: int
-    raw_text: str
-    norm_text: str
-    n_chars: int
-    frames: int
-    codes: np.ndarray  # (9, T) int16
-    audio_sec: float
-    target_source: str
-    gen_ms: float
-
-    def save(self, path: Path) -> None:
-        np.savez_compressed(
-            path,
-            index=self.index,
-            raw_text=self.raw_text,
-            norm_text=self.norm_text,
-            n_chars=self.n_chars,
-            frames=self.frames,
-            codes=self.codes.astype(np.int16),
-            audio_sec=self.audio_sec,
-            target_source=self.target_source,
-            gen_ms=self.gen_ms,
-        )
-
-    @classmethod
-    def load(cls, path: Path) -> "TeacherShard":
-        data = np.load(path, allow_pickle=False)
-        return cls(
-            index=int(data["index"]),
-            raw_text=str(data["raw_text"]),
-            norm_text=str(data["norm_text"]),
-            n_chars=int(data["n_chars"]),
-            frames=int(data["frames"]),
-            codes=data["codes"].astype(np.int64),
-            audio_sec=float(data["audio_sec"]),
-            target_source=str(data["target_source"]),
-            gen_ms=float(data["gen_ms"]),
-        )
+# Backwards-compatible name: the old teacher cache and the new real-speech
+# pipeline share one on-disk contract (``SpeechShard``).
+TeacherShard = SpeechShard
 
 
 class _CodeCaptureStreamer:
@@ -721,6 +683,7 @@ class DraftTrainer:
         lr: float = 3e-4,
         batch_size: int = 24,
         seed: int = 42,
+        duration_loss_weight: float = 0.1,
     ):
         self.model = draft_model
         self.device = device
@@ -728,6 +691,15 @@ class DraftTrainer:
         self.batch_size = batch_size
         self.seed = seed
         self.tokenizer = draft_model.tokenizer
+        self.duration_loss_weight = float(max(0.0, duration_loss_weight))
+        self.last_duration_loss: Optional[float] = None
+
+    @property
+    def uses_durations(self) -> bool:
+        return (
+            self.model.frame_decoder is not None
+            and getattr(self.model.frame_decoder, "duration_proj", None) is not None
+        )
 
     def _collate(self, batch: List[TeacherShard]):
         texts = [s.norm_text for s in batch]
@@ -735,6 +707,10 @@ class DraftTrainer:
         max_t = max(s.frames for s in batch)
         targets = torch.full((len(batch), max_t), -100, dtype=torch.long)
         frame_lengths = torch.tensor([int(s.frames) for s in batch], dtype=torch.long)
+        # Per-token durations are in the *tokenizer* coordinate system: one
+        # zero-duration BOS, then one entry per text character, then EOS.
+        token_durations = torch.zeros_like(input_ids, dtype=torch.float32)
+        duration_supervised = torch.zeros(len(batch), dtype=torch.bool)
         for i, s in enumerate(batch):
             t = s.codes[0]
             if int(t.shape[0]) != int(s.frames):
@@ -742,12 +718,33 @@ class DraftTrainer:
                     f"shard {s.index}: frames={s.frames} but CB0 has {t.shape[0]}"
                 )
             targets[i, : t.shape[0]] = torch.from_numpy(t).long()
+            n_tokens = int(attn[i].sum().item())
+            if (
+                s.has_durations
+                and s.char_durations is not None
+                and len(s.char_durations) == len(s.norm_text)
+            ):
+                with_eos = np.concatenate(
+                    ([0.0], s.char_durations.astype(np.float32), [0.0])
+                )
+                take = min(int(with_eos.size), n_tokens)
+                token_durations[i, :take] = torch.from_numpy(
+                    with_eos[:take].copy()
+                )
+                duration_supervised[i] = True
+            else:
+                # Uniform layout for shards without an aligner (legacy teacher
+                # cache).  The duration loss is masked out for these rows.
+                content = max(1, n_tokens - 2)
+                token_durations[i, 1:1 + content] = float(s.frames) / content
         return (
             input_ids.to(self.device),
             attn.to(self.device),
             targets.to(self.device),
             max_t,
             frame_lengths.to(self.device),
+            token_durations.to(self.device),
+            duration_supervised.to(self.device),
         )
 
     def _run_epoch(self, shards, optimizer, scaler, train: bool):
@@ -757,10 +754,22 @@ class DraftTrainer:
             shuffle=train, rng=random,
         )
         total_loss, total_frames = 0.0, 0
+        total_duration_loss, duration_batches = 0.0, 0
         use_amp = self.device.type == "cuda"
         for start in range(0, len(order), self.batch_size):
             batch = [shards[j] for j in order[start:start + self.batch_size]]
-            input_ids, attn, targets, max_t, frame_lengths = self._collate(batch)
+            (
+                input_ids,
+                attn,
+                targets,
+                max_t,
+                frame_lengths,
+                token_durations,
+                duration_supervised,
+            ) = self._collate(batch)
+            duration_kwargs = (
+                {"token_durations": token_durations} if self.uses_durations else {}
+            )
             with torch.set_grad_enabled(train):
                 with torch.autocast(
                     device_type=self.device.type,
@@ -772,12 +781,30 @@ class DraftTrainer:
                         attention_mask=attn,
                         frame_lengths=frame_lengths,
                         sample=False,
+                        **duration_kwargs,
                     )
                     loss = torch.nn.functional.cross_entropy(
                         out.logits.reshape(-1, out.logits.shape[-1]),
                         targets.reshape(-1),
                         ignore_index=-100,
                     )
+                    duration_loss = None
+                    if (
+                        out.duration_logits is not None
+                        and self.duration_loss_weight > 0.0
+                        and duration_supervised.any()
+                    ):
+                        duration_mask = (
+                            duration_supervised.unsqueeze(1)
+                            & (token_durations > 0)
+                            & attn
+                        )
+                        if duration_mask.any():
+                            duration_loss = torch.nn.functional.smooth_l1_loss(
+                                out.duration_logits[duration_mask],
+                                torch.log1p(token_durations[duration_mask]),
+                            )
+                            loss = loss + self.duration_loss_weight * duration_loss
                 if train:
                     optimizer.zero_grad(set_to_none=True)
                     if scaler is not None:
@@ -793,10 +820,18 @@ class DraftTrainer:
             n_frames = int((targets != -100).sum().item())
             total_loss += float(loss.detach().cpu()) * n_frames
             total_frames += n_frames
+            if duration_loss is not None:
+                total_duration_loss += float(duration_loss.detach().cpu())
+                duration_batches += 1
+        self.last_duration_loss = (
+            total_duration_loss / duration_batches if duration_batches else None
+        )
         return total_loss / max(1, total_frames)
 
     @torch.inference_mode()
-    def evaluate_topk(self, shards, k: int = 5) -> Tuple[float, float]:
+    def evaluate_topk(
+        self, shards, k: int = 5, use_gt_durations: bool = False
+    ) -> Tuple[float, float]:
         self.model.eval()
         top1 = topk = total = 0
         diversities: List[Dict[str, float]] = []
@@ -805,12 +840,26 @@ class DraftTrainer:
         )
         for start in range(0, len(order), self.batch_size):
             batch = [shards[j] for j in order[start:start + self.batch_size]]
-            input_ids, attn, targets, max_t, frame_lengths = self._collate(batch)
+            (
+                input_ids,
+                attn,
+                targets,
+                max_t,
+                frame_lengths,
+                token_durations,
+                _duration_supervised,
+            ) = self._collate(batch)
+            duration_kwargs = (
+                {"token_durations": token_durations}
+                if use_gt_durations and self.uses_durations
+                else {}
+            )
             out = self.model(
                 input_ids=input_ids,
                 attention_mask=attn,
                 frame_lengths=frame_lengths,
                 sample=False,
+                **duration_kwargs,
             )
             logits = out.logits
             for i, s in enumerate(batch):
@@ -863,6 +912,7 @@ class DraftTrainer:
         best_val = float("inf")
         best_state: Optional[Dict[str, torch.Tensor]] = None
         best_epoch = -1
+        best_duration_loss: Optional[float] = None
         stale = 0
         t_start = _now()
         stats: Dict[str, float] = {}
@@ -876,6 +926,7 @@ class DraftTrainer:
             if improved:
                 best_val = val_loss
                 best_epoch = epoch
+                best_duration_loss = self.last_duration_loss
                 stale = 0
                 best_state = {
                     k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
@@ -898,20 +949,41 @@ class DraftTrainer:
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
+            self.last_duration_loss = best_duration_loss
+        # Primary metric is inference-honest: no external durations.  The GT
+        # pass is an oracle-alignment ablation for diagnosing the duration head.
+        gt_top1 = gt_top5 = None
+        val_duration_shards = sum(1 for s in val_shards if s.has_durations)
+        if self.model.duration_predictor is not None and val_duration_shards:
+            gt_top1, gt_top5 = self.evaluate_topk(val_shards, use_gt_durations=True)
         top1, top5 = self.evaluate_topk(val_shards)
         diversity = getattr(self, "last_argmax_stats", {})
+        duration_shards = sum(1 for s in shards if s.has_durations)
         stats.update(
             best_val_loss=float(best_val),
             best_epoch=int(best_epoch),
             epochs_run=int(epoch),
             val_top1=float(top1),
             val_top5=float(top5),
+            duration_conditioning=bool(self.model.duration_predictor is not None),
+            duration_loss_weight=float(self.duration_loss_weight),
+            duration_shards=int(duration_shards),
+            duration_shard_fraction=float(duration_shards / max(1, len(shards))),
+            val_duration_shards=int(val_duration_shards),
+            val_duration_loss=(
+                float(self.last_duration_loss)
+                if self.last_duration_loss is not None
+                else None
+            ),
             val_argmax_unique=float(diversity.get("unique", 0.0)),
             val_argmax_top_frac=float(diversity.get("top_frac", 1.0)),
             val_argmax_longest_run=float(diversity.get("longest_run", 0.0)),
             val_argmax_entropy_nats=float(diversity.get("entropy_nats", 0.0)),
             train_seconds=float(_now() - t_start),
         )
+        if gt_top1 is not None:
+            stats["val_top1_gt_durations"] = float(gt_top1)
+            stats["val_top5_gt_durations"] = float(gt_top5)
         print(
             f"[Draft] done | best val {best_val:.4f} @ epoch {best_epoch} | "
             f"CB0 top-1 {top1 * 100:.2f}% | top-5 {top5 * 100:.2f}% | "
@@ -920,6 +992,12 @@ class DraftTrainer:
             f"run {stats['val_argmax_longest_run']:.0f}, "
             f"H {stats['val_argmax_entropy_nats']:.2f}"
         )
+        if gt_top1 is not None:
+            print(
+                f"[Draft] oracle-duration ablation | CB0 top-1 {gt_top1 * 100:.2f}% | "
+                f"top-5 {gt_top5 * 100:.2f}% | duration shards "
+                f"{duration_shards}/{len(shards)}"
+            )
         return stats
 
 
@@ -1435,6 +1513,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft-frame-decoder-layers", type=int, default=0,
                    help="Add a text-conditioned frame decoder with this many layers. "
                         "0 keeps the legacy temporal projector (default).")
+    p.add_argument("--draft-duration-conditioning", action="store_true",
+                   help="Add a duration head and feed CTC-derived per-character durations "
+                        "into the frame decoder. Requires --draft-frame-decoder-layers >= 1.")
+    p.add_argument("--draft-duration-loss-weight", type=float, default=0.1,
+                   help="Weight for the duration-prediction smooth-L1 loss.")
+    p.add_argument("--require-durations", action="store_true",
+                   help="Refuse to train on any shard without per-character durations.")
     p.add_argument("--max-minutes", type=float, default=12.0,
                    help="Wall-clock budget for draft training.")
     p.add_argument("--min-epochs", type=int, default=0,
@@ -1495,6 +1580,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[Draft] --draft-frame-decoder-layers must be between 0 and 6")
         return 2
     config.draft.frame_decoder_layers = int(args.draft_frame_decoder_layers)
+    if args.draft_duration_conditioning:
+        if config.draft.frame_decoder_layers < 1:
+            print(
+                "[Draft] --draft-duration-conditioning requires "
+                "--draft-frame-decoder-layers >= 1"
+            )
+            return 2
+        config.draft.duration_conditioning = True
+    if args.draft_duration_loss_weight < 0.0:
+        print("[Draft] --draft-duration-loss-weight must be >= 0")
+        return 2
     if args.residual_d_model:
         if args.residual_d_model < 64:
             print("[Residual] --residual-d-model must be >= 64")
@@ -1589,6 +1685,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("[Teacher] interrupted — partial shards are cached; re-run to resume.")
             return 130
 
+    duration_shards = sum(1 for s in shards if s.has_durations)
+    if args.require_durations and duration_shards < len(shards):
+        missing = [s for s in shards if not s.has_durations]
+        print(
+            f"[Draft] ❌ --require-durations: {len(missing)}/{len(shards)} shards "
+            f"have no CTC durations (first: {missing[0].norm_text[:60]!r}). "
+            "Run prepare_real_speech.py with --durations ctc, or drop the flag."
+        )
+        return 2
+    if args.draft_duration_conditioning:
+        print(
+            f"[Draft] duration supervision: {duration_shards}/{len(shards)} shards "
+            f"({duration_shards / max(1, len(shards)):.1%})"
+        )
+
     # Recompute the length model over whatever shards exist (resume-safe).
     length_model = LengthModel.fit([s.n_chars for s in shards], [s.frames for s in shards])
 
@@ -1609,7 +1720,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.skip_draft:
         draft = DraftTransformer(config.draft).to(device)
         draft_stats = DraftTrainer(
-            draft, device, lr=args.draft_lr, batch_size=args.draft_batch, seed=args.seed
+            draft,
+            device,
+            lr=args.draft_lr,
+            batch_size=args.draft_batch,
+            seed=args.seed,
+            duration_loss_weight=args.draft_duration_loss_weight,
         ).train(shards, epochs=args.draft_epochs, max_minutes=args.max_minutes,
                 min_epochs=args.min_epochs)
     elif args.draft_ckpt:
@@ -1656,6 +1772,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         "corpus_source": args.corpus_json or f"bootstrap(seed={args.seed})",
         "target_source": args.target_source,
         "target_stats": getattr(engine, "backend", "n/a"),
+        "duration_conditioning": bool(
+            draft is not None and draft.config.duration_conditioning
+        ),
+        "duration_shards": int(duration_shards),
+        "duration_shard_fraction": float(duration_shards / max(1, len(shards))),
         "residual_scheduled_sampling": args.residual_sched,
         "residual_ramp_epochs": int(args.residual_ramp_epochs or args.residual_epochs),
         "residual_only": bool(args.skip_draft),
@@ -1716,7 +1837,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("=" * 78)
     print(f"[Done] total {_fmt_time(_now() - t_all)}")
-    print(f"  checkpoints : {ckpt_dir}/draft_cb0.pt, {ckpt_dir}/residual_cb1_8.pt")
+    saved_checkpoints = [
+        path for path in (ckpt_dir / "draft_cb0.pt", ckpt_dir / "residual_cb1_8.pt")
+        if path.is_file()
+    ]
+    print(
+        "  checkpoints :",
+        ", ".join(str(path) for path in saved_checkpoints)
+        if saved_checkpoints else "none (metadata only)",
+    )
     print(f"  meta        : {ckpt_dir}/meta.json  (length model + training stats)")
     print("  next        : python run_full_evaluation.py --ckpt codeswitch_ckpt")
     print("=" * 78)

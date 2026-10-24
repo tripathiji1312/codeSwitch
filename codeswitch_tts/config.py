@@ -45,6 +45,12 @@ class DraftModelConfig:
     # the text encoder memory.
     frame_decoder_layers: int = 0
     max_frames: int = 2048
+    # Duration supervision.  When enabled, a small head predicts per-character
+    # DAC-frame durations from the text encoder; at training time the decoder
+    # can also receive ground-truth durations for an oracle-alignment ablation.
+    # Defaults keep v2-v5 checkpoints byte-compatible.
+    duration_conditioning: bool = False
+    duration_hidden: int = 256
 
 
 @dataclass

@@ -29,6 +29,131 @@ class DraftOutput:
     logits: torch.Tensor          # (batch, num_frames, codebook_size)
     probabilities: torch.Tensor   # (batch, num_frames, codebook_size)
     tokens: torch.Tensor          # (batch, num_frames) - sampled or argmax draft tokens
+    duration_logits: Optional[torch.Tensor] = None  # (batch, text_len) log1p(frames)
+    frame_durations: Optional[torch.Tensor] = None  # (batch, text_len) int frame counts
+
+
+# ===========================================================================
+# Duration utilities
+# ===========================================================================
+def normalize_token_durations(
+    durations: torch.Tensor,
+    lengths: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Turn positive per-token durations into integer frame counts.
+
+    Every row sums to exactly ``lengths[b]``.  Largest-remainder rounding is
+    used per sample so the length regulator agrees with the acoustic target.
+    ``valid_mask`` should exclude padding and BOS/EOS; those tokens receive 0.
+    """
+    if durations.ndim != 2:
+        raise ValueError(f"durations must be 2-D, got {tuple(durations.shape)}")
+    batch, seq_len = durations.shape
+    lengths = torch.as_tensor(lengths, device=durations.device, dtype=torch.long).flatten()
+    if lengths.numel() != batch:
+        raise ValueError(f"lengths has {lengths.numel()} entries for batch {batch}")
+    if valid_mask is None:
+        valid_mask = torch.ones_like(durations, dtype=torch.bool)
+    else:
+        valid_mask = valid_mask.to(device=durations.device, dtype=torch.bool)
+        if valid_mask.shape != durations.shape:
+            raise ValueError(
+                f"valid_mask shape {tuple(valid_mask.shape)} != durations "
+                f"{tuple(durations.shape)}"
+            )
+
+    positive = torch.clamp(durations.float(), min=0.0) * valid_mask.float()
+    out = torch.zeros((batch, seq_len), device=durations.device, dtype=torch.long)
+    for row in range(batch):
+        target = int(lengths[row].item())
+        if target <= 0:
+            continue
+        valid = valid_mask[row]
+        if not bool(valid.any()):
+            out[row, 0] = target
+            continue
+        values = positive[row]
+        total = float(values.sum().item())
+        if total <= 0.0:
+            values = valid.float() * (float(target) / float(valid.sum().item()))
+        else:
+            values = values * (float(target) / total)
+        floors = torch.floor(values).long()
+        remainder = target - int(floors.sum().item())
+        if remainder > 0:
+            fractional = values - floors.float()
+            fractional = torch.where(
+                valid, fractional, torch.full_like(fractional, -1.0)
+            )
+            order = torch.argsort(fractional, descending=True, stable=True)
+            for index in order.tolist():
+                if remainder <= 0:
+                    break
+                if bool(valid[index]):
+                    floors[index] += 1
+                    remainder -= 1
+        # Defensive if every fractional part was zero (integer-valued seconds).
+        cursor = 0
+        valid_indices = torch.nonzero(valid, as_tuple=False).flatten().tolist()
+        while remainder > 0 and valid_indices:
+            floors[valid_indices[cursor % len(valid_indices)]] += 1
+            remainder -= 1
+            cursor += 1
+        out[row] = floors
+    return out
+
+
+def expand_text_by_durations(
+    memory: torch.Tensor,
+    token_durations: torch.Tensor,
+    max_frames: int,
+) -> torch.Tensor:
+    """Repeat each text position by its duration to build per-frame features."""
+    if memory.shape[:2] != token_durations.shape:
+        raise ValueError(
+            f"memory {tuple(memory.shape[:2])} and durations "
+            f"{tuple(token_durations.shape)} disagree"
+        )
+    batch, _, d_model = memory.shape
+    indices = []
+    for row in range(batch):
+        counts = token_durations[row].clamp(min=0).to(dtype=torch.long)
+        index = torch.repeat_interleave(
+            torch.arange(counts.numel(), device=memory.device), counts
+        )
+        if index.numel() >= max_frames:
+            index = index[:max_frames]
+        elif index.numel() > 0:
+            pad = index[-1].expand(max_frames - index.numel())
+            index = torch.cat((index, pad), dim=0)
+        else:
+            index = torch.zeros(max_frames, device=memory.device, dtype=torch.long)
+        indices.append(index)
+    index_tensor = torch.stack(indices, dim=0)  # (B, max_frames)
+    return torch.gather(
+        memory,
+        1,
+        index_tensor.unsqueeze(-1).expand(-1, -1, d_model),
+    )
+
+
+class DurationPredictor(nn.Module):
+    """Predict log1p(per-character DAC frames) from text encoder states."""
+
+    def __init__(self, d_model: int, hidden: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, memory: torch.Tensor) -> torch.Tensor:
+        return self.net(memory).squeeze(-1)
 
 
 class PositionalEncoding(nn.Module):
@@ -184,6 +309,16 @@ class FrameDecoder(nn.Module):
         self.length_embedding = nn.Embedding(self.max_frames + 1, self.d_model)
         nn.init.normal_(self.length_embedding.weight, mean=0.0, std=0.02)
 
+        # Only created when duration conditioning is explicitly enabled.  This
+        # keeps v5 state dicts byte-compatible.
+        self.duration_proj: Optional[nn.Module] = None
+        if bool(getattr(config, "duration_conditioning", False)):
+            self.duration_proj = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model),
+                nn.GELU(),
+                nn.Linear(self.d_model, self.d_model),
+            )
+
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.d_model,
             nhead=config.n_heads,
@@ -204,6 +339,7 @@ class FrameDecoder(nn.Module):
         memory: torch.Tensor,
         memory_key_padding_mask: Optional[torch.Tensor],
         lengths: torch.Tensor,
+        token_durations: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Decode frames for a batch.
 
@@ -211,6 +347,9 @@ class FrameDecoder(nn.Module):
             memory: (batch, text_len, d_model) encoded text.
             memory_key_padding_mask: (batch, text_len) True for text padding.
             lengths: (batch,) positive, per-sample frame counts.
+            token_durations: optional (batch, text_len) integer frame counts.
+                When supplied (and duration conditioning is enabled), each
+                frame query receives the text state for its aligned character.
         """
         if lengths.ndim != 1 or lengths.numel() != memory.shape[0]:
             raise ValueError(
@@ -229,6 +368,10 @@ class FrameDecoder(nn.Module):
         queries = self.frame_queries[:, :max_t, :].expand(batch, -1, -1)
         queries = self.pos_encoder(queries)
         queries = queries + self.length_embedding(lengths).unsqueeze(1)
+
+        if token_durations is not None and self.duration_proj is not None:
+            aligned = expand_text_by_durations(memory, token_durations, max_t)
+            queries = queries + self.duration_proj(aligned)
 
         positions = torch.arange(max_t, device=memory.device).unsqueeze(0)
         tgt_key_padding_mask = positions >= lengths.unsqueeze(1)
@@ -280,6 +423,21 @@ class DraftTransformer(nn.Module):
             raise ValueError("frame_decoder_layers must be >= 0")
         if self.config.frame_decoder_layers > 0:
             self.frame_decoder = FrameDecoder(self.config)
+        if self.config.duration_conditioning and self.frame_decoder is None:
+            raise ValueError(
+                "duration_conditioning requires frame_decoder_layers >= 1"
+            )
+
+        # Optional FastSpeech-2-style duration head.  Trained with CTC-derived
+        # durations; used at inference to build the frame layout without an
+        # external aligner.
+        self.duration_predictor: Optional[DurationPredictor] = None
+        if self.config.duration_conditioning:
+            self.duration_predictor = DurationPredictor(
+                self.config.d_model,
+                hidden=self.config.duration_hidden,
+                dropout=self.config.dropout,
+            )
 
         # Codebook 0 Categorical Head (vocab = 1024)
         self.cb0_head = nn.Linear(self.config.d_model, self.config.codebook_size)
@@ -293,6 +451,19 @@ class DraftTransformer(nn.Module):
         if self.cb0_head.bias is not None:
             nn.init.zeros_(self.cb0_head.bias)
 
+    @staticmethod
+    def _duration_valid_mask(
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            valid = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            valid = attention_mask.to(device=input_ids.device, dtype=torch.bool)
+        # PAD=0, BOS=1, EOS=2.  Character tokens, including <unk>=3, may carry
+        # duration; padding/sentinels must not.
+        return valid & (input_ids > 2)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -301,6 +472,7 @@ class DraftTransformer(nn.Module):
         temperature: float = 1.0,
         sample: bool = True,
         frame_lengths: Optional[torch.Tensor] = None,
+        token_durations: Optional[torch.Tensor] = None,
     ) -> DraftOutput:
         """Forward pass generating Codebook 0 categorical distributions.
         
@@ -316,6 +488,10 @@ class DraftTransformer(nn.Module):
                 duration and the output is padded to the batch maximum.
                 Training must use this instead of ``num_frames=max_t`` to avoid
                 text stretching.
+            token_durations: Optional (batch, seq_len) ground-truth frame
+                counts.  Used to lay out the frame queries during training
+                (oracle alignment); when omitted, the duration head predicts
+                its own layout.
             
         Returns:
             DraftOutput with logits, probabilities, and discrete draft tokens
@@ -345,14 +521,56 @@ class DraftTransformer(nn.Module):
                     (input_ids.shape[0],), int(target_frames),
                     device=input_ids.device, dtype=torch.long,
                 )
+
+            duration_logits: Optional[torch.Tensor] = None
+            frame_durations: Optional[torch.Tensor] = None
+            if self.duration_predictor is not None:
+                duration_logits = self.duration_predictor(h)
+                if token_durations is not None:
+                    token_durations = torch.as_tensor(
+                        token_durations, device=input_ids.device, dtype=torch.float32
+                    )
+                    if token_durations.shape != input_ids.shape:
+                        raise ValueError(
+                            "token_durations shape must match input_ids: "
+                            f"{tuple(token_durations.shape)} vs "
+                            f"{tuple(input_ids.shape)}"
+                        )
+                    frame_durations = normalize_token_durations(
+                        token_durations,
+                        lengths,
+                        valid_mask=self._duration_valid_mask(
+                            input_ids, attention_mask
+                        ),
+                    )
+                else:
+                    # Training targets log1p(frame counts), so invert that
+                    # transform here.  softplus(log1p(x)) is not the inverse
+                    # and would badly distort the character layout.
+                    predicted = torch.expm1(duration_logits).clamp(min=1e-4)
+                    frame_durations = normalize_token_durations(
+                        predicted,
+                        lengths,
+                        valid_mask=self._duration_valid_mask(
+                            input_ids, attention_mask
+                        ),
+                    )
             frame_features = self.frame_decoder(
                 h,
                 memory_key_padding_mask=src_key_padding_mask,
                 lengths=lengths,
+                token_durations=frame_durations,
             )
         else:
+            if token_durations is not None:
+                raise ValueError(
+                    "token_durations requires the frame decoder; "
+                    "set frame_decoder_layers >= 1"
+                )
             if not isinstance(target_frames, torch.Tensor) and int(target_frames) <= 0:
                 raise ValueError("target_frames must be positive")
+            duration_logits = None
+            frame_durations = None
             frame_features = self.temporal_projector(h, target_frames=target_frames)
 
         # 4. Predict Codebook 0 categorical distributions
@@ -375,6 +593,8 @@ class DraftTransformer(nn.Module):
             logits=logits,
             probabilities=probs,
             tokens=tokens,
+            duration_logits=duration_logits,
+            frame_durations=frame_durations,
         )
 
     def generate_chunk(
@@ -384,6 +604,7 @@ class DraftTransformer(nn.Module):
         temperature: float = 1.0,
         sample: bool = True,
         device: Optional[Union[str, torch.device]] = None,
+        token_durations: Optional[torch.Tensor] = None,
     ) -> DraftOutput:
         """Helper method to generate draft Codebook 0 tokens directly from raw text string(s)."""
         if isinstance(text, str):
@@ -393,6 +614,8 @@ class DraftTransformer(nn.Module):
         if device is not None:
             input_ids = input_ids.to(device)
             mask = mask.to(device)
+            if token_durations is not None:
+                token_durations = token_durations.to(device)
 
         return self.forward(
             input_ids=input_ids,
@@ -400,4 +623,5 @@ class DraftTransformer(nn.Module):
             num_frames=num_frames,
             temperature=temperature,
             sample=sample,
+            token_durations=token_durations,
         )

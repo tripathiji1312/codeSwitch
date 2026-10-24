@@ -1,9 +1,11 @@
 """Comprehensive Unit & Regression Tests for CodeSwitch-TTS."""
 
+import math
+from pathlib import Path
+
+import numpy as np
 import pytest
 import torch
-import numpy as np
-from pathlib import Path
 
 from codeswitch_tts.config import CodeSwitchTTSConfig
 from codeswitch_tts.frontend.normalizer import TanglishNormalizer
@@ -299,3 +301,147 @@ def test_protobuf_runtime_version_fallback_api():
         is None
     )
 
+
+
+# ===========================================================================
+# Duration-conditioned FrameDecoder
+# ===========================================================================
+def _duration_model(duration_conditioning=True, max_frames=64):
+    from codeswitch_tts.config import DraftModelConfig
+
+    config = DraftModelConfig(
+        d_model=16,
+        n_heads=2,
+        num_layers=1,
+        d_ff=32,
+        frame_decoder_layers=1,
+        max_frames=max_frames,
+        duration_conditioning=duration_conditioning,
+        duration_hidden=16,
+    )
+    return DraftTransformer(config).eval()
+
+
+def test_normalize_token_durations_sums_exactly_and_masks_sentinels():
+    from codeswitch_tts.models.draft_transformer import normalize_token_durations
+
+    durations = torch.tensor([[99.0, 1.0, 1.0, 1.0, 99.0]])
+    lengths = torch.tensor([10])
+    valid = torch.tensor([[False, True, True, True, False]])
+    out = normalize_token_durations(durations, lengths, valid)
+    assert out.dtype == torch.long
+    assert int(out.sum()) == 10
+    assert out[0, 0].item() == 0
+    assert out[0, -1].item() == 0
+    assert (out[0, 1:4] > 0).all()
+
+
+def test_duration_conditioning_forward_uses_ground_truth_layout():
+    model = _duration_model()
+    text = "abcd"
+    input_ids, mask = model.tokenizer.batch_encode([text])
+    durations = torch.zeros_like(input_ids, dtype=torch.float32)
+    durations[0, 1:5] = 4.0  # 16 frames exactly
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            attention_mask=mask,
+            frame_lengths=torch.tensor([16]),
+            token_durations=durations,
+            sample=False,
+        )
+    assert out.logits.shape == (1, 16, 1024)
+    assert out.duration_logits is not None
+    assert out.duration_logits.shape == input_ids.shape
+    assert out.frame_durations is not None
+    assert int(out.frame_durations.sum()) == 16
+    assert out.frame_durations[0, 0].item() == 0
+    assert out.frame_durations[0, -1].item() == 0
+
+
+def test_duration_conditioning_predicts_layout_without_external_aligner():
+    model = _duration_model()
+    input_ids, mask = model.tokenizer.batch_encode(["நாளை வருகிறேன்"])
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            attention_mask=mask,
+            frame_lengths=torch.tensor([23]),
+            sample=False,
+        )
+    assert out.frame_durations is not None
+    assert int(out.frame_durations.sum()) == 23
+    assert out.frame_durations[0, 0].item() == 0
+    assert out.frame_durations[0, -1].item() == 0
+
+
+def test_inference_inverts_log1p_duration_target():
+    """Use expm1, not softplus: softplus(log1p([1, 99])) gives [19, 81]."""
+    model = _duration_model(max_frames=128)
+    input_ids, mask = model.tokenizer.batch_encode(["ab"])
+    assert input_ids.shape[1] >= 4
+    logits = torch.zeros(input_ids.shape, dtype=torch.float32)
+    logits[0, 1] = math.log1p(1.0)
+    logits[0, 2] = math.log1p(99.0)
+    model.duration_predictor.forward = lambda memory: logits
+    with torch.no_grad():
+        out = model(
+            input_ids=input_ids,
+            attention_mask=mask,
+            frame_lengths=torch.tensor([100]),
+            sample=False,
+        )
+    assert out.frame_durations is not None
+    assert out.frame_durations[0, 1].item() == 1
+    assert out.frame_durations[0, 2].item() == 99
+    assert int(out.frame_durations.sum()) == 100
+
+
+def test_duration_head_and_projection_receive_gradients():
+    model = _duration_model()
+    input_ids, mask = model.tokenizer.batch_encode(["abcd"])
+    durations = torch.zeros_like(input_ids, dtype=torch.float32)
+    durations[0, 1:5] = 4.0
+    out = model(
+        input_ids=input_ids,
+        attention_mask=mask,
+        frame_lengths=torch.tensor([16]),
+        token_durations=durations,
+        sample=False,
+    )
+    assert out.duration_logits is not None
+    duration_mask = (durations > 0) & mask
+    duration_loss = torch.nn.functional.smooth_l1_loss(
+        out.duration_logits[duration_mask],
+        torch.log1p(durations[duration_mask]),
+    )
+    loss = duration_loss + out.logits.float().pow(2).mean()
+    loss.backward()
+    head_grad = model.duration_predictor.net[0].weight.grad
+    proj_grad = model.frame_decoder.duration_proj[0].weight.grad
+    assert head_grad is not None and head_grad.abs().sum().item() > 0.0
+    assert proj_grad is not None and proj_grad.abs().sum().item() > 0.0
+
+
+def test_duration_conditioning_requires_frame_decoder():
+    from codeswitch_tts.config import DraftModelConfig
+
+    config = DraftModelConfig(
+        d_model=16,
+        n_heads=2,
+        num_layers=1,
+        d_ff=32,
+        duration_conditioning=True,
+    )
+    with pytest.raises(ValueError, match="duration_conditioning"):
+        DraftTransformer(config)
+
+
+def test_legacy_checkpoint_has_no_duration_head_keys():
+    from codeswitch_tts.config import DraftModelConfig
+
+    config = DraftModelConfig(d_model=16, n_heads=2, num_layers=1, d_ff=32)
+    model = DraftTransformer(config)
+    assert model.duration_predictor is None
+    assert not any(key.startswith("duration_predictor") for key in model.state_dict())
+    assert not any(key.startswith("frame_decoder.duration_proj") for key in model.state_dict())

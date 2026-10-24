@@ -11,3 +11,10 @@ numpy>=1.24.0,<2.0.0
 accelerate>=0.28.0
 sentencepiece>=0.2.0
 protobuf>=5.29.5
+
+# Optional real-speech data pipeline (prepare_real_speech.py).  The training
+# and evaluation paths do not import these; they are only needed to stream
+# Rasa/IndicVoices-R or to read local parquet shards.
+datasets>=2.19.0
+pandas>=1.5.0
+pyarrow>=14.0.0

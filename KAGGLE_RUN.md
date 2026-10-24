@@ -14,6 +14,25 @@ between cells except the one-time dependency install.
 
 ---
 
+## Real-speech data-scale + duration path (2026-10-24)
+
+The teacher-distillation path below is still valid, but it is no longer the only data
+path. For transcribed human speech (Rasa / IndicVoices-R) and the duration-conditioned
+v6 draft, open **`CodeSwitch_DataScale_Kaggle.ipynb`** instead:
+
+* default run: public FLEURS Tamil smoke, no gated token required;
+* gated run: set `SMOKE=False`, `DATASET_CHOICE="rasa_ta"` (or `"indicvoices_ta"`),
+  and add `HF_TOKEN` in Kaggle Secrets after accepting the dataset terms;
+* it writes `real_cache/<source>` and `codeswitch_ckpt_v6`, so it does **not**
+  overwrite `teacher_cache/` or the v2–v4 checkpoints;
+* it runs the unchanged 5% gate and refuses the 60-utterance evaluation until the
+  gate runs and passes (or an explicit diagnostic override is set).
+
+Design, commands, and verified/unverified evidence:
+[`plans/014-real-data-duration.md`](plans/014-real-data-duration.md).
+
+---
+
 ## 0) Notebook settings
 
 * Accelerator: **GPU T4 x1** (16 GB)

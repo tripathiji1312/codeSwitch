@@ -706,11 +706,22 @@ def test_draft_collate_carries_per_sample_frame_lengths():
     shards[1].codes = shards[1].codes[:, :80]
     shards[2].frames = 120
     trainer = T.DraftTrainer(model, torch.device("cpu"), batch_size=3)
-    input_ids, attn, targets, max_t, lengths = trainer._collate(shards)
+    (
+        input_ids,
+        attn,
+        targets,
+        max_t,
+        lengths,
+        durations,
+        duration_supervised,
+    ) = trainer._collate(shards)
     assert max_t == 120
     assert lengths.tolist() == [40, 80, 120]
     assert targets.shape == (3, 120)
     assert int((targets[0] != -100).sum()) == 40
+    assert durations.shape == input_ids.shape
+    assert not duration_supervised.any()  # legacy teacher shards have no aligner
+    assert torch.allclose(durations.sum(dim=1), lengths.float())
 
 
 def test_min_epochs_flag_is_wired_into_both_trainers():
@@ -737,3 +748,49 @@ def test_draft_frame_decoder_layers_flag_is_wired():
     assert args.draft_frame_decoder_layers == 2
     source = inspect.getsource(T.main)
     assert "config.draft.frame_decoder_layers = int(args.draft_frame_decoder_layers)" in source
+
+
+def test_draft_trainer_consumes_ctc_durations_and_reports_duration_loss():
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import DraftModelConfig
+
+    text = "abcde"
+    frames = 12
+    durations = np.array([2, 3, 3, 2, 2], dtype=np.int32)
+    shard = T.TeacherShard(
+        index=0,
+        raw_text=text,
+        norm_text=text,
+        n_chars=len(text),
+        frames=frames,
+        codes=np.zeros((9, frames), dtype=np.int16),
+        audio_sec=frames / 86.0,
+        target_source="real_dac",
+        gen_ms=1.0,
+        char_durations=durations,
+        duration_source="ctc:unit",
+        language="ta",
+    )
+    config = DraftModelConfig(
+        d_model=16,
+        n_heads=2,
+        num_layers=1,
+        d_ff=32,
+        frame_decoder_layers=1,
+        max_frames=64,
+        duration_conditioning=True,
+        duration_hidden=16,
+    )
+    model = T.DraftTransformer(config)
+    trainer = T.DraftTrainer(
+        model, torch.device("cpu"), batch_size=1, duration_loss_weight=0.1
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    loss = trainer._run_epoch([shard], optimizer, None, train=True)
+    assert np.isfinite(loss)
+    assert trainer.last_duration_loss is not None
+    assert np.isfinite(trainer.last_duration_loss)
+    top1, top5 = trainer.evaluate_topk([shard], use_gt_durations=True)
+    assert 0.0 <= top1 <= 1.0
+    assert 0.0 <= top5 <= 1.0
