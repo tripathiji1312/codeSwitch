@@ -146,9 +146,12 @@ teacher caches load through the additive fallback in `SpeechShard.load`.
 `requirements-kaggle.txt` is the notebook's narrow install set. It omits Torch
 and torchaudio (Kaggle owns the matched CUDA pair) and omits
 `descript-audio-codec` (its `descript-audiotools` dependency pins
-`protobuf<3.20`). It pins `transformers==4.46.1`, `datasets==3.6.0`,
-`pyarrow<21`, and `numpy<2` so the resolver cannot drift into the graph that
-caused pip's `resolution-too-deep` error on Kaggle.
+`protobuf<3.20`). It uses only lower bounds for the scientific stack: Kaggle's
+Python 3.13 image ships NumPy 2.x with a pandas built against the same C ABI,
+so pinning `numpy<2` causes `numpy.dtype size changed`. `datasets==5.0.1` is
+selected because it is the last release accepting `huggingface-hub<2`, keeping
+Kaggle's preinstalled Gradio/Diffusers hub constraint intact. The notebook
+checks imports and skips pip entirely when the data-path packages are present.
 
 ### 3.5 Kaggle notebook
 
@@ -156,7 +159,8 @@ New `CodeSwitch_DataScale_Kaggle.ipynb` (21 cells, 11 code cells):
 
 - setup checklist (GPU, Internet, Secrets);
 - clone/pull GitHub branch and print commit SHA;
-- install `requirements-kaggle.txt` (no Torch reinstall, no conflicting
+- check imports, then install only missing packages from
+  `requirements-kaggle.txt` (no Torch/NumPy downgrade, no conflicting
   `descript-audio-codec`; W&B included);
 - verify the new feature flags exist in the checkout;
 - public FLEURS Tamil smoke by default; Rasa/IndicVoices-R when `HF_TOKEN` is
@@ -292,21 +296,27 @@ pins `protobuf<3.20`, while the repo requires `protobuf>=5.29.5`. Asking pip to
 solve the full manifest therefore backtracks until Kaggle reports
 `resolution-too-deep`.
 
-A clean Python 3.11 / pip 26.2.2 dry run of the narrow set succeeds:
+Kaggle's current image is Python 3.13 with a NumPy 2.x / pandas pair built
+against the same C ABI. The first version of this fix pinned `numpy<2` and
+produced `ValueError: numpy.dtype size changed` when `datasets` imported pandas.
+The install set now has no upper bounds on NumPy, pandas, pyarrow, Transformers,
+tokenizers, or huggingface-hub, and the notebook checks imports before running
+pip at all.
+
+A clean Python 3.13.15 pip dry run of `requirements-kaggle.txt` succeeds with:
 
 ```text
-$ /tmp/opencode/pipcheck/bin/python -m pip install --dry-run -r requirements-kaggle.txt
-...
-EXIT:0
+numpy 2.5.4, pandas 3.1.0, pyarrow 26.0.0, datasets 5.0.1,
+huggingface-hub 1.33.0, transformers 5.20.2, soundfile 0.14.0, scipy 1.18.1
 ```
 
-The resolved graph contains `transformers==4.46.1`, `datasets==3.6.0`,
-`numpy==1.26.4`, `pyarrow==20.0.0`, and `wandb==0.31.0`, with **no**
-torch/torchaudio, torchcodec, or descript package. The pinned Transformers
-build imports `DacModel`, `Wav2Vec2ForCTC`, and `Wav2Vec2Processor` with the
-local Torch. A real `datasets==3.6.0` check confirmed `Audio(decode=False)`
-returns `{bytes, path}` for both map-style and iterable datasets, so the HF
-adapter no longer depends on a torchcodec wheel matching Kaggle's Torch ABI.
+No torch/torchaudio, torchcodec, or descript package is pulled into that
+isolated environment (Kaggle supplies Torch separately). The same 23 data
+pipeline tests pass under Python 3.13.15, NumPy 2.5.4, pandas 3.1.0, datasets
+5.0.1, and torch 2.14.1 CPU. A real `datasets` 5.0.1 check confirmed
+`Audio(decode=False)` returns `{bytes, path}` for both map-style and iterable
+datasets, so the HF adapter does not require a torchcodec wheel matching
+Kaggle's Torch ABI.
 
 ### 5.3 Real Tamil speech → real DAC → Tamil CTC
 

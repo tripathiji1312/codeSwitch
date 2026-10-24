@@ -22,10 +22,14 @@ v6 draft, open **`CodeSwitch_DataScale_Kaggle.ipynb`** instead:
 
 * default run: public FLEURS Tamil smoke, no gated token required;
 * install: the notebook uses `requirements-kaggle.txt`, not `requirements.txt`.
-  Kaggle already provides the CUDA Torch pair, and `descript-audio-codec`
-  pulls `descript-audiotools` (which pins `protobuf<3.20`). Installing the full
-  manifest on Kaggle triggers pip's `resolution-too-deep`; do not do it in this
-  notebook. The data path uses `transformers.DacModel` instead;
+  Kaggle already provides the CUDA Torch pair **and** a Python 3.13 NumPy 2 /
+  pandas pair built against the same C ABI. Do not pin or downgrade NumPy,
+  pandas, pyarrow, Transformers, tokenizers, or huggingface-hub here: forcing
+  `numpy<2` produces `ValueError: numpy.dtype size changed`. `descript-audio-codec`
+  also pulls `descript-audiotools` (which pins `protobuf<3.20`). The notebook
+  checks imports and only installs missing packages; the data path uses
+  `transformers.DacModel` instead. If an earlier run downgraded NumPy, start a
+  **fresh Kaggle session** (a plain kernel restart may keep the old packages);
 * gated run: set `SMOKE=False`, `DATASET_CHOICE="rasa_ta"` (or `"indicvoices_ta"`),
   and add `HF_TOKEN` in Kaggle Secrets after accepting the dataset terms;
 * it writes `real_cache/<source>` and `codeswitch_ckpt_v6`, so it does **not**

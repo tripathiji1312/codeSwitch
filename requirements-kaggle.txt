@@ -1,21 +1,26 @@
 # Kaggle-only install set for CodeSwitch_DataScale_Kaggle.ipynb.
 #
-# Kaggle already provides a matched CUDA torch/torchaudio pair.  Do not add
-# torch or torchaudio here: asking pip to re-solve them is what produces
-# "resolution-too-deep" on the Kaggle image.
+# Kaggle's Python 3.13 image preinstalls a matched CUDA torch/torchaudio pair
+# and a NumPy 2.x/pandas pair built against the same C ABI.  Do NOT pin
+# numpy<2, pandas<3, pyarrow<21, or downgrade Transformers, tokenizers, or
+# huggingface-hub here.  A NumPy downgrade produces:
+#   ValueError: numpy.dtype size changed, may indicate binary incompatibility
+# and forcing old Transformers can downgrade tokenizers/huggingface-hub under
+# Kaggle's other preinstalled packages.  Leave the base image alone.
 #
 # This path encodes speech with transformers.DacModel and decodes it with
 # soundfile/torchaudio.  The optional descript-audio-codec fallback pulls
 # descript-audiotools, which pins protobuf<3.20 and conflicts with the repo's
 # protobuf>=5.29.5; it is deliberately not installed here.
 #
-# datasets<4 keeps the audio column on soundfile instead of requiring a
-# torchcodec wheel built for Kaggle's exact Torch ABI.
-transformers==4.46.1
-datasets==3.6.0
-numpy>=1.24.0,<2.0.0
-pandas>=1.5.0,<3.0.0
-pyarrow>=15.0.0,<21.0.0
+# The notebook installs this file only when a required import is missing.
+# datasets 5.0.1 is the last release that accepts huggingface-hub<2, which
+# keeps Kaggle's preinstalled Gradio/Diffusers hub constraint intact.
+transformers>=4.46.1
+datasets==5.0.1
+numpy>=1.24.0
+pandas>=1.5.0
+pyarrow>=14.0.0
 soundfile>=0.12.1
 scipy>=1.11.0
 sentencepiece>=0.2.0
