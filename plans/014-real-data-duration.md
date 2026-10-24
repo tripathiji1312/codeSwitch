@@ -143,14 +143,21 @@ teacher caches load through the additive fallback in `SpeechShard.load`.
 `requirements.txt` adds the optional data-pipeline packages:
 `datasets>=2.19.0`, `pandas>=1.5.0`, `pyarrow>=14.0.0`.
 
+`requirements-kaggle.txt` is the notebook's narrow install set. It omits Torch
+and torchaudio (Kaggle owns the matched CUDA pair) and omits
+`descript-audio-codec` (its `descript-audiotools` dependency pins
+`protobuf<3.20`). It pins `transformers==4.46.1`, `datasets==3.6.0`,
+`pyarrow<21`, and `numpy<2` so the resolver cannot drift into the graph that
+caused pip's `resolution-too-deep` error on Kaggle.
+
 ### 3.5 Kaggle notebook
 
 New `CodeSwitch_DataScale_Kaggle.ipynb` (21 cells, 11 code cells):
 
 - setup checklist (GPU, Internet, Secrets);
 - clone/pull GitHub branch and print commit SHA;
-- install requirements + `wandb`, then attempt an optional `torchcodec` wheel for
-  `datasets>=4` audio decoding;
+- install `requirements-kaggle.txt` (no Torch reinstall, no conflicting
+  `descript-audio-codec`; W&B included);
 - verify the new feature flags exist in the checkout;
 - public FLEURS Tamil smoke by default; Rasa/IndicVoices-R when `HF_TOKEN` is
   set and terms are accepted;
@@ -252,16 +259,17 @@ The Kaggle notebook wraps this and marks FAIL otherwise.
 ### 5.1 Tests
 
 ```text
-$ movio/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
-170 passed, 3 warnings in 16.98s
+$ .venv/bin/python -m pytest tests -q -p no:cacheprovider
+171 passed, 3 warnings in 20.72s
 ```
 
 New coverage:
 
-- `tests/test_data_pipeline.py` — 22 tests: shard round-trip/legacy load,
+- `tests/test_data_pipeline.py` — 23 tests: shard round-trip/legacy load,
   `(9,T)` validation, CTC Viterbi (clean/repeated/too-many-labels), label
-  mapping, exact frame sums, manifest/parquet adapters, torchcodec decode,
-  language normalization, CLI guard, injected-encoder pipeline, resume/dedup;
+  mapping, exact frame sums, manifest/parquet adapters, raw HF audio (no
+  torchcodec requirement), language normalization, CLI guard, injected-encoder
+  pipeline, resume/dedup;
 - `tests/test_codeswitch_tts.py` — 7 duration-model tests (normalization sums,
   expansion, log1p inversion regression, head/projection gradients, config
   gating, output contract, legacy keys);
@@ -276,7 +284,31 @@ loaded unchanged through `load_draft_checkpoint`: `frame_decoder_layers=0`,
 `duration_conditioning=False`, 16.81M params, no duration-head keys. This is
 the compatibility check for the v2–v5 shape.
 
-### 5.2 Real Tamil speech → real DAC → Tamil CTC
+### 5.2 Kaggle install resolver
+
+`requirements.txt` is intentionally **not** the Kaggle install path. Its
+optional `descript-audio-codec` dependency pulls `descript-audiotools`, which
+pins `protobuf<3.20`, while the repo requires `protobuf>=5.29.5`. Asking pip to
+solve the full manifest therefore backtracks until Kaggle reports
+`resolution-too-deep`.
+
+A clean Python 3.11 / pip 26.2.2 dry run of the narrow set succeeds:
+
+```text
+$ /tmp/opencode/pipcheck/bin/python -m pip install --dry-run -r requirements-kaggle.txt
+...
+EXIT:0
+```
+
+The resolved graph contains `transformers==4.46.1`, `datasets==3.6.0`,
+`numpy==1.26.4`, `pyarrow==20.0.0`, and `wandb==0.31.0`, with **no**
+torch/torchaudio, torchcodec, or descript package. The pinned Transformers
+build imports `DacModel`, `Wav2Vec2ForCTC`, and `Wav2Vec2Processor` with the
+local Torch. A real `datasets==3.6.0` check confirmed `Audio(decode=False)`
+returns `{bytes, path}` for both map-style and iterable datasets, so the HF
+adapter no longer depends on a torchcodec wheel matching Kaggle's Torch ABI.
+
+### 5.3 Real Tamil speech → real DAC → Tamil CTC
 
 Source: public `google/fleurs`, config `ta_in`, split `validation`, 2 rows.
 
@@ -301,7 +333,7 @@ session restart; the reproducible command is the same CLI with
 `--hf-dataset hf-internal-testing/librispeech_asr_dummy --hf-config clean
 --hf-split validation --language en --ctc-model-en facebook/wav2vec2-base-960h`.
 
-### 5.3 Duration-conditioned v6 smoke
+### 5.4 Duration-conditioned v6 smoke
 
 Trained on the two FLEURS shards for 1 epoch on CPU
 (`/tmp/opencode/cs_v6_smoke2`):
@@ -342,7 +374,7 @@ generalization, or the gate.
    predicted ablation is a relative diagnostic, not proof of phonetic
    accuracy.
 6. **The English CTC path was a one-off /tmp smoke**, not retained as an
-   artifact. Reproduce with the command in §5.2.
+   artifact. Reproduce with the command in §5.3.
 
 ---
 
@@ -401,7 +433,7 @@ generalization, or the gate.
 - [x] Real Tamil FLEURS → real DAC shards with exact duration sums.
 - [x] Duration predictor + duration-conditioned frame decoder.
 - [x] Trainer duration collation/loss/oracle ablation and flags.
-- [x] 170 tests pass; no new warnings attributable to this plan.
+- [x] 171 tests pass; no new warnings attributable to this plan.
 - [x] Self-contained Kaggle notebook statically validated (JSON parses; all
       11 code cells compile).
 - [ ] Rasa / IndicVoices-R real corpus prepared (gated; needs user `HF_TOKEN`).

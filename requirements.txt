@@ -1,5 +1,10 @@
 # CodeSwitch-TTS Dependencies
 # Optimized for Python 3.10 / 3.11 with CUDA 12 on NVIDIA T4 (Kaggle GPU)
+#
+# Kaggle notebook: use requirements-kaggle.txt, not this full manifest.
+# descript-audio-codec pulls descript-audiotools, which pins protobuf<3.20 and
+# conflicts with protobuf>=5.29.5 below; installing this whole file into the
+# Kaggle image can backtrack into pip's "resolution-too-deep".
 
 torch>=2.2.0
 torchaudio>=2.2.0

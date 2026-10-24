@@ -419,6 +419,24 @@ def iter_hf_dataset(
         dataset_obj = load_dataset(dataset, config, **kwargs)
     else:
         dataset_obj = load_dataset(dataset, **kwargs)
+
+    # ``datasets>=4`` decodes an Audio column to a torchcodec.AudioDecoder.
+    # That pins the data path to a torchcodec wheel matching Kaggle's Torch ABI.
+    # Ask for raw bytes/path instead, then decode with soundfile/torchaudio.
+    features = getattr(dataset_obj, "features", None)
+    audio_key = audio_column
+    if audio_key is None and features is not None and hasattr(features, "__contains__"):
+        audio_key = _first_key(features, _AUDIO_COLUMNS)
+    if audio_key:
+        try:
+            from datasets import Audio
+
+            dataset_obj = dataset_obj.cast_column(audio_key, Audio(decode=False))
+        except Exception:
+            # Some datasets expose a non-standard audio feature.  The caller's
+            # decode_audio adapter still handles dict/bytes/decoder cells.
+            pass
+
     source = f"hf:{dataset}" + (f"/{config}" if config else "") + f"/{split}"
     for index, row in enumerate(dataset_obj):
         speech = row_to_speech(

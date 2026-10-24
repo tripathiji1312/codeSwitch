@@ -209,6 +209,7 @@ from codeswitch_tts.data.real_speech import (  # noqa: E402
     RealSpeechPipeline,
     SpeechRow,
     detect_language,
+    iter_hf_dataset,
     iter_manifest,
     iter_parquet_dir,
     normalize_language_tag,
@@ -482,3 +483,49 @@ def test_iter_parquet_dir_reads_hf_style_audio_bytes(tmp_path: Path):
     # The parquet adapter prefixes the file/row so row ids stay unique across
     # the 67-file Rasa Tamil split.
     assert rows[0].row_id.startswith("Tamil.parquet:0:")
+
+
+def test_iter_hf_dataset_disables_audio_decoding(monkeypatch):
+    """Streaming rows must not require a torchcodec wheel matching Kaggle Torch."""
+    import io
+    import sys
+    import types
+
+    buffer = io.BytesIO()
+    sf.write(buffer, np.zeros(1600, dtype=np.float32), 16000, format="WAV")
+
+    class _FakeAudio:
+        def __init__(self, decode=True):
+            self.decode = decode
+
+    class _FakeDataset:
+        features = {"audio": object(), "text": object(), "speaker_id": object()}
+
+        def __init__(self):
+            self.cast = None
+
+        def cast_column(self, column, feature):
+            self.cast = (column, feature)
+            return self
+
+        def __iter__(self):
+            yield {
+                "audio": {"bytes": buffer.getvalue(), "path": None},
+                "text": "நாளை வருகிறேன்",
+                "speaker_id": "spk-1",
+            }
+
+    dataset = _FakeDataset()
+    fake_datasets = types.ModuleType("datasets")
+    fake_datasets.Audio = _FakeAudio
+    fake_datasets.load_dataset = lambda *args, **kwargs: dataset
+    monkeypatch.setitem(sys.modules, "datasets", fake_datasets)
+
+    rows = list(iter_hf_dataset("fake/corpus", split="train", default_language="ta"))
+    assert dataset.cast is not None
+    assert dataset.cast[0] == "audio"
+    assert dataset.cast[1].decode is False
+    assert len(rows) == 1
+    assert rows[0].sample_rate == 16000
+    assert rows[0].audio.shape == (1600,)
+    assert rows[0].speaker == "spk-1"

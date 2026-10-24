@@ -21,6 +21,11 @@ path. For transcribed human speech (Rasa / IndicVoices-R) and the duration-condi
 v6 draft, open **`CodeSwitch_DataScale_Kaggle.ipynb`** instead:
 
 * default run: public FLEURS Tamil smoke, no gated token required;
+* install: the notebook uses `requirements-kaggle.txt`, not `requirements.txt`.
+  Kaggle already provides the CUDA Torch pair, and `descript-audio-codec`
+  pulls `descript-audiotools` (which pins `protobuf<3.20`). Installing the full
+  manifest on Kaggle triggers pip's `resolution-too-deep`; do not do it in this
+  notebook. The data path uses `transformers.DacModel` instead;
 * gated run: set `SMOKE=False`, `DATASET_CHOICE="rasa_ta"` (or `"indicvoices_ta"`),
   and add `HF_TOKEN` in Kaggle Secrets after accepting the dataset terms;
 * it writes `real_cache/<source>` and `codeswitch_ckpt_v6`, so it does **not**
