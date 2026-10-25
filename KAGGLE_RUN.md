@@ -20,7 +20,10 @@ The teacher-distillation path below is still valid, but it is no longer the only
 path. For transcribed human speech (Rasa / IndicVoices-R) and the duration-conditioned
 v6 draft, open **`CodeSwitch_DataScale_Kaggle.ipynb`** instead:
 
-* default run: public FLEURS Tamil smoke, no gated token required;
+* default run: real Rasa Tamil, 5000 rows capped at 6 h, draft + residual +
+  unchanged gate; requires `HF_TOKEN`;
+* public smoke: set `SMOKE=True` and `DATASET_CHOICE="fleurs_ta"`; no gated
+  token required, and residual/gate switch off;
 * install: the notebook uses `requirements-kaggle.txt`, not `requirements.txt`.
   Kaggle already provides the CUDA Torch pair **and** a Python 3.13 NumPy 2 /
   pandas pair built against the same C ABI. Do not pin or downgrade NumPy,
@@ -30,12 +33,12 @@ v6 draft, open **`CodeSwitch_DataScale_Kaggle.ipynb`** instead:
   checks imports and only installs missing packages; the data path uses
   `transformers.DacModel` instead. If an earlier run downgraded NumPy, start a
   **fresh Kaggle session** (a plain kernel restart may keep the old packages);
-* gated run: set `SMOKE=False`, `DATASET_CHOICE="rasa_ta"` (or `"indicvoices_ta"`),
-  and add `HF_TOKEN` in Kaggle Secrets after accepting the dataset terms.
-  Rows are not hours: a 200-row Rasa pilot produced only **0.29 h**, so the
-  real default is **5000 rows capped at 6 h** (`PREP_MAX_HOURS`). A <1 h
-  corpus is a plumbing smoke; the notebook prints a warning and its gate result
-  is not a model-architecture verdict;
+* gated data: add `HF_TOKEN` in Kaggle Secrets after accepting the Rasa (or
+  IndicVoices-R) dataset terms. `DATASET_CHOICE="rasa_ta"` is the default;
+  `"indicvoices_ta"` is available. Rows are not hours: a 200-row Rasa pilot
+  produced only **0.29 h**, so the real default is **5000 rows capped at 6 h**
+  (`PREP_MAX_HOURS`). A <1 h corpus is a plumbing smoke; the notebook prints a
+  warning and its gate result is not a model-architecture verdict;
 * it writes `real_cache/<source>` and `codeswitch_ckpt_v6`, so it does **not**
   overwrite `teacher_cache/` or the v2–v4 checkpoints;
 * it runs the unchanged 5% gate and refuses the 60-utterance evaluation until the

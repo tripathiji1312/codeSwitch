@@ -164,12 +164,13 @@ New `CodeSwitch_DataScale_Kaggle.ipynb` (21 cells, 11 code cells):
   `requirements-kaggle.txt` (no Torch/NumPy downgrade, no conflicting
   `descript-audio-codec`; W&B included);
 - verify the new feature flags exist in the checkout;
-- public FLEURS Tamil smoke by default; Rasa/IndicVoices-R when `HF_TOKEN` is
-  set and terms are accepted;
+- real Rasa Tamil by default (5000 rows capped at 6 h, residual + gate);
+  public FLEURS Tamil smoke when `SMOKE=True`; IndicVoices-R via
+  `DATASET_CHOICE="indicvoices_ta"`;
 - W&B data-prep run, `meta.json` artifact;
 - v6 draft/residual training, W&B config/git commit/metrics/model artifact;
-- optional unchanged 5% gate via `diagnose_audio_bug.py`, with
-  `rt_a >= 5%` and `rd_a >= 5%`;
+- unchanged 5% gate via `diagnose_audio_bug.py`, with `rt_a >= 5%` and
+  `rd_a >= 5%` (on for the real profile);
 - optional 60-utterance evaluation, blocked unless the gate ran and passed
   (or `ALLOW_EVAL_WITHOUT_GATE=True` is explicitly set);
 - zip of checkpoint/meta/reports; raw shards excluded by default.
@@ -476,18 +477,19 @@ LR so an optimization-limited run is distinguishable from a converged one.
    notebook clones the branch; uncommitted local work is invisible.
 2. Open `CodeSwitch_DataScale_Kaggle.ipynb` in Kaggle.
 3. Set **Accelerator → GPU** and **Internet → On**.
-4. Add Secrets: `WANDB_API_KEY`; `HF_TOKEN` only for gated Rasa/IndicVoices-R;
-   `GITHUB_TOKEN` only if the repo is private.
-5. Default config is the public FLEURS Tamil smoke (`SMOKE=True`,
-   `DATASET_CHOICE="fleurs_ta"`). Run All to verify plumbing.
-6. For the real corpus set `SMOKE=False`, `DATASET_CHOICE="rasa_ta"` (or
-   `"indicvoices_ta"`). The real default is `PREP_LIMIT=5000`,
-   `PREP_MAX_HOURS=6.0`; rows are not hours. If the prepared `meta.json`
-   reports `<1 h`, the notebook prints a warning and the gate result is not a
-   model verdict.
-7. For a full run set `DO_RESIDUAL=True`; keep `DO_GATE=True` before
-   `DO_EVAL=True`. The real epoch floor is 150, so the residual cannot stop at
-   the pilot's 100-epoch floor. The residual log prints its LR.
+4. Add Secrets: `HF_TOKEN` (required for the default gated Rasa run),
+   `WANDB_API_KEY`; `GITHUB_TOKEN` only if the repo is private.
+5. Default config is the real Rasa Tamil run (`SMOKE=False`,
+   `DATASET_CHOICE="rasa_ta"`, `DO_RESIDUAL=True`, `DO_GATE=True`); Run All
+   also needs `HF_TOKEN`. `DO_EVAL=False` keeps the 60-utterance suite off.
+6. The real defaults are `PREP_LIMIT=5000`, `PREP_MAX_HOURS=6.0`; rows are not
+   hours. If the prepared `meta.json` reports `<1 h`, the notebook prints a
+   warning and the gate result is not a model verdict. For IndicVoices-R set
+   `DATASET_CHOICE="indicvoices_ta"`; for a public plumbing smoke set
+   `SMOKE=True` and `DATASET_CHOICE="fleurs_ta"`.
+7. Set `DO_EVAL=True` only after the gate passes. The real epoch floor is 150,
+   so the residual cannot stop at the pilot's 100-epoch floor. The residual log
+   prints its LR.
 8. The notebook prints the commit SHA, checkpoint path, W&B URLs, and a zip
    path under `/kaggle/working`.
 
