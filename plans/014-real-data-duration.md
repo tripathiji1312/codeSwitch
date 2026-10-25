@@ -1,12 +1,13 @@
 # Plan 014 — Real speech → DAC shards + CTC durations + duration-conditioned draft (v6)
 
-**Snapshot:** 2026-10-24
+**Snapshot:** 2026-10-25
 **Branch:** `fix/013-bc-noise`
-**HEAD at snapshot:** `ed9b78f`
-**Status:** **IN PROGRESS** — code/tests are complete and the public-speech
-smoke is verified. The gated Rasa/IndicVoices-R corpus, full-scale v6
-training, the unchanged 5% gate, and the 60-utterance evaluation have **not**
-been run.
+**Base commit:** `baae776`
+**Status:** **IN PROGRESS** — a 200-row Rasa Tamil pilot ran end-to-end and
+failed the unchanged 5% gate. That pilot is only **0.2928 h** of audio, so it
+is a data-scale/plumbing result, not a full real-corpus result. The 6 h real
+slice, full-scale retrain, passing gate, and 60-utterance evaluation have
+**not** been run. No B/C quality is claimed.
 
 This plan is the implementation companion to the 2026-10-24 data-scale
 decision: stop waiting for a large synthetic teacher cache, encode transcribed
@@ -196,8 +197,14 @@ movio/.venv/bin/python prepare_real_speech.py \
 python prepare_real_speech.py \
   --out real_cache/rasa_ta \
   --hf-dataset ai4bharat/Rasa --hf-config Tamil --hf-split train \
-  --language ta --durations ctc --limit 200 --max-hours 2 --device cuda
+  --language ta --durations ctc --limit 5000 --max-hours 6 --device cuda
 ```
+
+`--limit` is a row cap, not an hours target. The first real slice used
+`--limit 200 --max-hours 6` and produced only **0.2928 h** (200 shards, 200/200
+with CTC durations, mean coverage 0.9728). The row cap must be well above the
+expected average duration; the notebook default is now 5000 rows capped at
+6 h.
 
 For IndicVoices-R:
 
@@ -205,7 +212,7 @@ For IndicVoices-R:
 python prepare_real_speech.py \
   --out real_cache/indicvoices_ta \
   --hf-dataset ai4bharat/indicvoices_r --hf-config Tamil --hf-split train \
-  --language ta --durations ctc --limit 200 --max-hours 2 --device cuda
+  --language ta --durations ctc --limit 5000 --max-hours 6 --device cuda
 ```
 
 If some rows are code-mixed and have no Tamil CTC alignment, omit
@@ -235,7 +242,7 @@ python train_draft_distill.py \
   --device cuda:0 --dtype fp16 \
   --draft-frame-decoder-layers 1 \
   --draft-duration-conditioning --draft-duration-loss-weight 0.1 \
-  --draft-epochs 300 --draft-batch 16 --min-epochs 100 --max-minutes 90 \
+  --draft-epochs 300 --draft-batch 16 --min-epochs 150 --max-minutes 90 \
   --residual-epochs 150 --residual-ramp-epochs 100 --residual-sched 1.0 \
   --residual-d-model 512 --residual-layers 6 --max-minutes-residual 90
 ```
@@ -243,6 +250,12 @@ python train_draft_distill.py \
 For a draft-only smoke, add `--skip-residual`. For a strict corpus, add
 `--require-durations`; the full command above deliberately leaves it off so a
 few unaligned code-mixed rows do not discard an otherwise usable corpus.
+
+The shared `--min-epochs 150` floor is deliberate: the 200-row pilot passed
+`--min-epochs 100`, so the residual stopped at epoch 100 despite a 150-epoch
+budget. A <1 h corpus is a plumbing smoke; the trainer prints
+`[Data] WARNING` and records `corpus_hours` in `meta.json` so a failure is not
+misread as an architecture verdict.
 
 The gate remains separate and unchanged:
 
@@ -264,7 +277,7 @@ The Kaggle notebook wraps this and marks FAIL otherwise.
 
 ```text
 $ .venv/bin/python -m pytest tests -q -p no:cacheprovider
-171 passed, 3 warnings in 20.72s
+172 passed, 3 warnings in 10.65s
 ```
 
 New coverage:
@@ -360,21 +373,75 @@ This verifies the duration loss, masked collation, duration-conditioned frame
 decoder, checkpoint config, and meta recording. It does not verify convergence,
 generalization, or the gate.
 
+### 5.5 Real Rasa Tamil 200-row pilot (gate failed)
+
+Source: `ai4bharat/Rasa`, config `Tamil`, split `train`, 200 rows.
+
+Data (`prepare_real_speech.py`, CTC durations):
+
+| Field | Value |
+|---|---:|
+| rows seen / written | 201 / 200 |
+| shards | 200 |
+| audio | **0.2927674659863946 h** |
+| duration shards | 200 / 200 |
+| mean duration coverage | 0.9728298477194176 |
+| W&B data run | `gd4ea2go` |
+
+This is the key runbook failure: 200 rows are **17.6 minutes**, not 6 hours.
+The row cap, not `--max-hours`, is what bound the pilot.
+
+Training (`codeswitch_ckpt_v6`, 150 residual epochs configured):
+
+- draft: best val `5.2843` @ epoch 17; `val_top1 = 6.9244%`,
+  `val_top5 = 20.2883%`, duration loss `0.13921`, duration shards `200/200`;
+- residual: 1146 windows of 86 frames (1053 train / 93 val); windows cover
+  83182/83256 teacher frames, with 74 frames dropped from one short shard;
+- residual selected `val 6.9280 @ epoch 100` (`sched 1.00`, full-draft hold);
+- mean teacher-CB1–8 top-1 `1.42%`, draft `0.95%`;
+- residual stopped at **epoch 100** because the shared `--min-epochs 100`
+  floor overrode the 150-epoch residual budget;
+- W&B train run `ucsyx8e0`.
+
+The residual validation loss is `6.928`, essentially the uniform-codebook
+value `ln(1024) = 6.931`; even the teacher-CB0 path is weak. That is consistent
+with underfitting, but it is not evidence that the 5% threshold is wrong.
+
+Unchanged gate (`diagnose_audio_bug.py`, 4 shards):
+
+| Metric | Value | Requirement |
+|---|---:|---:|
+| `cb0_s` | 3.2946% | — |
+| `cb0_a` | 11.9186% | — |
+| `rt_a` | **2.6133%** | `>= 5%` — **FAIL** |
+| `rd_a` | **1.7593%** | `>= 5%` — **FAIL** |
+| chance | 0.0977% | — |
+
+W&B gate run `qg3pnhk5`; `gate_pass=False`. The 5% gate is unchanged and the
+60-utterance evaluation stayed blocked.
+
+Leading diagnosis: **data scale**. The residual has only 200 real shards vs the
+v3 teacher-residual run's 2000 synthetic shards; the v3 run reached
+`rt_a=5.594%` but still failed `rd_a=1.834%`. The v6 pilot also stopped the
+residual at 100 epochs. Neither cause is proven yet; the next run raises the
+real slice to 6 h, raises the shared epoch floor to 150, and prints the residual
+LR so an optimization-limited run is distinguishable from a converged one.
+
 ---
 
 ## 6. Not verified / blockers
 
-1. **Rasa and IndicVoices-R were not downloaded.** Both are gated; this
-   environment has no user `HF_TOKEN`. Their exact column names, config names,
-   and text punctuation are therefore unconfirmed. The generic adapters cover
-   the expected `audio`/`text`/`speaker_id`/`language`/`style` schemas, and the
-   notebook discovers the Tamil config, but the first real run must inspect
-   the first few shards and `meta.json`.
-2. **No full-scale v6 training.** Only 2 shards / 1 epoch / CPU. No B/C quality,
-   intelligibility, or gate claim.
-3. **No 5% gate run.** `rt_a`/`rd_a` remain unmeasured for v6. Do not run the
-   60-utterance suite until the gate passes and the argmax smoke is
-   intelligible.
+1. **Only a 200-row Rasa pilot was prepared; IndicVoices-R was not prepared.**
+   Rasa's real schema and Tamil CTC path are now verified (200 shards, 200/200
+   durations), but only for 0.2928 h. The 6 h slice is not prepared, and
+   IndicVoices-R remains unconfirmed. The generic adapters cover the expected
+   `audio`/`text`/`speaker_id`/`language`/`style` schemas.
+2. **No full-scale v6 training.** The pilot trained on 200 shards / 0.2928 h
+   and stopped the residual at 100 epochs. No B/C quality or intelligibility
+   claim.
+3. **The 5% gate was run and failed.** `rt_a=2.6133%`, `rd_a=1.7593%` on the
+   pilot. The gate is unchanged. Do not run the 60-utterance suite until a
+   larger real slice passes it and the argmax smoke is intelligible.
 4. **Code-mixed alignment is partial by construction.** A Tamil CTC vocabulary
    cannot represent Latin characters; those characters get zero duration and
    lower `alignment_coverage`. The trainer masks by positive duration, so this
@@ -414,10 +481,13 @@ generalization, or the gate.
 5. Default config is the public FLEURS Tamil smoke (`SMOKE=True`,
    `DATASET_CHOICE="fleurs_ta"`). Run All to verify plumbing.
 6. For the real corpus set `SMOKE=False`, `DATASET_CHOICE="rasa_ta"` (or
-   `"indicvoices_ta"`), and increase `PREP_LIMIT` / `PREP_MAX_HOURS` as
-   needed.
+   `"indicvoices_ta"`). The real default is `PREP_LIMIT=5000`,
+   `PREP_MAX_HOURS=6.0`; rows are not hours. If the prepared `meta.json`
+   reports `<1 h`, the notebook prints a warning and the gate result is not a
+   model verdict.
 7. For a full run set `DO_RESIDUAL=True`; keep `DO_GATE=True` before
-   `DO_EVAL=True`.
+   `DO_EVAL=True`. The real epoch floor is 150, so the residual cannot stop at
+   the pilot's 100-epoch floor. The residual log prints its LR.
 8. The notebook prints the commit SHA, checkpoint path, W&B URLs, and a zip
    path under `/kaggle/working`.
 
@@ -425,8 +495,9 @@ generalization, or the gate.
 
 ## 9. Rollback
 
-- Code: this work is uncommitted; `git restore` the modified files and remove
-  the new `codeswitch_tts/data/`, `prepare_real_speech.py`,
+- Code: if the runbook correction is uncommitted, `git restore` the four
+  changed files; if it was committed, revert that commit. To roll the whole
+  feature back, also remove `codeswitch_tts/data/`, `prepare_real_speech.py`,
   `tests/test_data_pipeline.py`, and `CodeSwitch_DataScale_Kaggle.ipynb`.
 - Data/checkpoints: delete `real_cache/` and `codeswitch_ckpt_v6/`. Do **not**
   delete `teacher_cache/`, `codeswitch_ckpt_v2`, `_v3`, or `_v4_draft`.
@@ -443,14 +514,18 @@ generalization, or the gate.
 - [x] Real Tamil FLEURS → real DAC shards with exact duration sums.
 - [x] Duration predictor + duration-conditioned frame decoder.
 - [x] Trainer duration collation/loss/oracle ablation and flags.
-- [x] 171 tests pass; no new warnings attributable to this plan.
+- [x] 172 tests pass; no new warnings attributable to this plan.
 - [x] Self-contained Kaggle notebook statically validated (JSON parses; all
       11 code cells compile).
-- [ ] Rasa / IndicVoices-R real corpus prepared (gated; needs user `HF_TOKEN`).
-- [ ] Full-scale v6 draft/residual trained on the real corpus.
-- [ ] Unchanged 5% `rt_a`/`rd_a` gate passes.
+- [x] Rasa Tamil 200-row pilot prepared (0.2928 h; 200/200 durations;
+      0.9728 coverage); this is not the full 6 h slice.
+- [ ] Full 6 h Rasa/IndicVoices-R real corpus prepared.
+- [ ] Full-scale v6 draft/residual trained on the real corpus with the
+      150-epoch floor.
+- [ ] Unchanged 5% `rt_a`/`rd_a` gate passes (200-row pilot: `2.6133%` /
+      `1.7593%`, **FAIL**; gate not lowered).
 - [ ] 60-utterance evaluation and intelligibility check.
 - [ ] B/C quality claim (blocked until the gate passes).
 
-Do not mark this plan `DONE` until the three unchecked run items above have
+Do not mark this plan `DONE` until the five unchecked run items above have
 real evidence. Code completion is not quality.

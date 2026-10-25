@@ -438,6 +438,30 @@ def _fake_teacher_shards(n: int = 12, frames: int = 120):
     ]
 
 
+def test_main_records_corpus_hours_and_warns_under_one_hour(tmp_path, capsys):
+    """A real pilot can be data-limited; the checkpoint meta must say so."""
+    import train_draft_distill as T
+
+    shards = _fake_teacher_shards()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for shard in shards:
+        shard.save(cache / f"shard_{shard.index:05d}.npz")
+
+    ckpt_dir = tmp_path / "ckpt"
+    argv = [
+        "--skip-teacher", "--skip-draft", "--skip-residual",
+        "--teacher-cache", str(cache), "--ckpt-dir", str(ckpt_dir),
+        "--device", "cpu", "--dtype", "fp32",
+    ]
+    assert T.main(argv) == 0
+
+    meta = json.loads((ckpt_dir / "meta.json").read_text(encoding="utf-8"))
+    expected_hours = sum(float(s.audio_sec) for s in shards) / 3600.0
+    assert meta["corpus_hours"] == pytest.approx(expected_hours)
+    assert "[Data] WARNING: corpus is under 1 h" in capsys.readouterr().out
+
+
 def test_min_epochs_blocks_premature_early_stopping():
     """A small, noisy validation split must not be able to end training early.
 

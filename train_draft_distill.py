@@ -1259,10 +1259,12 @@ class ResidualTrainer:
                 best_full_state = {
                     k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
                 }
+            lr_now = optimizer.param_groups[0]["lr"]
             print(
                 f"[Residual] epoch {epoch:3d} | train {train_loss:.4f} (sched {sched_p:.2f}) "
                 f"| val {val_loss:.4f} [{val_label}]"
-                f"{'  *best*' if improved else ''} | total {_fmt_time(_now() - t_start)}"
+                f"{'  *best*' if improved else ''} | lr {lr_now:.2e} "
+                f"| total {_fmt_time(_now() - t_start)}"
             )
             if stale >= patience and epoch >= int(min_epochs):
                 print(f"[Residual] early stopping at epoch {epoch}")
@@ -1702,6 +1704,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Recompute the length model over whatever shards exist (resume-safe).
     length_model = LengthModel.fit([s.n_chars for s in shards], [s.frames for s in shards])
+    corpus_hours = float(sum(float(s.audio_sec) for s in shards) / 3600.0)
+    print(f"[Data] corpus {len(shards)} shards, {corpus_hours:.3f} h")
+    if corpus_hours < 1.0:
+        print(
+            "[Data] WARNING: corpus is under 1 h; a failed 5% residual gate is a "
+            "data-scale result first, not a model-architecture verdict. Use a larger "
+            "real slice (the notebook default is 5000 rows capped at 6 h)."
+        )
 
     # ---------------- trainers ----------------
     draft: Optional[DraftTransformer] = None
@@ -1769,6 +1779,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     meta = {
         "corpus_size": len(shards),
+        "corpus_hours": float(corpus_hours),
         "corpus_source": args.corpus_json or f"bootstrap(seed={args.seed})",
         "target_source": args.target_source,
         "target_stats": getattr(engine, "backend", "n/a"),

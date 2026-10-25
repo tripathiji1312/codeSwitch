@@ -31,7 +31,11 @@ v6 draft, open **`CodeSwitch_DataScale_Kaggle.ipynb`** instead:
   `transformers.DacModel` instead. If an earlier run downgraded NumPy, start a
   **fresh Kaggle session** (a plain kernel restart may keep the old packages);
 * gated run: set `SMOKE=False`, `DATASET_CHOICE="rasa_ta"` (or `"indicvoices_ta"`),
-  and add `HF_TOKEN` in Kaggle Secrets after accepting the dataset terms;
+  and add `HF_TOKEN` in Kaggle Secrets after accepting the dataset terms.
+  Rows are not hours: a 200-row Rasa pilot produced only **0.29 h**, so the
+  real default is **5000 rows capped at 6 h** (`PREP_MAX_HOURS`). A <1 h
+  corpus is a plumbing smoke; the notebook prints a warning and its gate result
+  is not a model-architecture verdict;
 * it writes `real_cache/<source>` and `codeswitch_ckpt_v6`, so it does **not**
   overwrite `teacher_cache/` or the v2–v4 checkpoints;
 * it runs the unchanged 5% gate and refuses the 60-utterance evaluation until the
