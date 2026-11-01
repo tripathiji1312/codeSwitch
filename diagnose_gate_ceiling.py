@@ -174,6 +174,14 @@ def gate_decomposition(
     correct_cb0 = 0
     topk_hits = {k: 0 for k in (1, 3, 5, 10, 20, 50)}
     confidence_rows = []
+    # The official gate averages per-shard window means (see
+    # ``diagnose_audio_bug.py``), which is not the same estimator as pooling
+    # all frames.  Keep both so the notebook never conflates them.
+    shard_p_means: List[float] = []
+    shard_rt_means: List[float] = []
+    shard_rd_means: List[float] = []
+    shard_c_means: List[float] = []
+    shard_w_means: List[float] = []
 
     for shard in shards:
         codes = np.asarray(shard.codes, dtype=np.int64)
@@ -184,8 +192,11 @@ def gate_decomposition(
         )
         correct = draft_tokens == codes[0]
         order = np.argsort(draft_probs, axis=-1)[:, ::-1]
-        shard_teacher_hits = 0
-        shard_frames = 0
+        shard_p_windows: List[float] = []
+        shard_rt_windows: List[float] = []
+        shard_rd_windows: List[float] = []
+        shard_c_windows: List[float] = []
+        shard_w_windows: List[float] = []
 
         for start, end in _windows(T, frames):
             tcb0 = codes[0, start:end]
@@ -219,8 +230,13 @@ def gate_decomposition(
                 )
             teacher_hit = r_teacher == tgt
             draft_hit = r_draft == tgt
-            shard_teacher_hits += int(teacher_hit.sum())
-            shard_frames += int(end - start)
+            shard_p_windows.append(float(ok.mean()))
+            shard_rt_windows.append(float(teacher_hit.mean()))
+            shard_rd_windows.append(float(draft_hit.mean()))
+            if n_ok:
+                shard_c_windows.append(float(teacher_hit[:, ok].mean()))
+            if n_bad:
+                shard_w_windows.append(float(draft_hit[:, bad].mean()))
             per_cb_teacher_all += teacher_hit.sum(axis=1)
             per_cb_draft_all += draft_hit.sum(axis=1)
             if n_ok:
@@ -247,17 +263,38 @@ def gate_decomposition(
             ):
                 confidence_rows.append((float(c), bool(is_ok), float(acc)))
 
+        shard_p_means.append(
+            float(np.mean(shard_p_windows)) if shard_p_windows else 0.0
+        )
+        shard_rt_means.append(
+            float(np.mean(shard_rt_windows)) if shard_rt_windows else 0.0
+        )
+        shard_rd_means.append(
+            float(np.mean(shard_rd_windows)) if shard_rd_windows else 0.0
+        )
+        if shard_c_windows:
+            shard_c_means.append(float(np.mean(shard_c_windows)))
+        if shard_w_windows:
+            shard_w_means.append(float(np.mean(shard_w_windows)))
+
         rows.append(
             {
                 "index": int(shard.index),
                 "frames": T,
-                "cb0_top1": float(correct.mean() * 100),
+                "cb0_top1": (
+                    float(np.mean(shard_p_windows) * 100)
+                    if shard_p_windows else 0.0
+                ),
                 "cb0_top5": float(
                     (order[:, :5] == codes[0, :, None]).any(-1).mean() * 100
                 ),
                 "rt_a": (
-                    float(shard_teacher_hits * 100.0 / shard_frames)
-                    if shard_frames else 0.0
+                    float(np.mean(shard_rt_windows) * 100)
+                    if shard_rt_windows else 0.0
+                ),
+                "rd_a": (
+                    float(np.mean(shard_rd_windows) * 100)
+                    if shard_rd_windows else 0.0
                 ),
             }
         )
@@ -276,6 +313,23 @@ def gate_decomposition(
     )
     rt_a_overall = float(
         (per_cb_teacher_all / max(1, window_frames)).mean() * 100
+    )
+    p_gate_style = float(np.mean(shard_p_means) * 100) if shard_p_means else 0.0
+    rt_a_gate_style = (
+        float(np.mean(shard_rt_means) * 100) if shard_rt_means else 0.0
+    )
+    rd_a_gate_style = (
+        float(np.mean(shard_rd_means) * 100) if shard_rd_means else 0.0
+    )
+    c_gate_style = (
+        float(np.mean(shard_c_means) * 100) if shard_c_means else 0.0
+    )
+    w_gate_style = (
+        float(np.mean(shard_w_means) * 100) if shard_w_means else 0.0
+    )
+    gate_style_identity = (
+        p_gate_style / 100.0 * c_gate_style
+        + (1.0 - p_gate_style / 100.0) * w_gate_style
     )
 
     bins = []
@@ -305,6 +359,16 @@ def gate_decomposition(
         "rd_a_overall": rd_a_overall,
         "rt_a": rt_a_overall,
         "decomposition_error": abs(rd_a - rd_a_overall),
+        # The official gate averages per-shard window means.  These fields make
+        # that estimator explicit; the p/c/w identity is exact only in the
+        # frame-weighted view above.
+        "p_gate_style": p_gate_style,
+        "c_gate_style": c_gate_style,
+        "w_gate_style": w_gate_style,
+        "rd_a_gate_style": rd_a_gate_style,
+        "rt_a_gate_style": rt_a_gate_style,
+        "gate_style_identity": gate_style_identity,
+        "gate_style_identity_error": abs(gate_style_identity - rd_a_gate_style),
         "correct_frames": correct_frames,
         "wrong_frames": wrong_frames,
         "per_cb_teacher": [float(x * 100) for x in per_cb_c],
@@ -618,7 +682,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"c  (residual CB1-8 | CB0 ok)  = {gate['c']:.4f}%")
     print(f"w  (residual CB1-8 | CB0 bad) = {gate['w']:.4f}%")
     print(f"rd_a = p*c + (1-p)*w          = {gate['rd_a_from_terms']:.4f}%  "
-          f"{'PASS' if gate['rd_a_from_terms'] >= 5 else 'FAIL'}")
+          f"(frame-weighted identity)")
+    print(f"official gate-style rd_a      = {gate['rd_a_gate_style']:.4f}%  "
+          f"{'PASS' if gate['rd_a_gate_style'] >= 5 else 'FAIL'}  "
+          f"(equal-weight per shard, matches diagnose_audio_bug)")
+    print(f"gate-style identity check     = {gate['gate_style_identity']:.4f}%  "
+          f"(abs error {gate['gate_style_identity_error']:.4f} points; "
+          "p/c/w means are nonlinear, so this is not exact)")
     print(f"required p at current c,w     = "
           f"{gate['required_p_at_current_c_w']:.2f}%" if gate['required_p_at_current_c_w'] is not None
           else "required p at current c,w     = n/a (c <= w)")
@@ -665,13 +735,19 @@ def _git_commit() -> str:
 
 def _truth_statement(gate: Dict, ngram: Dict) -> str:
     p, c, w = gate["p"], gate["c"], gate["w"]
+    official = gate.get("rd_a_gate_style", gate["rd_a_from_terms"])
     lines = []
-    if gate["rd_a_from_terms"] >= 5.0:
-        lines.append("The unchanged gate passes on this sample. Verify with the 60-utterance suite.")
+    if official >= 5.0:
+        lines.append(
+            "The unchanged gate passes on this sample "
+            f"(official gate-style rd_a={official:.3f}%). Verify with the "
+            "60-utterance suite."
+        )
     else:
         lines.append(
-            f"The unchanged gate fails: rd_a={gate['rd_a_from_terms']:.3f}% < 5%. "
-            f"p={p:.3f}%, c={c:.3f}%, w={w:.3f}%."
+            f"The unchanged gate fails: official gate-style rd_a={official:.3f}% < 5%. "
+            f"The frame-weighted identity is rd_a={gate['rd_a_from_terms']:.3f}% "
+            f"with p={p:.3f}%, c={c:.3f}%, w={w:.3f}%."
         )
     if c > w:
         lines.append(

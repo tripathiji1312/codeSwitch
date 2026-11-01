@@ -786,6 +786,12 @@ Two diagnostic fixes matter for truth:
   `w`. The earlier version used raw shard frames, so on a local 80-shard check
   the identity drifted by 0.0375 points. A unit test covers non-divisible shard
   lengths and asserts `decomposition_error < 1e-9`.
+- The official gate averages per-shard window means. The diagnostic now reports
+  that `rd_a_gate_style` next to the frame-weighted identity, plus the
+  gate-style identity error. On the local 4-shard smoke it gave
+  `rd_a_gate_style=0.7397%` versus the gate's `0.740%`, while the frame-weighted
+  identity was `0.7367%`; the conditional identity is not exact under
+  equal-shard weighting because `p/c/w` means are nonlinear.
 - `diagnose_gate_ceiling.py --skip-ngram` skips the n-gram baselines for
   gate-only decomposition; `--ngram-shards 0` still means *all* shards.
 

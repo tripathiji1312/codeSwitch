@@ -554,8 +554,12 @@ not neural ceilings; the text floor is ~4.4× below the required `w`.
 
 The ceiling diagnostic now averages `p` over the same overlapping 86-frame
 windows as `c`/`w`; raw shard frames made the identity drift by 0.0375 points
-on the 80-shard check. `--skip-ngram` was added for gate-only decomposition
-(`--ngram-shards 0` still means all shards).
+on the 80-shard check. It also reports the official per-shard gate-style
+`rd_a` next to the frame-weighted identity, because the conditional identity
+is not exact under equal-shard weighting. `--skip-ngram` was added for
+gate-only decomposition (`--ngram-shards 0` still means all shards). Local
+4-shard smoke: `rd_a_gate_style=0.7397%` vs gate `0.740%`; frame-weighted
+`rd_a=0.7367%`.
 
 Standalone notebook: `CodeSwitch_TextResidual_Kaggle.ipynb`. It reuses or pulls
 the preserved 6 h artifacts, reproduces the base gate/decomposition, trains only

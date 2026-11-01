@@ -240,6 +240,8 @@ def test_gate_decomposition_uses_conditional_c_and_w(monkeypatch):
     assert gate["wrong_frames"] == 129
     assert gate["rd_a_from_terms"] == pytest.approx(gate["rd_a_overall"], abs=1e-9)
     assert gate["decomposition_error"] < 1e-9
+    assert gate["rd_a_gate_style"] == pytest.approx(gate["rd_a_overall"], abs=1e-9)
+    assert gate["gate_style_identity_error"] < 1e-9
 
 
 def test_residual_text_confidence_conditioning_and_null_cb0():
