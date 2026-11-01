@@ -2,13 +2,13 @@
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-10-31 |
-| Repo HEAD | `e9c6234` (v7 text/confidence residual, diagnostics, notebook) |
-| Status | **BLOCKED** — unchanged 5% gate fails on `rd_a` |
-| Scope | Primary: real Rasa Tamil v6. Appendix A: pre-v6 synthetic-cache lineage. Appendix B: plans 001–012 |
+| Last updated | 2026-11-01 |
+| Repo HEAD | `fix/013-bc-noise` branch tip: v7 result record on code commit `2b8eec4` |
+| Status | **BLOCKED** — v7 text/confidence residual FAILED the unchanged gate (`rd_a=2.4367%`); no quality claim |
+| Scope | Primary: real Rasa Tamil v6/v7. Appendix A: pre-v6 synthetic-cache lineage. Appendix B: plans 001–012 |
 | Quality claim | **None** — 60-utterance evaluation not run |
 
-**Bottom line:** the unchanged 5% gate fails. The 60-utterance evaluation has not run. There is no valid B/C quality claim.
+**Bottom line:** five gate attempts fail. The best `rd_a` is still `2.4367% < 5%`. The 60-utterance evaluation has not run, and there is no valid B/C quality claim.
 
 ---
 
@@ -16,13 +16,15 @@
 
 - Real Rasa Tamil speech was prepared, DAC-encoded, and used to train the CTC-duration-conditioned v6 draft and residual.
 - Best full run: **6.0001 h**, 4,015 shards, draft `val_top1 = 5.8416%`, residual selected at epoch 149.
-- Gate result: `rt_a = 8.8726%` **passes**, `rd_a = 2.2487%` **fails**.
-- The LR-floor rerun improved `rt_a` to **10.6244%** but left `rd_a` at **2.2340%**. The gate still fails.
-- The binding constraint is draft CB0 accuracy: `p = 7.9383%`. The residual reaches `c = 10.6244%` when CB0 is correct, but only `w = 1.5105%` when CB0 is wrong.
-- At current `c` and `w`, the draft would need `p ≈ 38.3%` to reach `rd_a = 5%`. The 6 h numbers imply `p ≈ 46.2%`.
-- Rejected levers: LR floor, duration-loss weight 0.5, WIKI-only data, 20 h + residual projections, token corruption/soft top-k.
-- Remaining paths: a fundamentally stronger draft/residual, an explicit gate re-scope with user sign-off, or one cheap draft-capacity diagnostic.
-- v7 intervention (code complete, not yet trained): text/confidence-conditioned residual to raise `w`, with a standalone Kaggle notebook. See Appendix C.
+- Base gate: `rt_a = 8.8726%` **passes**, `rd_a = 2.2487%` **fails**.
+- Corrected conditional decomposition on the base checkpoint: `p = 8.1395%`, `c = 12.5000%`, `w = 1.3671%` (frame-weighted `rd_a = 2.2733%`; official gate-style `rd_a = 2.2487%`). The earlier ledger's `p/c/w` used a mixed estimator and is superseded; the official `rd_a` is unchanged.
+- The LR-floor rerun improved `rt_a` to **10.6244%** but left `rd_a` at **2.2340%**. Its conditional `c/w` were not recomputed, so the old `c=10.6244%`, `w=1.5105%` must not be quoted as conditional terms.
+- v7 text/confidence residual: `rt_a = 8.3932%` **passes**, `rd_a = 2.4367%` **fails**. Corrected decomposition: `p = 8.1395%`, `c = 13.3571%`, `w = 1.4620%`.
+- The 20-shard v7 robustness check gives `rt_a = 6.5134%`, `rd_a = 1.5574%`, also **FAIL**. The 4-shard gate remains the verdict.
+- At v7's `p/c/w`, passing needs `p ≈ 29.7%` or `w ≈ 4.26%`; the observed values are `8.14%` and `1.46%`.
+- Rejected levers: LR floor, duration-loss weight 0.5, WIKI-only data, 20 h + residual projections, token corruption/soft top-k, and now text/confidence conditioning through draft frame features.
+- Remaining paths: candidate reranking over top-k CB0 (oracle top-10 `rd_a = 5.40%`), a dedicated text encoder, a fundamentally stronger draft/residual, or an explicit gate re-scope with user sign-off.
+- v7 result: `rd_a = 2.4367%` (**FAIL**), W&B `16aklys4`; no 60-utterance evaluation. See Appendix C.
 
 ---
 
@@ -60,8 +62,11 @@ Metric definitions:
 - `rd_s` / `rd_a`: residual top-1 with **draft CB0**.
 - Gate pass condition uses the `_a` values: `rt_a >= 5` and `rd_a >= 5`.
 - `_s` values are diagnostics only.
-- `rt_a` is effectively the residual ceiling when CB0 is correct: `c`.
-- `rd_a` is the actual deployed gate metric.
+- `p`: draft CB0 top-1 on the same overlapping 86-frame windows used for `c/w`.
+- `c`: residual CB1–8 top-1 with the **draft CB0**, restricted to frames where that CB0 is **correct**.
+- `w`: residual CB1–8 top-1 with the **draft CB0**, restricted to frames where that CB0 is **wrong**.
+- `rt_a` is **not** `c`: `rt_a` evaluates the residual with teacher CB0 on all frames; `c` evaluates it with draft CB0 only on frames where draft CB0 is correct.
+- `rd_a` is the actual deployed gate metric. The frame-weighted identity is `rd_a = p*c + (1-p)*w`; the official gate averages per-shard window means, so its `rd_a_gate_style` can differ slightly.
 
 ---
 
@@ -247,72 +252,157 @@ The WIKI model had **better val loss, better oracle accuracy, and better diversi
 
 No corruption setting reaches 5%. Corrupting CB0 does not rescue the residual. Token corruption, soft CB0, and top-k CB0 were ruled out.
 
+### 4.8 v7 text/confidence residual — FAIL
+
+**Date:** 2026-11-01. **One intervention:** residual-only text/confidence conditioning; the
+draft was reused unchanged.
+
+**Data provenance.** The 6 h cache was rebuilt in the Kaggle session with the recorded
+`prepare_real_speech.py` recipe: 4,024 rows seen, 4,015 written, 0 errors, 6.0001366 h,
+duration coverage 0.9724745706. The base gate reproduced the ledger exactly
+(`rt_a=8.8725682021%`, `rd_a=2.2487142218%`), so the v7 comparison is valid. This is a
+rebuilt cache, not a preserved byte stream; the exact reproduction is the evidence that
+the gate sample is equivalent.
+
+**Residual training**
+
+| Item | Value |
+|---|---:|
+| Epochs run | 139 (90 min budget) |
+| Selected | epoch 100, full-draft |
+| Selected val | 6.735466 |
+| Best val any | 6.733203 @ epoch 8 |
+| Best teacher val | 6.304696 |
+| `cb_top1_teacher_mean` | 2.600186% |
+| `cb_top1_draft_mean` | 1.214072% |
+| `cb_top1_text_mean` | 1.208579% |
+| W&B | `4e0k60z2` |
+
+**4-shard gate (unchanged thresholds)**
+
+| Metric | Value |
+|---|---:|
+| `cb0_s` | 3.583408% |
+| `cb0_a` | 7.938283% |
+| `rt_s` | 3.095651% |
+| `rt_a` | **8.393197% — PASS** |
+| `rd_s` | 0.315155% |
+| `rd_a` | **2.436689% — FAIL** |
+| W&B | `16aklys4` |
+
+**Corrected decomposition**
+
+| Term | Base | v7 |
+|---|---:|---:|
+| `p` | 8.139535% | 8.139535% |
+| `c` | 12.500000% | 13.357143% |
+| `w` | 1.367088% | 1.462025% |
+| frame-weighted `rd_a` | 2.273256% | 2.430233% |
+| official `rd_a_gate_style` | 2.248714% | 2.436689% |
+| `w_text_model` | — | 1.405063% |
+| required `p` at current `c/w` | 32.63% | 29.74% |
+| required `w` at current `p/c` | 4.34% | 4.26% |
+
+**20-shard robustness:** `rt_a=6.513365%` (pass), `rd_a=1.557440%` (**FAIL**). The 4-shard
+result remains the gate verdict.
+
+**Interpretation.** v7 raised `c` by 0.857 points and `w` by only 0.095 points. The
+text-only fallback (`w=1.4051%`) is almost the entire wrong-CB0 performance; confidence
+and CB0-token fusion add about 0.057 points. The residual is not learning to exploit the
+draft frame features to recover wrong CB0. The gain in `rd_a` (+0.188 points) is far
+below the 5% gate, and the 20-shard recheck is lower than the 4-shard result. The text/confidence-conditioning
+hypothesis is rejected.
+
 ---
 
 ## 5. Gate arithmetic — why `rd_a` is stuck
 
-The deployed gate decomposes as:
+The gate decomposes in the **frame-weighted** view as:
 
 ```text
 rd_a = p * c + (1 - p) * w
 ```
 
-where:
+where `p` is the draft CB0 top-1 on the same overlapping windows, `c` is the
+residual CB1–8 top-1 with draft CB0 on frames where that CB0 is correct, and `w`
+is the same on frames where it is wrong. The official gate averages per-shard
+window means; `diagnose_gate_ceiling.py` reports that as `rd_a_gate_style` next
+to the frame-weighted identity.
 
-- `p = cb0_a` = draft CB0 top-1.
-- `c = rt_a` = residual top-1 when CB0 is correct.
-- `w` = residual top-1 when CB0 is wrong.
-
-Using the LR-fix numbers:
-
-```text
-p = 7.9383%
-c = 10.6244%
-w = 1.5105%
-
-rd_a = 0.079383 * 0.106244 + 0.920617 * 0.015105
-     = 0.008434 + 0.013906
-     = 0.022340 = 2.2340%
-```
-
-Using the 6 h numbers:
+**Base checkpoint (recomputed 2026-11-01):**
 
 ```text
-p = 7.9383%
-c = 8.8726%
-w = 1.6771%
+p = 8.1395%
+c = 12.5000%
+w = 1.3671%
 
-rd_a = 2.2487%
+frame-weighted rd_a = 2.2733%
+official rd_a       = 2.2487%
 ```
 
-**Required draft accuracy at current `c` and `w`:**
+The earlier ledger's `p=7.9383%`, `c=8.8726%`, `w=1.6771%` and the LR-floor
+`c=10.6244%`, `w=1.5105%` mixed `rt_a` with the conditional `c` and used
+un-windowed `p`. Those values are **superseded for attribution**. The official
+gate numbers (`rt_a`, `rd_a`) are unchanged.
+
+**v7 text/confidence residual:**
+
+```text
+p = 8.1395%
+c = 13.3571%
+w = 1.4620%
+
+frame-weighted rd_a = 2.4302%
+official rd_a       = 2.4367%   FAIL
+```
+
+**Required terms at v7's `c/w`:**
 
 ```text
 p_required = (5% - w) / (c - w)
-           = (5 - 1.5105) / (10.6244 - 1.5105)
-           = 38.3%
+           = (5 - 1.4620) / (13.3571 - 1.4620)
+           = 29.74%
 ```
 
-At the 6 h `c` and `w`, the requirement is **46.2%**.
+**Required wrong-CB0 accuracy at v7's `p/c`:**
 
-**Projection at current `c = 10.6244%`, `w = 1.5105%`:**
+```text
+w_required = (5% - p*c) / (1 - p)
+           = (5 - 8.1395*13.3571/100) / (1 - 0.081395)
+           = 4.26%
+```
+
+At the base checkpoint the corresponding values are `p_required = 32.63%` and
+`w_required = 4.34%`.
+
+**Projection at v7's `c=13.3571%`, `w=1.4620%`:**
 
 | Draft CB0 `p` | Projected `rd_a` |
 |---:|---:|
-| 12% | 2.60% |
-| 20% | 3.33% |
-| 30% | 4.24% |
-| 38.3% | 5.00% |
+| 12% | 2.89% |
+| 20% | 3.84% |
+| 29.7% | 5.00% |
+| 40% | 6.22% |
+
+**What would `c` alone need?** At v7's `p=8.1395%` and `w=1.4620%`, even
+`c=30%` gives only `3.79%`; `c` would need about **46%** to reach 5%. Improving
+`c` is not the cheap path.
 
 **Context:**
 
 - Chance is `0.0977%` (1/1024).
-- `rd_a = 2.234%` is about **22.9× chance**.
+- Base `rd_a=2.2487%` is about **23.0× chance**; v7 `2.4367%` is about **24.9×**.
 - 5% is about **51.2× chance**.
-- The earlier top-5 oracle projection was **≈3.15%**, still below 5%.
-- To pass by improving wrong-CB0 recovery alone, `w` would need to be **4.52%**, about **3×** the observed 1.51%.
+- At v7, `w` must rise **2.91×** (1.4620 → 4.26) or `p` must rise **3.65×**
+  (8.1395 → 29.74) to pass at the other terms' current values.
+- The measured top-k oracle `rd_a` is `top5=4.43%`, `top10=5.40%`,
+  `top20=6.78%`, `top50=9.08%`. Candidate reranking is the only measured
+  quantity that crosses 5%, but it is a structural change, not a residual tweak.
 
-**Conclusion:** the gate is dominated by draft CB0 accuracy. The residual cannot recover wrong CB0 frames. At the current residual ceiling, even a perfect CB0 would only produce ~10.6%, so the draft does not need to be perfect — but it needs to be roughly **5× better** than it is now (`7.94% → 38.3%`) unless the residual ceiling also improves.
+**Conclusion:** the binding term remains `w`. v7 moved it only `1.3671 → 1.4620`
+(+0.095 points) while `c` moved +0.857. The residual-only text/confidence path
+is exhausted; a pass now requires a structurally different draft/residual or an
+explicitly signed-off gate re-scope.
 
 ---
 
@@ -320,11 +410,12 @@ At the 6 h `c` and `w`, the requirement is **46.2%**.
 
 | Lever | Result | Why rejected |
 |---|---|---|
-| **LR floor `1e-5`** | `rd_a 2.2487 → 2.2340` | Improved `c`, not `p`; full-draft val worsened after epoch 100; selection stayed at first full-draft epoch. |
+| **LR floor `1e-5`** | `rt_a 8.8726 → 10.6244`; `rd_a 2.2487 → 2.2340` | Improved teacher-CB0 accuracy, not `p`; its conditional `c/w` were not recomputed and the old `c/w` values are superseded. Rejected. |
 | **Duration-loss weight 0.5** | top1 `5.8416 → 5.6959`, top5 `17.9546 → 16.8193` | Lower duration loss, worse token accuracy; oracle gap widened. Duration conditioning is not the bottleneck. |
 | **WIKI-only data** | top1 `4.5702%` | Better loss/oracle/diversity but lower argmax top-1; style is not the lever; gate rewards mode collapse. |
 | **20 h + residual** | projected `2.60 / 3.33 / 4.24%` at `p = 12 / 20 / 30%` | Still fails; unfiltered 20 h adds male/style variance and is not a clean data-scale test. |
-| **Token corruption / soft / top-k** | top-5 oracle ceiling ≈3.15% | Cannot reach 5%; wrong-CB0 recovery would need `w = 4.52%`. |
+| **Token corruption / soft / top-k** | no corruption setting reaches 5%; top-5 oracle `4.15%` base / `4.43%` v7 | Cannot reach 5% by perturbation; candidate reranking is a different architecture with a `top10=5.05/5.40%` oracle, not a residual tweak. |
+| **v7 text/confidence residual** | `rd_a 2.2487 → 2.4367`; `w 1.3671 → 1.4620` | Text-only fallback `w=1.4051%`; confidence/fusion adds ~0.057 points; 20-shard `rd_a=1.5574%`. Rejected. |
 | **Cross-cache gate comparison** | invalid | Different 4-shard samples: 200-shard cache picks `0,66,133,199`; 4,015-shard cache picks `0,1338,2676,4014`. |
 
 The pilot’s `cb0_a = 11.9186%` is **not** comparable to the 6 h `cb0_a = 7.9383%` for this reason.
@@ -379,11 +470,11 @@ WIKI-only was a clean style isolation test: 6.001 h, all Female, but it failed t
 
 ## 8. Issues and validity caveats
 
-1. **Gate fails.** `rd_a = 2.2340% < 5%`; the 60-utterance eval remains blocked.
-2. **Only 4 gate shards.** The gate samples 4 shards via `np.linspace`; cross-cache comparisons are confounded. No confidence interval or seed-variance study was run.
+1. **Gate fails.** Best `rd_a = 2.4367% < 5%` (v7); the 60-utterance eval remains blocked.
+2. **Only 4 gate shards.** The gate samples 4 shards via `np.linspace`; cross-cache comparisons are confounded. The 20-shard robustness check (`rd_a=1.5574%`) is reported separately and is not a substitute for the 4-shard verdict.
 3. **Pilot artifacts overwritten.** The pilot weights were replaced at `codeswitch_ckpt_v6`; pilot meta/prep time is lost. Only metrics survive in `plans/014` and W&B `qg3pnhk5`.
 4. **No training resume.** Each run starts from scratch. The LR patch exists only in the Kaggle working copy.
-5. **Notebook still points at `codeswitch_ckpt_v6`.** It must be changed per experiment or it will overwrite the pilot again.
+5. **The v7 cache was rebuilt in-session.** It reproduced the base gate exactly, so the gate sample is equivalent, but the original 4,015 shards are not preserved as a byte stream.
 6. **Cache ordering bias.** The 6 h cache is the first rows of Rasa Tamil, female-only and style-skewed. It is not representative of the full 56 h corpus.
 7. **Speaker/style metadata missing.** No clean conditioning experiment is possible until re-prep captures `gender` and `style`.
 8. **6 h draft is below the 10% triage.** `5.8416% < 10%`; WIKI is also below (`4.5702%`). The current draft is not close to the gate.
@@ -394,17 +485,14 @@ WIKI-only was a clean style isolation test: 6.001 h, all Female, but it failed t
 
 ## 9. Local repo state
 
-- HEAD: `decefc38c6547fc985244639a133266bbb6d1de3` (`decefc3`).
-- Commits `0bff727` and `decefc3` pushed.
-- Worktree clean at the time of the last check.
-- Local test suite: **172 passed, 3 warnings in 10.65s**.
-- Notebook: **21 cells, 11 code cells**, all compile.
-- Shell-command-in-Python-cell error fixed with:
-  ```python
-  subprocess.run([...], cwd="/kaggle/working/codeSwitch", check=True)
-  ```
-- `plans/014-real-data-duration.md` still needs the WIKI and `dur05` numbers added.
-- The notebook’s `CKPT_DIR` is still `codeswitch_ckpt_v6`; this is a real overwrite risk.
+- Branch `fix/013-bc-noise`; v7 result record on code commit `2b8eec4`.
+- Worktree clean after the docs/notebook result commit.
+- Local test suite: **179 passed, 3 warnings**.
+- Notebook: **22 cells, 11 code cells**, all compile.
+- `CKPT_DIR` is `codeswitch_ckpt_v7_textres`; the 6 h checkpoint is never overwritten.
+- `plans/014-real-data-duration.md` now records the v7 result and exact numbers.
+- The Kaggle v7 run used the rebuilt 4,015-shard cache; the base gate reproduced the
+  ledger exactly, which is the evidence that the gate sample is equivalent.
 
 **Preserved checkpoints:**
 
@@ -412,6 +500,7 @@ WIKI-only was a clean style isolation test: 6.001 h, all Female, but it failed t
 - `codeswitch_ckpt_v6_lrfix` — LR-floor checkpoint/meta.
 - `codeswitch_ckpt_v6_dur05` — duration-weight checkpoint/meta.
 - `codeswitch_ckpt_v6_wiki` — WIKI draft checkpoint/meta.
+- `codeswitch_ckpt_v7_textres` — v7 text/confidence residual (15.50M params), **FAIL**.
 - `codeswitch_ckpt_v2`, `codeswitch_ckpt_v3`, `codeswitch_ckpt_v4_draft`, `teacher_cache` — untouched.
 
 ---
@@ -427,13 +516,18 @@ Sequence, not a bundle:
 3. **Residual-only:** improve `c` toward ≈20%.
 4. Joint example: `p = 20%`, `c = 20%`, `w = 1.5%` → `rd_a = 5.2%`.
 
-If only the draft changes, the target remains `p ≈ 38.3%` at current `c/w`. That is a ~5× improvement and is unlikely from data scale alone.
+If only the draft changes, the target is `p ≈ 29.7%` at v7's `c/w` (`≈32.6%` at
+base `c/w`). That is still a **3.6–4×** improvement and is unlikely from data
+scale alone.
 
-This path is research-heavy and requires schema changes for speaker/style conditioning. It should be staged one variable at a time.
+This path is research-heavy and requires schema changes for speaker/style
+conditioning. It should be staged one variable at a time.
 
 ### Option B — Explicit gate re-scope
 
-Only with explicit user sign-off. This conflicts with the standing requirement and would break comparability with all prior runs. It is **not** recommended as a silent fix, and it must be documented as a scope change, not a model pass.
+Only with explicit user sign-off. This conflicts with the standing requirement and
+would break comparability with all prior runs. It is **not** recommended as a silent
+fix, and it must be documented as a scope change, not a model pass.
 
 ### Option C — Cheap draft-capacity diagnostic
 
@@ -456,9 +550,36 @@ Compare against:
 val_top1 5.8416% | val_top5 17.9546% | oracle 9.8324% / 27.3165%
 ```
 
-Stop rule: if `val_top1 < 7%`, capacity is not the lever; stop. If it clears ~10–15%, capacity helps but is still far from the gate. Do **not** train a residual or run the gate unless the projection reaches 5%.
+Stop rule: if `val_top1 < 7%`, capacity is not the lever; stop. If it clears
+~10–15%, capacity helps but is still far from the gate. Do **not** train a
+residual or run the gate unless the projection reaches 5%.
 
-**Recommendation:** run **C first**. It is one variable, cheap, and falsifiable. If it fails the 7% floor, do not spend on 20 h + residual. If it shows a real jump, use that signal to decide whether A is worth the larger draft/residual work.
+### Option D — Candidate reranking over top-k CB0
+
+This is the only measured quantity whose oracle crosses 5%:
+
+```text
+v7 oracle top-k rd_a: top5=4.43%, top10=5.40%, top20=6.78%, top50=9.08%
+v7 top-k coverage:    top5=24.98%, top10=33.07%, top20=44.74%, top50=64.05%
+```
+
+A reranker would score the draft's top-k CB0 candidates with text/confidence and
+pick one. This changes inference and the gate implementation; it is **not** a
+residual-only tweak. The oracle assumes perfect selection among candidates, so a
+real reranker will be lower. It needs a new pre-registered protocol and a fresh
+gate run, not a silent re-scope.
+
+### Option E — Dedicated text encoder
+
+Replace the draft frame features with a dedicated character/phoneme text encoder
+as the residual's text signal. The current text-only fallback reaches
+`w=1.4051%`; passing needs `4.26%`, about **3×** more. This is narrower than
+candidate reranking but the 3× gap is unproven.
+
+**Recommendation:** do not run the 60-utterance evaluation. If continuing, **C**
+is the cheapest falsifiable draft-capacity check; **D** has the only measured
+oracle above 5% but is structural; **E** is a narrower text-side test. None is
+guaranteed, and a gate re-scope still requires explicit user sign-off.
 
 ---
 
@@ -747,19 +868,20 @@ The plan index is `plans/README.md`. Plans 001–012 are code-quality work; thei
 
 ---
 
-# Appendix C — v7 text/confidence residual (implemented; Kaggle run pending)
+# Appendix C — v7 text/confidence residual (trained; gate FAILED)
 
-**Date:** 2026-10-31. **Status:** code complete and locally tested; **not yet trained on
-the 6 h cache, so there is no v7 gate number.** The unchanged gate remains failed as of
-the last recorded run (`rd_a = 2.2340%`).
+**Date:** 2026-11-01. **Status:** trained and gated on the rebuilt 6 h Rasa cache.
+**Result:** `rt_a=8.3932%` passes, `rd_a=2.4367%` **FAILS**. No 60-utterance
+evaluation. The unchanged gate remains failed; this is the fifth failure.
 
 ## Why this intervention
 
-The gate decomposes exactly as `rd_a = p*c + (1-p)*w`. At the best measured
-`p = 7.9383%`, `c = 10.6244%`, `w = 1.5105%`, the binding term is `w`: about 92% of
-deployed frames have a wrong draft CB0, and the CB0-only residual only reaches 1.51%
-on them. At fixed `p/c`, passing requires `w ≈ 4.52%`. A CB0-only residual cannot
-recover a wrong CB0; it has no text signal.
+The gate decomposes in the frame-weighted view as `rd_a = p*c + (1-p)*w`. At the
+corrected base terms `p = 8.1395%`, `c = 12.5000%`, `w = 1.3671%`, the binding
+term is `w`: about 92% of deployed frames have a wrong draft CB0, and the
+CB0-only residual only reaches 1.37% on them. At fixed `p/c`, passing requires
+`w ≈ 4.34%`. A CB0-only residual cannot recover a wrong CB0; it has no text
+signal.
 
 ## What changed (one intervention)
 
@@ -795,6 +917,45 @@ Two diagnostic fixes matter for truth:
 - `diagnose_gate_ceiling.py --skip-ngram` skips the n-gram baselines for
   gate-only decomposition; `--ngram-shards 0` still means *all* shards.
 
+## v7 result (2026-11-01)
+
+**Provenance.** The 6 h cache was rebuilt in-session with the recorded
+`prepare_real_speech.py` command (4,015 shards, 6.0001366 h, 4,024 rows,
+0 errors). The base gate reproduced the ledger exactly:
+`rt_a=8.8725682021%`, `rd_a=2.2487142218%`. The comparison is therefore valid,
+but the cache is a rebuilt sample, not a preserved byte stream.
+
+**Training.** 139 epochs in the 90-minute budget; selected epoch 100
+(full-draft), selected val `6.735466`; best val any `6.733203 @ 8`; best
+teacher val `6.304696`; `cb_top1_teacher_mean=2.600186%`,
+`cb_top1_draft_mean=1.214072%`, `cb_top1_text_mean=1.208579%`. W&B `4e0k60z2`.
+
+**4-shard gate:**
+
+| Metric | Value |
+|---|---:|
+| `cb0_s` | 3.583408% |
+| `cb0_a` | 7.938283% |
+| `rt_s` | 3.095651% |
+| `rt_a` | **8.393197% — PASS** |
+| `rd_s` | 0.315155% |
+| `rd_a` | **2.436689% — FAIL** |
+| W&B | `16aklys4` |
+
+**Corrected decomposition:** `p=8.139535%`, `c=13.357143%`, `w=1.462025%`,
+frame-weighted `rd_a=2.430233%`, official `rd_a_gate_style=2.436689%`,
+`w_text_model=1.405063%`, `rd_a_if_text_only=2.377907%`, required
+`p=29.74%`, required `w=4.26%`.
+
+**20-shard robustness:** `rt_a=6.513365%` (pass), `rd_a=1.557440%` (**FAIL**).
+
+**Interpretation.** The intervention moved `c` by +0.857 points but `w` by only
++0.095 points. The text-only fallback (`w=1.4051%`) is almost the entire
+wrong-CB0 performance; confidence and CB0-token fusion add about 0.057 points.
+The frame features are not giving the residual enough text signal to recover a
+wrong CB0. The +0.188-point `rd_a` gain is far below 5%, and the 20-shard recheck
+is worse. The text/confidence-conditioning hypothesis is rejected.
+
 ## Local FLEURS calibration (80 shards, 0.230 h, 80 Tamil utterances)
 
 CPU-only, random tiny draft/residual; only the n-gram baselines are meaningful.
@@ -808,10 +969,10 @@ CPU-only, random tiny draft/residual; only the n-gram baselines are meaningful.
 | CB0 AR n-gram | **8.94%** | 100% |
 
 **Interpretation:** on real Tamil speech, a text-only character n-gram explains about
-1% exact per-codebook identity, while the target `w` is 4.52%. A neural
-text-conditioned residual must therefore exceed this empirical floor by ~4.4×; the
+1% exact per-codebook identity, while the target `w` is ~4.3%. A neural
+text-conditioned residual must therefore exceed this empirical floor by ~4.2×; the
 n-gram result is a floor, not a ceiling. The CB0 AR n-gram floor (8.94%) is consistent
-with the measured NAR draft `p = 7.94%`, so a causal model can already match/beat the
+with the measured NAR draft `p = 8.14%`, so a causal model can already match/beat the
 n-gram estimate. FLEURS is not Rasa and this is not a gate result.
 
 ## Artifacts
@@ -826,12 +987,15 @@ n-gram estimate. FLEURS is not Rasa and this is not a gate result.
 - Local suite: **179 passed, 3 warnings** (added text/confidence, chunking, and trainer
   plumbing tests).
 
-## Truth still unchanged
+## Truth after v7
 
-No v7 number exists yet. The prior four gate results remain the evidence:
-v3 `1.834%`, pilot `1.7593%`, 6 h `2.2487%`, LR floor `2.2340%` — all **FAIL**.
-A v7 failure would be the fifth failure, not a reason to re-scope. A v7 pass would
-still require the 60-utterance evaluation before any B/C quality claim.
+Five gate results fail: v3 `1.834%`, pilot `1.7593%`, 6 h `2.2487%`, LR floor
+`2.2340%`, v7 `2.4367%` — all **FAIL**. v7 is the fifth failure, not a reason
+to re-scope. The gate remains `rt_a >= 5%` **and** `rd_a >= 5%`.
+
+No 60-utterance evaluation was run, and no B/C quality claim is valid. A gate
+change or a new acceptance metric requires explicit user sign-off and must be
+reported as a scope change, not a pass.
 
 ---
 

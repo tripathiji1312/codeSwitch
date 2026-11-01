@@ -134,10 +134,10 @@ real-speech → DAC shard pipeline, optional CTC per-character durations, a
 duration-predicted v6 draft, and `CodeSwitch_DataScale_Kaggle.ipynb`. The 6 h
 Rasa slice (4,015 shards; 0.9725 duration coverage) and the full v6
 draft/residual have run; the unchanged gate passes `rt_a=8.8726%` but fails
-`rd_a=2.2487%` (LR-floor rerun `2.2340%`). The v7 text/confidence residual and
-`CodeSwitch_TextResidual_Kaggle.ipynb` are code-complete; the v7 Kaggle run and
-the 60-utterance evaluation remain unverified. See
-[`014-real-data-duration.md`](014-real-data-duration.md).
+`rd_a=2.2487%` (LR-floor rerun `2.2340%`). The v7 text/confidence residual ran
+on the rebuilt 6 h cache: `rt_a=8.3932%`, `rd_a=2.4367%`, also **FAIL**; the
+20-shard recheck is `rd_a=1.5574%`. The 60-utterance evaluation has not run and
+remains blocked. See [`014-real-data-duration.md`](014-real-data-duration.md).
 
 **2026-10-20 residual-only amendment (post-v2 listening).** The matched v2
 hybrids isolate the residual as the primary bottleneck: `teacher_full` is clear,

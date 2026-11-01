@@ -1,13 +1,13 @@
 # Plan 014 — Real speech → DAC shards + CTC durations + duration-conditioned draft (v6)
 
-**Snapshot:** 2026-10-31
+**Snapshot:** 2026-11-01
 **Branch:** `fix/013-bc-noise`
 **Base commit:** `baae776`
 **Status:** **IN PROGRESS** — the 6 h real Rasa slice and full v6 run are
 complete, but the unchanged 5% gate fails on `rd_a` (`2.2487%`; LR-floor rerun
-`2.2340%`). The v7 text/confidence residual is implemented and tested; its
-Kaggle run and the 60-utterance evaluation have **not** been run. No B/C quality
-is claimed.
+`2.2340%`). The v7 text/confidence residual has now trained and failed the same
+gate (`rd_a=2.4367%`; 20-shard `1.5574%`). The 60-utterance evaluation has
+**not** been run. No B/C quality is claimed.
 
 This plan is the implementation companion to the 2026-10-24 data-scale
 decision: stop waiting for a large synthetic teacher cache, encode transcribed
@@ -531,11 +531,12 @@ LR so an optimization-limited run is distinguishable from a converged one.
 - [ ] 60-utterance evaluation and intelligibility check.
 - [ ] B/C quality claim (blocked until the gate passes).
 
-### 11.1 v7 text/confidence residual (code complete; Kaggle run pending)
+### 11.1 v7 text/confidence residual (trained; gate FAIL)
 
-The 6 h failure is dominated by the wrong-CB0 residual term `w`. At
-`p=7.9383%`, `c=10.6244%`, the gate needs `w≈4.52%`; the CB0-only residual
-reaches `1.5105%`. v7 adds opt-in text/confidence conditioning to the residual:
+The 6 h failure is dominated by the wrong-CB0 residual term `w`. At the corrected
+base `p=8.1395%`, `c=12.5000%`, `w=1.3671%`, the gate needs `w≈4.34%`; the
+CB0-only residual reaches `1.3671%`. v7 adds opt-in text/confidence conditioning
+to the residual:
 
 - `DraftOutput.frame_features` exposes the draft frame decoder's text features.
 - `ResidualDecoder` projects those features, embeds draft CB0 confidence, and
@@ -550,7 +551,7 @@ reaches `1.5105%`. v7 adds opt-in text/confidence conditioning to the residual:
 
 Local FLEURS calibration (80 shards, 0.230 h) gives character text n-gram
 `w≈1.03%`, CB0 n-gram `1.21%`, CB0 AR `p≈8.94%`. These are empirical floors,
-not neural ceilings; the text floor is ~4.4× below the required `w`.
+not neural ceilings; the text floor is ~4.2× below the required `w`.
 
 The ceiling diagnostic now averages `p` over the same overlapping 86-frame
 windows as `c`/`w`; raw shard frames made the identity drift by 0.0375 points
@@ -561,15 +562,30 @@ gate-only decomposition (`--ngram-shards 0` still means all shards). Local
 4-shard smoke: `rd_a_gate_style=0.7397%` vs gate `0.740%`; frame-weighted
 `rd_a=0.7367%`.
 
+**v7 result (2026-11-01).** The 6 h cache was rebuilt in-session (4,015 shards,
+6.0001366 h, 4,024 rows, 0 errors); the base gate reproduced the ledger exactly
+(`rt_a=8.8725682021%`, `rd_a=2.2487142218%`). Training: 139 epochs in the
+90-minute budget, selected epoch 100, `cb_top1_draft_mean=1.214072%`,
+`cb_top1_text_mean=1.208579%`. Gate: `rt_a=8.393197%` (pass),
+`rd_a=2.436689%` (**FAIL**). Decomposition: `p=8.139535%`, `c=13.357143%`,
+`w=1.462025%`, `w_text_model=1.405063%`, required `p=29.74%`, required
+`w=4.26%`. The 20-shard recheck gives `rt_a=6.513365%`, `rd_a=1.557440%`
+(FAIL). W&B: diagnostics `728w3ok9`, train `4e0k60z2`, gate `16aklys4`.
+The text/confidence hypothesis is rejected: `w` moved only +0.095 points, and
+the text-only fallback is nearly all of the wrong-CB0 accuracy.
+
 Standalone notebook: `CodeSwitch_TextResidual_Kaggle.ipynb`. It reuses or pulls
 the preserved 6 h artifacts, reproduces the base gate/decomposition, trains only
 the residual into `codeswitch_ckpt_v7_textres`, runs the unchanged gate, and
 blocks the 60-utterance evaluation unless both halves pass. Local suite:
 **179 passed, 3 warnings**.
 
-- [x] v7 code, tests, diagnostics, and notebook committed (`e9c6234`).
-- [ ] v7 residual trained on the 6 h cache and unchanged gate run.
-- [ ] v7 gate result recorded with exact `p/c/w` and W&B run IDs.
+- [x] v7 code, tests, diagnostics, and notebook committed (`2b8eec4`;
+      initial `e9c6234`).
+- [x] v7 residual trained on the 6 h cache and unchanged gate run
+      (W&B `4e0k60z2`; gate **FAIL** `rd_a=2.4367%`).
+- [x] v7 gate result recorded with exact `p/c/w` and W&B run IDs
+      (W&B `16aklys4`; 20-shard `rd_a=1.5574%`).
 
-Do not mark this plan `DONE` until the five unchecked run items above have
+Do not mark this plan `DONE` until the remaining unchecked run items above have
 real evidence. Code completion is not quality.
