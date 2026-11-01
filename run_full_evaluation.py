@@ -948,7 +948,7 @@ class EvalSynthesizer:
         #    path so per-utterance B/C rows are reproducible across runs.
         set_seed(seed)
         with torch.inference_mode():
-            draft_out = self.draft.generate_chunk(
+            draft_out = self.draft.generate_sequence(
                 text=normalized,
                 num_frames=n_frames,
                 temperature=1.0,
@@ -959,6 +959,11 @@ class EvalSynthesizer:
         draft_ms = (_now() - t0) * 1000.0
         draft_tokens = draft_out.tokens[0].detach().cpu().numpy().astype(np.int64)
         draft_probs_all = draft_out.probabilities[0].detach().float().cpu().numpy()
+        draft_features_all = None
+        if getattr(draft_out, "frame_features", None) is not None:
+            draft_features_all = (
+                draft_out.frame_features[0].detach().float().cpu().numpy()
+            )
 
         waves: List[np.ndarray] = []
         accept_true_parts: List[np.ndarray] = []
@@ -1027,11 +1032,26 @@ class EvalSynthesizer:
             # residual + DAC (chunk-wise; matches residual training windows)
             t_r = _now()
             cuda_sync(self.device)
+            residual_kwargs = {}
+            if getattr(self.residual.config, "text_conditioning", False):
+                if draft_features_all is None:
+                    raise RuntimeError(
+                        "text-conditioned residual requires draft frame features; "
+                        "the loaded draft checkpoint has no frame decoder."
+                    )
+                residual_kwargs["text_features"] = torch.from_numpy(
+                    draft_features_all[chunk_start:chunk_end]
+                ).unsqueeze(0).to(self.device)
+            if getattr(self.residual.config, "confidence_conditioning", False):
+                residual_kwargs["cb0_confidence"] = torch.from_numpy(
+                    np.max(chunk_probs, axis=-1).astype(np.float32)
+                ).unsqueeze(0).to(self.device)
             with torch.inference_mode():
                 res_out = self.residual(
                     cb0_tokens=torch.from_numpy(kept).unsqueeze(0).to(self.device),
                     temperature=1.0,
                     sample=draw_sample,
+                    **residual_kwargs,
                 )
             cuda_sync(self.device)
             residual_ms = (_now() - t_r) * 1000.0
@@ -1145,7 +1165,7 @@ class EvalSynthesizer:
             return None
         set_seed(seed)
         with torch.inference_mode():
-            draft_out = self.draft.generate_chunk(
+            draft_out = self.draft.generate_sequence(
                 text=normalized,
                 num_frames=n_frames,
                 temperature=1.0,

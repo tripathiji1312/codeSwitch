@@ -90,6 +90,30 @@ class ResidualDecoder(nn.Module):
             for _ in range(self.config.num_residual_codebooks)
         ])
 
+        # Optional text/confidence conditioning.  ``None`` on legacy
+        # checkpoints, so v2-v6 CB0-only state dicts still load unchanged.
+        self.text_proj: Optional[nn.Module] = None
+        self.confidence_embedding: Optional[nn.Embedding] = None
+        self.fusion_gate: Optional[nn.Module] = None
+        self.cb0_null_embedding: Optional[nn.Parameter] = None
+        if bool(getattr(self.config, "text_conditioning", False)):
+            self.text_proj = nn.Sequential(
+                nn.Linear(int(self.config.text_d_model), self.config.d_model),
+                nn.GELU(),
+                nn.Linear(self.config.d_model, self.config.d_model),
+            )
+            self.cb0_null_embedding = nn.Parameter(torch.zeros(self.config.d_model))
+        if bool(getattr(self.config, "confidence_conditioning", False)):
+            self.confidence_embedding = nn.Embedding(
+                int(self.config.confidence_bins), self.config.d_model
+            )
+        if self.text_proj is not None and self.confidence_embedding is not None:
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(3 * self.config.d_model, self.config.d_model),
+                nn.GELU(),
+                nn.Linear(self.config.d_model, 1),
+            )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -98,12 +122,23 @@ class ResidualDecoder(nn.Module):
             nn.init.normal_(head.weight, mean=0.0, std=0.02)
             if head.bias is not None:
                 nn.init.zeros_(head.bias)
+        if self.cb0_null_embedding is not None:
+            nn.init.zeros_(self.cb0_null_embedding)
+        if self.confidence_embedding is not None:
+            nn.init.normal_(self.confidence_embedding.weight, mean=0.0, std=0.02)
+
+    def _confidence_bins(self, confidence: torch.Tensor) -> torch.Tensor:
+        bins = max(1, int(self.config.confidence_bins))
+        scaled = confidence.clamp(0.0, 1.0) * float(bins - 1)
+        return scaled.round().long().clamp(0, bins - 1)
 
     def forward(
         self,
         cb0_tokens: torch.Tensor,
         temperature: float = 1.0,
         sample: bool = False,
+        text_features: Optional[torch.Tensor] = None,
+        cb0_confidence: Optional[torch.Tensor] = None,
     ) -> ResidualOutput:
         """Forward pass predicting Codebooks 1 through 8 from verified Codebook 0.
         
@@ -111,6 +146,12 @@ class ResidualDecoder(nn.Module):
             cb0_tokens: (batch, num_frames) verified Codebook 0 tokens
             temperature: Sampling temperature
             sample: Whether to sample from categorical distribution or take argmax
+            text_features: optional (batch, num_frames, text_d_model) frame-level
+                text features.  Required when the config enables text
+                conditioning; omitted for legacy CB0-only models.
+            cb0_confidence: optional (batch, num_frames) in [0, 1].  The draft's
+                argmax probability (or 1.0 for teacher CB0).  Used by the
+                confidence-conditioned fusion gate.
             
         Returns:
             ResidualOutput containing residual_codebooks (B, 8, T) and full_codebooks (B, 9, T)
@@ -123,8 +164,53 @@ class ResidualDecoder(nn.Module):
 
         batch_size, time_steps = cb0_tokens.shape
 
-        # 1. Embed Codebook 0 and add positional encodings
-        x = self.cb0_embedding(cb0_tokens)  # (batch, time, d_model)
+        # 1. Embed Codebook 0 (and optionally text/confidence) and add positions
+        cb0_is_null = cb0_tokens < 0
+        safe_cb0 = cb0_tokens.clamp(min=0)
+        cb0_embed = self.cb0_embedding(safe_cb0)  # (batch, time, d_model)
+        if self.cb0_null_embedding is not None and bool(cb0_is_null.any()):
+            null = self.cb0_null_embedding.to(cb0_embed.dtype)
+            cb0_embed = torch.where(cb0_is_null.unsqueeze(-1), null, cb0_embed)
+
+        text_embed = None
+        if self.text_proj is not None and text_features is not None:
+            if text_features.dim() != 3 or text_features.shape[:2] != (batch_size, time_steps):
+                raise ValueError(
+                    "text_features must be (batch, time, text_d_model); got "
+                    f"{tuple(text_features.shape)} for cb0 {(batch_size, time_steps)}"
+                )
+            text_embed = self.text_proj(text_features.to(cb0_embed.dtype))
+        elif self.text_proj is not None:
+            # Explicit text ablation: run CB0-only without inventing features.
+            text_embed = torch.zeros_like(cb0_embed)
+
+        conf_embed = None
+        if self.confidence_embedding is not None:
+            if cb0_confidence is None:
+                cb0_confidence = torch.ones(
+                    (batch_size, time_steps), device=cb0_tokens.device, dtype=cb0_embed.dtype
+                )
+            else:
+                cb0_confidence = cb0_confidence.to(device=cb0_tokens.device, dtype=cb0_embed.dtype)
+                if cb0_confidence.shape != (batch_size, time_steps):
+                    raise ValueError(
+                        "cb0_confidence must match cb0_tokens; got "
+                        f"{tuple(cb0_confidence.shape)} vs {(batch_size, time_steps)}"
+                    )
+            conf_embed = self.confidence_embedding(self._confidence_bins(cb0_confidence))
+
+        if self.fusion_gate is not None and text_embed is not None and conf_embed is not None:
+            gate = torch.sigmoid(
+                self.fusion_gate(torch.cat([cb0_embed, text_embed, conf_embed], dim=-1))
+            )
+            x = gate * cb0_embed + (1.0 - gate) * text_embed + conf_embed
+        else:
+            x = cb0_embed
+            if text_embed is not None:
+                x = x + text_embed
+            if conf_embed is not None:
+                x = x + conf_embed
+
         x = self.pos_encoder(x)
 
         # 2. Run through Dilated Residual Backbone

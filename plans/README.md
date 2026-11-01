@@ -131,11 +131,12 @@ argmax evaluation, and quality gates are still pending.
 
 Plan 014 is the 2026-10-24 data-scale follow-up on the same branch. It adds a
 real-speech → DAC shard pipeline, optional CTC per-character durations, a
-duration-predicted v6 draft, and `CodeSwitch_DataScale_Kaggle.ipynb`. The code
-and tests are complete, and a public FLEURS Tamil smoke has produced real
-duration shards plus a duration-conditioned checkpoint. Rasa/IndicVoices-R are
-gated and were not downloaded; full v6 training, the unchanged 5% gate, and the
-60-utterance evaluation remain unverified. See
+duration-predicted v6 draft, and `CodeSwitch_DataScale_Kaggle.ipynb`. The 6 h
+Rasa slice (4,015 shards; 0.9725 duration coverage) and the full v6
+draft/residual have run; the unchanged gate passes `rt_a=8.8726%` but fails
+`rd_a=2.2487%` (LR-floor rerun `2.2340%`). The v7 text/confidence residual and
+`CodeSwitch_TextResidual_Kaggle.ipynb` are code-complete; the v7 Kaggle run and
+the 60-utterance evaluation remain unverified. See
 [`014-real-data-duration.md`](014-real-data-duration.md).
 
 **2026-10-20 residual-only amendment (post-v2 listening).** The matched v2

@@ -169,6 +169,139 @@ def test_residual_decoder_forward():
     assert torch.equal(res_out.full_codebooks[:, 0, :], cb0_tokens)
 
 
+def test_draft_generate_sequence_chunks_past_max_frames():
+    """30 s utterances exceed max_frames; chunking must keep them usable."""
+    model = _duration_model(duration_conditioning=True, max_frames=32)
+    short = model.generate_chunk(text="abc", num_frames=20, sample=False)
+    same = model.generate_sequence(text="abc", num_frames=20, sample=False)
+    assert torch.equal(short.tokens, same.tokens)
+
+    long = model.generate_sequence(text="abc", num_frames=70, sample=False)
+    assert long.tokens.shape == (1, 70)
+    assert long.probabilities.shape == (1, 70, 1024)
+    assert long.frame_features.shape == (1, 70, 16)
+
+
+def test_diagnose_residual_tokens_passes_text_and_confidence():
+    """The gate must feed the same conditioning the trainer used."""
+    import diagnose_audio_bug as D
+    from codeswitch_tts.config import ResidualModelConfig
+
+    model = ResidualDecoder(ResidualModelConfig(
+        d_model=32, num_layers=2, text_conditioning=True,
+        confidence_conditioning=True, text_d_model=16, confidence_bins=8,
+    )).eval()
+    cb0 = np.random.RandomState(0).randint(0, 1024, size=12).astype(np.int64)
+    feats = np.random.RandomState(1).randn(12, 16).astype(np.float32)
+    conf = np.random.RandomState(2).rand(12).astype(np.float32)
+    full, residual = D.residual_tokens(
+        model, cb0, False, torch.device("cpu"),
+        text_features=feats, confidence=conf,
+    )
+    assert full.shape == (9, 12)
+    assert residual.shape == (8, 12)
+    with pytest.raises(ValueError, match="text_features"):
+        D.residual_tokens(model, cb0, False, torch.device("cpu"))
+
+
+def test_gate_decomposition_uses_conditional_c_and_w(monkeypatch):
+    """rd_a = p*c + (1-p)*w must hold with c/w conditioned on draft-CB0 correctness."""
+    from types import SimpleNamespace
+
+    import diagnose_gate_ceiling as D
+    from codeswitch_tts.config import ResidualModelConfig
+
+    frames = 200  # deliberately not divisible by 86: the trailing window overlaps
+    rng = np.random.RandomState(0)
+    codes = np.stack(
+        [np.arange(frames) % 2]
+        + [rng.randint(0, 1024, size=frames) for _ in range(8)]
+    ).astype(np.int16)
+    shard = SimpleNamespace(
+        index=0, norm_text="test", frames=frames, codes=codes,
+    )
+
+    def fake_draft_pass(draft, text, n, device, sample, seed=42):
+        tokens = np.zeros(n, dtype=np.int64)
+        probs = np.full((n, 1024), 1.0 / 1024.0, dtype=np.float32)
+        probs[np.arange(n), 0] = 1.0
+        return tokens, probs, np.zeros((n, 32), dtype=np.float32)
+
+    monkeypatch.setattr(D, "_draft_pass", fake_draft_pass)
+    residual = ResidualDecoder(ResidualModelConfig(
+        d_model=32, num_layers=2, text_conditioning=True, text_d_model=32,
+        confidence_conditioning=True, confidence_bins=8,
+    )).eval()
+
+    gate = D.gate_decomposition(None, residual, [shard], torch.device("cpu"))
+    # 200 frames -> windows [0:86], [86:172], [114:200]; 258 window frames.
+    assert gate["p"] == pytest.approx(50.0)
+    assert gate["correct_frames"] == 129
+    assert gate["wrong_frames"] == 129
+    assert gate["rd_a_from_terms"] == pytest.approx(gate["rd_a_overall"], abs=1e-9)
+    assert gate["decomposition_error"] < 1e-9
+
+
+def test_residual_text_confidence_conditioning_and_null_cb0():
+    """The w-term lever: a residual that can fall back to text when CB0 is wrong.
+
+    Also exercises the learned null-CB0 embedding used by corruption/dropout
+    training, and the legacy ablation (no text features -> zero text branch)
+    without adding keys to the default checkpoint.
+    """
+    from codeswitch_tts.config import ResidualModelConfig
+
+    config = ResidualModelConfig(
+        d_model=32,
+        num_layers=2,
+        text_conditioning=True,
+        confidence_conditioning=True,
+        text_d_model=16,
+        confidence_bins=8,
+    )
+    model = ResidualDecoder(config).eval()
+    assert model.text_proj is not None
+    assert model.confidence_embedding is not None
+    assert model.fusion_gate is not None
+    assert model.cb0_null_embedding is not None
+
+    cb0 = torch.randint(0, 1024, (2, 12))
+    text = torch.randn(2, 12, 16)
+    conf = torch.rand(2, 12)
+    with torch.inference_mode():
+        out = model(cb0_tokens=cb0, text_features=text, cb0_confidence=conf)
+        assert out.residual_codebooks.shape == (2, 8, 12)
+        assert out.full_codebooks.shape == (2, 9, 12)
+
+        # Unknown-CB0 path (corruption/dropout) must not index embedding -1.
+        null = model(
+            cb0_tokens=torch.full((2, 12), -1, dtype=torch.long),
+            text_features=text,
+            cb0_confidence=torch.zeros(2, 12),
+        )
+        assert null.residual_codebooks.shape == (2, 8, 12)
+
+        # Explicit text ablation still runs (used to quantify the text branch).
+        ablated = model(cb0_tokens=cb0, text_features=None, cb0_confidence=None)
+        assert ablated.residual_codebooks.shape == (2, 8, 12)
+
+    with pytest.raises(ValueError, match="text_features must be"):
+        model(cb0_tokens=cb0, text_features=torch.randn(2, 11, 16))
+
+    # Legacy checkpoints must remain byte-compatible: no new keys by default.
+    legacy = ResidualDecoder(ResidualModelConfig(d_model=32, num_layers=2))
+    assert legacy.text_proj is None
+    assert legacy.confidence_embedding is None
+    assert legacy.fusion_gate is None
+    assert not any(
+        key.startswith(("text_proj.", "confidence_embedding.", "fusion_gate."))
+        for key in legacy.state_dict()
+    )
+    clone = ResidualDecoder(ResidualModelConfig(d_model=32, num_layers=2))
+    clone.load_state_dict(legacy.state_dict())
+
+
+
 def test_speculative_verification():
     engine = SpeculativeEngine()
     draft_tokens = torch.randint(0, 1024, (1, 16))

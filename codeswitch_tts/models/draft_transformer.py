@@ -31,6 +31,10 @@ class DraftOutput:
     tokens: torch.Tensor          # (batch, num_frames) - sampled or argmax draft tokens
     duration_logits: Optional[torch.Tensor] = None  # (batch, text_len) log1p(frames)
     frame_durations: Optional[torch.Tensor] = None  # (batch, text_len) int frame counts
+    # Frame-level text features from the final acoustic decoder.  Exposed so a
+    # text-conditioned residual can reuse the draft's text encoder without a
+    # second text tower.  Always present when frame_decoder_layers >= 1.
+    frame_features: Optional[torch.Tensor] = None  # (batch, num_frames, d_model)
 
 
 # ===========================================================================
@@ -595,6 +599,7 @@ class DraftTransformer(nn.Module):
             tokens=tokens,
             duration_logits=duration_logits,
             frame_durations=frame_durations,
+            frame_features=frame_features,
         )
 
     def generate_chunk(
@@ -624,4 +629,63 @@ class DraftTransformer(nn.Module):
             temperature=temperature,
             sample=sample,
             token_durations=token_durations,
+        )
+
+    def generate_sequence(
+        self,
+        text: Union[str, List[str]],
+        num_frames: int,
+        temperature: float = 1.0,
+        sample: bool = True,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> DraftOutput:
+        """Generate a sequence longer than ``config.max_frames``.
+
+        The frame decoder materializes one query per frame, so a single pass is
+        bounded by ``max_frames``.  Utterances up to 30 s at 86.13 Hz exceed the
+        default 2048-frame bound, and the residual gate evaluates whole
+        utterances.  Chunking keeps those shards usable instead of dropping
+        them; each chunk is a normal NAR pass over the same text and its own
+        frame count.  For sequences inside the bound this is byte-identical to
+        ``generate_chunk``.
+        """
+        if isinstance(text, str):
+            text = [text]
+        if len(text) != 1:
+            raise ValueError("generate_sequence currently supports one text string")
+        n = int(num_frames)
+        if n <= 0:
+            raise ValueError("num_frames must be positive")
+        max_chunk = int(getattr(self.config, "max_frames", n) or n)
+        if n <= max_chunk:
+            return self.generate_chunk(
+                text=text, num_frames=n, temperature=temperature,
+                sample=sample, device=device,
+            )
+
+        tokens: List[torch.Tensor] = []
+        probs: List[torch.Tensor] = []
+        logits: List[torch.Tensor] = []
+        features: List[torch.Tensor] = []
+        have_features = True
+        for start in range(0, n, max_chunk):
+            length = min(max_chunk, n - start)
+            out = self.generate_chunk(
+                text=text, num_frames=length, temperature=temperature,
+                sample=sample, device=device,
+            )
+            tokens.append(out.tokens)
+            probs.append(out.probabilities)
+            logits.append(out.logits)
+            if getattr(out, "frame_features", None) is None:
+                have_features = False
+            else:
+                features.append(out.frame_features)
+        return DraftOutput(
+            logits=torch.cat(logits, dim=1),
+            probabilities=torch.cat(probs, dim=1),
+            tokens=torch.cat(tokens, dim=1),
+            duration_logits=None,
+            frame_durations=None,
+            frame_features=(torch.cat(features, dim=1) if have_features and features else None),
         )

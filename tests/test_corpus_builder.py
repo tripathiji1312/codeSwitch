@@ -774,6 +774,129 @@ def test_draft_frame_decoder_layers_flag_is_wired():
     assert "config.draft.frame_decoder_layers = int(args.draft_frame_decoder_layers)" in source
 
 
+def test_residual_text_conditioning_flags_and_trainer_plumbing():
+    """Text/confidence conditioning must be opt-in, wired, and actually consumed."""
+    import inspect
+
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import DraftModelConfig, ResidualModelConfig
+
+    args = T.build_arg_parser().parse_args([
+        "--residual-text-conditioning",
+        "--residual-confidence-conditioning",
+        "--residual-cb0-dropout", "0.25",
+        "--residual-cb0-corruption", "0.10",
+    ])
+    assert args.residual_text_conditioning is True
+    assert args.residual_confidence_conditioning is True
+    assert args.residual_cb0_dropout == pytest.approx(0.25)
+    assert args.residual_cb0_corruption == pytest.approx(0.10)
+
+    source = inspect.getsource(T.main)
+    assert "config.residual.text_conditioning = True" in source
+    assert "config.residual.confidence_conditioning = True" in source
+    assert "config.residual.text_d_model = int(" in source
+    assert "cb0_dropout=args.residual_cb0_dropout" in source
+    assert "cb0_corruption=args.residual_cb0_corruption" in source
+
+    # Confidence conditioning without text conditioning is rejected outright.
+    bad = T.build_arg_parser().parse_args(["--residual-confidence-conditioning"])
+    assert bad.residual_text_conditioning is False
+    # The parser accepts it; main() must refuse the combination.  The check is
+    # in main so a CLI typo cannot silently train a half-conditioned model.
+    assert "--residual-confidence-conditioning requires" in source
+
+    draft = T.DraftTransformer(DraftModelConfig(
+        d_model=32, n_heads=4, num_layers=1, d_ff=64,
+        max_text_len=64, max_frames=256, frame_decoder_layers=1,
+    ))
+    residual = T.ResidualDecoder(ResidualModelConfig(
+        d_model=32, num_layers=2, text_conditioning=True,
+        confidence_conditioning=True, text_d_model=32, confidence_bins=8,
+    ))
+    shards = _fake_teacher_shards(n=4, frames=100)
+    trainer = T.ResidualTrainer(
+        residual, torch.device("cpu"), batch_size=2, seed=7,
+        draft_model=draft, sched_target=1.0, cb0_dropout=0.25,
+    )
+    draft_cb0 = trainer.precompute_draft_cb0(shards)
+    assert set(draft_cb0) == {s.index for s in shards}
+    assert trainer._draft_features[0].shape == (100, 32)
+    assert trainer._draft_confidence[0].shape == (100,)
+
+    windows = trainer.build_windows(
+        shards, draft_cb0, trainer._draft_confidence, trainer._draft_features
+    )
+    assert windows and len(windows[0]) == 5
+    cb0, tgt, feats, conf = next(
+        trainer._batches(windows, shuffle=False, sched_p=1.0, corrupt=True)
+    )
+    assert cb0.shape == tgt.shape[:1] + (tgt.shape[2],)
+    assert feats.shape == (2, 86, 32)
+    assert conf.shape == (2, 86)
+    # With 172 frames at p=0.25, at least one null token is effectively certain.
+    assert (cb0 == -1).any()
+    assert torch.all(conf[cb0 == -1] == 0.0)
+
+    optimizer = torch.optim.AdamW(residual.parameters(), lr=1e-3)
+    loss, _ = trainer._epoch(windows, optimizer, None, train=True, sched_p=1.0)
+    assert np.isfinite(loss)
+    total, per_cb = trainer.evaluate_text_only(windows)
+    assert total > 0
+    assert len(per_cb) == 8
+
+
+
+def test_residual_precompute_chunks_long_shards():
+    """30 s utterances exceed the draft's max_frames; features must still exist."""
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import DraftModelConfig, ResidualModelConfig
+
+    draft = T.DraftTransformer(DraftModelConfig(
+        d_model=32, n_heads=4, num_layers=1, d_ff=64,
+        max_text_len=64, max_frames=64, frame_decoder_layers=1,
+    ))
+    residual = T.ResidualDecoder(ResidualModelConfig(
+        d_model=32, num_layers=2, text_conditioning=True, text_d_model=32,
+    ))
+    shards = _fake_teacher_shards(n=1, frames=150)
+    trainer = T.ResidualTrainer(
+        residual, torch.device("cpu"), batch_size=1,
+        draft_model=draft, sched_target=1.0,
+    )
+    draft_cb0 = trainer.precompute_draft_cb0(shards)
+    assert draft_cb0[0].shape == (150,)
+    assert trainer._draft_features[0].shape == (150, 32)
+    assert trainer._draft_confidence[0].shape == (150,)
+    windows = trainer.build_windows(
+        shards, draft_cb0, trainer._draft_confidence, trainer._draft_features
+    )
+    assert all(w[4].shape == (86, 32) for w in windows)
+
+
+def test_text_residual_skips_shards_without_frame_features():
+    """One failed draft pass must not crash text-conditioned training later."""
+    import numpy as np
+    import torch
+    import train_draft_distill as T
+    from codeswitch_tts import ResidualModelConfig
+
+    residual = T.ResidualDecoder(ResidualModelConfig(
+        d_model=32, num_layers=2, text_conditioning=True, text_d_model=32,
+    ))
+    shards = _fake_teacher_shards(n=2, frames=120)
+    trainer = T.ResidualTrainer(
+        residual, torch.device("cpu"), batch_size=1, sched_target=0.0,
+    )
+    feats = {0: np.zeros((120, 32), dtype=np.float16)}
+    windows = trainer.build_windows(shards, {}, {}, feats)
+    # Only shard 0 is usable; its 120 frames tile into two 86-frame windows.
+    assert len(windows) == 2
+    assert all(w[4].shape == (86, 32) for w in windows)
+
+
 def test_draft_trainer_consumes_ctc_durations_and_reports_duration_loss():
     import torch
     import train_draft_distill as T

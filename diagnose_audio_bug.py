@@ -69,20 +69,39 @@ def load_shards(cache: Path, n: int) -> List[TeacherShard]:
 
 
 def draft_tokens(draft, text: str, n: int, sample: bool, device, seed: int = 42):
+    return draft_inputs(draft, text, n, sample, device, seed)[0]
+
+
+def draft_inputs(draft, text: str, n: int, sample: bool, device, seed: int = 42):
+    """Return ``(tokens, probabilities, frame_features)`` for one draft pass."""
     torch.manual_seed(seed)
-    ids, mask = draft.tokenizer.batch_encode([text])
     with torch.inference_mode():
-        out = draft.forward(ids.to(device), mask.to(device), num_frames=n,
-                            temperature=1.0, sample=sample)
-    tok = out.tokens[0].cpu().numpy().astype(np.int64)
-    return tok[:n]
+        out = draft.generate_sequence(text=text, num_frames=n, temperature=1.0,
+                                      sample=sample, device=device)
+    tok = out.tokens[0].cpu().numpy().astype(np.int64)[:n]
+    probs = out.probabilities[0].float().cpu().numpy()[:n]
+    features = getattr(out, "frame_features", None)
+    feats = features[0].float().cpu().numpy()[:n] if features is not None else None
+    return tok, probs, feats
 
 
-def residual_tokens(residual, cb0: np.ndarray, sample: bool, device, seed: int = 42):
+def residual_tokens(residual, cb0: np.ndarray, sample: bool, device, seed: int = 42,
+                    text_features=None, confidence=None):
+    kwargs = {}
+    if getattr(residual.config, "text_conditioning", False):
+        if text_features is None:
+            raise ValueError("text-conditioned residual requires text_features")
+        kwargs["text_features"] = torch.from_numpy(text_features).unsqueeze(0).to(device)
+    if getattr(residual.config, "confidence_conditioning", False):
+        if confidence is None:
+            confidence = np.ones_like(cb0, dtype=np.float32)
+        kwargs["cb0_confidence"] = torch.from_numpy(
+            np.asarray(confidence, dtype=np.float32)
+        ).unsqueeze(0).to(device)
     torch.manual_seed(seed)
     with torch.inference_mode():
         out = residual(cb0_tokens=torch.from_numpy(cb0).unsqueeze(0).to(device),
-                       temperature=1.0, sample=sample)
+                       temperature=1.0, sample=sample, **kwargs)
     return (out.full_codebooks[0].cpu().numpy().astype(np.int64),
             out.residual_codebooks[0].cpu().numpy().astype(np.int64))
 
@@ -215,15 +234,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             codes = codes.T
         T = int(min(shard.frames, codes.shape[1]))
         codes = np.clip(codes[:, :T], 0, 1023)
-        ds, da = draft_tokens(draft, shard.norm_text, T, True, device), \
-                 draft_tokens(draft, shard.norm_text, T, False, device)
+        ds, dsp, dsf = draft_inputs(draft, shard.norm_text, T, True, device)
+        da, dap, daf = draft_inputs(draft, shard.norm_text, T, False, device)
+        feat = daf if daf is not None else dsf
+        conf_s = (
+            dsp[np.arange(T), ds].astype(np.float32) if dsp is not None else None
+        )
+        conf_a = dap.max(axis=-1).astype(np.float32) if dap is not None else None
         win = []
         for s, e in windows(T, args.frames):
             tcb0, tres = codes[0, s:e], codes[1:9, s:e]
-            _, rts = residual_tokens(residual, tcb0, True, device)
-            _, rta = residual_tokens(residual, tcb0, False, device)
-            _, rds = residual_tokens(residual, ds[s:e], True, device)
-            _, rda = residual_tokens(residual, da[s:e], False, device)
+            fslice = feat[s:e] if feat is not None else None
+            _, rts = residual_tokens(residual, tcb0, True, device, text_features=fslice)
+            _, rta = residual_tokens(residual, tcb0, False, device, text_features=fslice)
+            _, rds = residual_tokens(
+                residual, ds[s:e], True, device, text_features=fslice,
+                confidence=(conf_s[s:e] if conf_s is not None else None),
+            )
+            _, rda = residual_tokens(
+                residual, da[s:e], False, device, text_features=fslice,
+                confidence=(conf_a[s:e] if conf_a is not None else None),
+            )
             win.append({"cb0_s": top1(ds[s:e], tcb0), "cb0_a": top1(da[s:e], tcb0),
                         "rt_s": mean(per_cb(rts, tres)), "rt_a": mean(per_cb(rta, tres)),
                         "rd_s": mean(per_cb(rds, tres)), "rd_a": mean(per_cb(rda, tres))})
@@ -247,12 +278,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         A = min(args.audio_frames, T)
         dsA, daA = ds[:A], da[:A]
-        fts, _ = residual_tokens(residual, codes[0, :A], True, device)
-        fta, _ = residual_tokens(residual, codes[0, :A], False, device)
-        fds, _ = residual_tokens(residual, dsA, True, device)
-        fda, _ = residual_tokens(residual, daA, False, device)
-        fda_s, _ = residual_tokens(residual, daA, True, device)
-        fds_a, _ = residual_tokens(residual, dsA, False, device)
+        fA = feat[:A] if feat is not None else None
+        fts, _ = residual_tokens(residual, codes[0, :A], True, device, text_features=fA)
+        fta, _ = residual_tokens(residual, codes[0, :A], False, device, text_features=fA)
+        fds, _ = residual_tokens(
+            residual, dsA, True, device, text_features=fA,
+            confidence=(conf_s[:A] if conf_s is not None else None),
+        )
+        fda, _ = residual_tokens(
+            residual, daA, False, device, text_features=fA,
+            confidence=(conf_a[:A] if conf_a is not None else None),
+        )
+        fda_s, _ = residual_tokens(
+            residual, daA, True, device, text_features=fA,
+            confidence=(conf_a[:A] if conf_a is not None else None),
+        )
+        fds_a, _ = residual_tokens(
+            residual, dsA, False, device, text_features=fA,
+            confidence=(conf_s[:A] if conf_s is not None else None),
+        )
         # Decode-path isolation: keep the teacher CB1-8 fixed while swapping
         # only the draft CB0, and keep each CB0 fixed while swapping only the
         # residual mode.  This separates draft mode-collapse from residual

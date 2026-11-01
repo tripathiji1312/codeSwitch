@@ -1,13 +1,13 @@
 # Plan 014 — Real speech → DAC shards + CTC durations + duration-conditioned draft (v6)
 
-**Snapshot:** 2026-10-25
+**Snapshot:** 2026-10-31
 **Branch:** `fix/013-bc-noise`
 **Base commit:** `baae776`
-**Status:** **IN PROGRESS** — a 200-row Rasa Tamil pilot ran end-to-end and
-failed the unchanged 5% gate. That pilot is only **0.2928 h** of audio, so it
-is a data-scale/plumbing result, not a full real-corpus result. The 6 h real
-slice, full-scale retrain, passing gate, and 60-utterance evaluation have
-**not** been run. No B/C quality is claimed.
+**Status:** **IN PROGRESS** — the 6 h real Rasa slice and full v6 run are
+complete, but the unchanged 5% gate fails on `rd_a` (`2.2487%`; LR-floor rerun
+`2.2340%`). The v7 text/confidence residual is implemented and tested; its
+Kaggle run and the 60-utterance evaluation have **not** been run. No B/C quality
+is claimed.
 
 This plan is the implementation companion to the 2026-10-24 data-scale
 decision: stop waiting for a large synthetic teacher cache, encode transcribed
@@ -278,7 +278,7 @@ The Kaggle notebook wraps this and marks FAIL otherwise.
 
 ```text
 $ .venv/bin/python -m pytest tests -q -p no:cacheprovider
-172 passed, 3 warnings in 10.65s
+179 passed, 3 warnings
 ```
 
 New coverage:
@@ -521,13 +521,51 @@ LR so an optimization-limited run is distinguishable from a converged one.
       11 code cells compile).
 - [x] Rasa Tamil 200-row pilot prepared (0.2928 h; 200/200 durations;
       0.9728 coverage); this is not the full 6 h slice.
-- [ ] Full 6 h Rasa/IndicVoices-R real corpus prepared.
-- [ ] Full-scale v6 draft/residual trained on the real corpus with the
-      150-epoch floor.
+- [x] Full 6 h Rasa real corpus prepared (4,015 shards; 6.0001 h;
+      0.9725 mean duration coverage; W&B `ck8i90t6`).
+- [x] Full-scale v6 draft/residual trained on the real corpus with the
+      150-epoch floor (draft `val_top1=5.8416%`; gate `rt_a=8.8726%`,
+      `rd_a=2.2487%`, **FAIL**; LR-floor rerun `rd_a=2.2340%`, **FAIL**).
 - [ ] Unchanged 5% `rt_a`/`rd_a` gate passes (200-row pilot: `2.6133%` /
-      `1.7593%`, **FAIL**; gate not lowered).
+      `1.7593%`, **FAIL**; 6 h: `8.8726%` / `2.2487%`, **FAIL**; gate not lowered).
 - [ ] 60-utterance evaluation and intelligibility check.
 - [ ] B/C quality claim (blocked until the gate passes).
+
+### 11.1 v7 text/confidence residual (code complete; Kaggle run pending)
+
+The 6 h failure is dominated by the wrong-CB0 residual term `w`. At
+`p=7.9383%`, `c=10.6244%`, the gate needs `w≈4.52%`; the CB0-only residual
+reaches `1.5105%`. v7 adds opt-in text/confidence conditioning to the residual:
+
+- `DraftOutput.frame_features` exposes the draft frame decoder's text features.
+- `ResidualDecoder` projects those features, embeds draft CB0 confidence, and
+  fuses `(CB0, text, confidence)` with a learned gate plus a null-CB0 embedding.
+- `ResidualTrainer` precomputes draft CB0/confidence/features and keeps the
+  existing scheduled-sampling ramp and full-draft checkpoint selection.
+- `DraftTransformer.generate_sequence` chunks sequences longer than
+  `max_frames`, so 30 s shards remain evaluable.
+- New flags: `--residual-text-conditioning`,
+  `--residual-confidence-conditioning`, `--residual-cb0-dropout`,
+  `--residual-cb0-corruption`. Legacy checkpoints load unchanged.
+
+Local FLEURS calibration (80 shards, 0.230 h) gives character text n-gram
+`w≈1.03%`, CB0 n-gram `1.21%`, CB0 AR `p≈8.94%`. These are empirical floors,
+not neural ceilings; the text floor is ~4.4× below the required `w`.
+
+The ceiling diagnostic now averages `p` over the same overlapping 86-frame
+windows as `c`/`w`; raw shard frames made the identity drift by 0.0375 points
+on the 80-shard check. `--skip-ngram` was added for gate-only decomposition
+(`--ngram-shards 0` still means all shards).
+
+Standalone notebook: `CodeSwitch_TextResidual_Kaggle.ipynb`. It reuses or pulls
+the preserved 6 h artifacts, reproduces the base gate/decomposition, trains only
+the residual into `codeswitch_ckpt_v7_textres`, runs the unchanged gate, and
+blocks the 60-utterance evaluation unless both halves pass. Local suite:
+**179 passed, 3 warnings**.
+
+- [x] v7 code, tests, diagnostics, and notebook committed (`e9c6234`).
+- [ ] v7 residual trained on the 6 h cache and unchanged gate run.
+- [ ] v7 gate result recorded with exact `p/c/w` and W&B run IDs.
 
 Do not mark this plan `DONE` until the five unchecked run items above have
 real evidence. Code completion is not quality.

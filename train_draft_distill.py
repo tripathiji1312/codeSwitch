@@ -82,6 +82,8 @@ try:  # torch is imported through codeswitch_tts already, but keep it explicit
 except Exception as exc:  # pragma: no cover
     raise SystemExit(f"PyTorch import failed: {exc}")
 
+CB0_SIZE = 1024
+
 
 # ===========================================================================
 # Small utilities
@@ -1017,6 +1019,8 @@ class ResidualTrainer:
         seed: int = 42,
         draft_model: Optional[torch.nn.Module] = None,
         sched_target: float = 0.0,
+        cb0_dropout: float = 0.0,
+        cb0_corruption: float = 0.0,
     ):
         self.model = residual_model
         self.device = device
@@ -1028,38 +1032,92 @@ class ResidualTrainer:
         # fraction of windows closes that exposure bias (target 0 disables it).
         self.draft = draft_model
         self.sched_target = float(max(0.0, min(1.0, sched_target)))
+        # Text/confidence conditioning is opt-in and is read from the model
+        # config so a checkpoint cannot disagree with its trainer.
+        self.text_conditioning = bool(
+            getattr(getattr(residual_model, "config", None), "text_conditioning", False)
+        )
+        self.confidence_conditioning = bool(
+            getattr(getattr(residual_model, "config", None), "confidence_conditioning", False)
+        )
+        # Regularization against the deployment mismatch: the residual sees
+        # teacher CB0 in training but draft CB0 (with errors) at inference.
+        # ``cb0_dropout`` replaces random frames with the learned null token;
+        # ``cb0_corruption`` replaces them with random tokens.  Both set the
+        # confidence to zero, so the fusion gate learns the text fallback.
+        self.cb0_dropout = float(max(0.0, min(1.0, cb0_dropout)))
+        self.cb0_corruption = float(max(0.0, min(1.0, cb0_corruption)))
+        self._draft_confidence: Dict[int, np.ndarray] = {}
+        self._draft_features: Dict[int, np.ndarray] = {}
 
     def precompute_draft_cb0(self, shards: List[TeacherShard]) -> Dict[int, np.ndarray]:
         """One NAR draft pass per shard: the CB0 the residual will actually see.
 
         Cheap relative to the teacher pass (a single forward per sentence) and
-        only computed when scheduled sampling is enabled.
+        only computed when scheduled sampling is enabled.  When the residual is
+        text/confidence-conditioned this also caches the draft's frame features
+        and per-frame argmax confidence.
         """
         out: Dict[int, np.ndarray] = {}
-        if self.draft is None or self.sched_target <= 0.0:
+        self._draft_confidence = {}
+        self._draft_features = {}
+        if self.draft is None:
+            if self.text_conditioning:
+                raise RuntimeError(
+                    "text-conditioned residual requires a draft model for frame "
+                    "features, but no draft was supplied"
+                )
+            return out
+        # Text features are needed even when scheduled sampling is disabled,
+        # because the residual still reads the draft's text representation.
+        if self.sched_target <= 0.0 and not self.text_conditioning:
             return out
         self.draft.eval()
         for shard in shards:
             try:
                 with torch.inference_mode():
-                    draft_out = self.draft.generate_chunk(
+                    draft_out = self.draft.generate_sequence(
                         text=shard.norm_text, num_frames=int(shard.frames),
                         temperature=1.0, sample=False, device=self.device,
                     )
                 tokens = draft_out.tokens[0].detach().cpu().numpy().astype(np.int64)
                 if tokens.shape[0] >= int(shard.frames):
-                    out[int(shard.index)] = tokens[: int(shard.frames)]
+                    n = int(shard.frames)
+                    out[int(shard.index)] = tokens[:n]
+                    probs = draft_out.probabilities[0].detach().float().cpu().numpy()
+                    self._draft_confidence[int(shard.index)] = (
+                        probs[:n].max(axis=-1).astype(np.float16)
+                    )
+                    features = getattr(draft_out, "frame_features", None)
+                    if features is not None:
+                        self._draft_features[int(shard.index)] = (
+                            features[0].detach().float().cpu().numpy()[:n].astype(np.float16)
+                        )
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"[Residual] draft pass failed for shard {shard.index}: "
                       f"{type(exc).__name__}: {exc}")
+        if self.text_conditioning and not self._draft_features:
+            raise RuntimeError(
+                "text-conditioned residual requested, but the draft checkpoint "
+                "exposes no frame_features; retrain the draft with "
+                "--draft-frame-decoder-layers >= 1 or disable text conditioning."
+            )
         return out
 
-    def build_windows(self, shards: List[TeacherShard],
-                      draft_cb0: Optional[Dict[int, np.ndarray]] = None):
+    def build_windows(
+        self,
+        shards: List[TeacherShard],
+        draft_cb0: Optional[Dict[int, np.ndarray]] = None,
+        draft_confidence: Optional[Dict[int, np.ndarray]] = None,
+        draft_features: Optional[Dict[int, np.ndarray]] = None,
+    ):
         windows = []
         total_frames = 0
         windowed_frames = 0
         short_shards = 0
+        missing_features = 0
+        draft_confidence = draft_confidence or {}
+        draft_features = draft_features or {}
         for s in shards:
             t = int(s.frames)
             total_frames += t
@@ -1067,8 +1125,15 @@ class ResidualTrainer:
                 # Cannot form even one full window; excluded from residual training.
                 short_shards += 1
                 continue
-            windowed_frames += t  # windows tile [0, t) exactly, so coverage is full
             draft_tokens = (draft_cb0 or {}).get(int(s.index))
+            draft_conf = draft_confidence.get(int(s.index))
+            features = draft_features.get(int(s.index))
+            if getattr(self, "text_conditioning", False) and features is None:
+                # A failed/legacy draft pass for one shard must not crash the
+                # whole text-conditioned run later in ``_batches``.
+                missing_features += 1
+                continue
+            windowed_frames += t  # windows tile [0, t) exactly, so coverage is full
             for start in range(0, t, self.WINDOW):
                 end = min(start + self.WINDOW, t)
                 if end - start < self.WINDOW:
@@ -1078,15 +1143,26 @@ class ResidualTrainer:
                     end = t
                 draft_slice = (draft_tokens[start:end]
                                if draft_tokens is not None else None)
-                windows.append((s.codes[0, start:end], s.codes[1:9, start:end], draft_slice))
+                conf_slice = (draft_conf[start:end]
+                              if draft_conf is not None else None)
+                feat_slice = (features[start:end]
+                              if features is not None else None)
+                windows.append((
+                    s.codes[0, start:end], s.codes[1:9, start:end],
+                    draft_slice, conf_slice, feat_slice,
+                ))
         dropped = total_frames - windowed_frames
         if dropped:
             print(f"[Residual] windows cover {windowed_frames}/{total_frames} teacher "
                   f"frames; {dropped} frames dropped ({short_shards} shard(s) shorter "
                   f"than {self.WINDOW} frames)")
+        if missing_features:
+            print(f"[Residual] ⚠ skipped {missing_features} shard(s) with no draft "
+                  f"frame features; text-conditioned training cannot use them")
         return windows
 
-    def _batches(self, windows, shuffle: bool, sched_p: float = 0.0, rng=None):
+    def _batches(self, windows, shuffle: bool, sched_p: float = 0.0, rng=None,
+                 corrupt: bool = False):
         order = list(range(len(windows)))
         if shuffle:
             random.shuffle(order)
@@ -1094,12 +1170,44 @@ class ResidualTrainer:
         for start in range(0, len(order), self.batch_size):
             idx = order[start:start + self.batch_size]
             inputs = []
+            confidences = []
+            features = []
             for j in idx:
-                teacher_cb0, _, draft_cb0 = windows[j]
-                if sched_p > 0.0 and draft_cb0 is not None and rng.random() < sched_p:
-                    inputs.append(draft_cb0)
+                teacher_cb0, _, draft_cb0, draft_conf, feat = windows[j]
+                use_draft = sched_p > 0.0 and draft_cb0 is not None and rng.random() < sched_p
+                if use_draft:
+                    cb0 = np.array(draft_cb0, dtype=np.int64, copy=True)
+                    conf = (
+                        np.array(draft_conf, dtype=np.float32, copy=True)
+                        if draft_conf is not None
+                        else np.ones(cb0.shape[0], dtype=np.float32)
+                    )
                 else:
-                    inputs.append(teacher_cb0)
+                    cb0 = np.array(teacher_cb0, dtype=np.int64, copy=True)
+                    conf = np.ones(cb0.shape[0], dtype=np.float32)
+                # Corruption/dropout only in training; it teaches the gate to
+                # fall back to text when CB0 is uninformative.
+                c = max(self.cb0_dropout, self.cb0_corruption) if corrupt else 0.0
+                if c > 0.0:
+                    drop_mask = np.fromiter(
+                        (rng.random() for _ in range(cb0.shape[0])),
+                        dtype=np.float32,
+                        count=int(cb0.shape[0]),
+                    ) < c
+                    if drop_mask.any():
+                        if self.cb0_dropout >= self.cb0_corruption:
+                            cb0[drop_mask] = -1
+                        else:
+                            cb0[drop_mask] = np.array(
+                                [rng.randrange(int(getattr(
+                                    self.model.config, "codebook_size", CB0_SIZE
+                                ))) for _ in range(int(drop_mask.sum()))],
+                                dtype=np.int64,
+                            )
+                        conf[drop_mask] = 0.0
+                inputs.append(cb0)
+                confidences.append(conf)
+                features.append(feat)
             lengths = {int(x.shape[0]) for x in inputs}
             if len(lengths) > 1:
                 raise ValueError(
@@ -1108,7 +1216,21 @@ class ResidualTrainer:
                 )
             cb0 = torch.stack([torch.from_numpy(x).long() for x in inputs]).to(self.device)
             tgt = torch.stack([torch.from_numpy(windows[j][1]).long() for j in idx]).to(self.device)
-            yield cb0, tgt
+            conf_t = torch.stack(
+                [torch.from_numpy(x).float() for x in confidences]
+            ).to(self.device) if self.confidence_conditioning else None
+            feat_t = None
+            if self.text_conditioning:
+                usable = [f for f in features if f is not None]
+                if len(usable) != len(features):
+                    raise RuntimeError(
+                        "text-conditioned residual batch has a window without "
+                        "draft frame features"
+                    )
+                feat_t = torch.stack(
+                    [torch.from_numpy(f).float() for f in features]
+                ).to(self.device)
+            yield cb0, tgt, feat_t, conf_t
 
     def _epoch(self, windows, optimizer, scaler, train: bool, sched_p: float = 0.0,
                rng=None):
@@ -1116,14 +1238,19 @@ class ResidualTrainer:
         use_amp = self.device.type == "cuda"
         loss_sum, n_batches = 0.0, 0
         per_cb_loss = np.zeros(8, dtype=np.float64)
-        for cb0, tgt in self._batches(windows, shuffle=train, sched_p=sched_p, rng=rng):
+        for cb0, tgt, text_feat, conf in self._batches(
+            windows, shuffle=train, sched_p=sched_p, rng=rng, corrupt=train
+        ):
             with torch.set_grad_enabled(train):
                 with torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.float16,
                     enabled=use_amp,
                 ):
-                    out = self.model(cb0_tokens=cb0, sample=False)
+                    out = self.model(
+                        cb0_tokens=cb0, sample=False,
+                        text_features=text_feat, cb0_confidence=conf,
+                    )
                     logits = out.logits  # (B, 8, T, V)
                     b, c, t, v = logits.shape
                     loss = sum(
@@ -1154,9 +1281,41 @@ class ResidualTrainer:
         self.model.eval()
         top1 = np.zeros(8, dtype=np.float64)
         total = 0
-        for cb0, tgt in self._batches(windows, shuffle=False, sched_p=sched_p, rng=rng):
-            out = self.model(cb0_tokens=cb0, sample=False)
+        for cb0, tgt, text_feat, conf in self._batches(
+            windows, shuffle=False, sched_p=sched_p, rng=rng
+        ):
+            out = self.model(
+                cb0_tokens=cb0, sample=False,
+                text_features=text_feat, cb0_confidence=conf,
+            )
             pred = out.residual_codebooks  # (B, 8, T)
+            top1 += (pred == tgt).float().sum(dim=(0, 2)).cpu().numpy()
+            total += tgt.shape[0] * tgt.shape[2]
+        return float(total), (top1 / max(1, total)).tolist()
+
+    @torch.inference_mode()
+    def evaluate_text_only(self, windows) -> Tuple[float, List[float]]:
+        """CB1-8 top-1 with CB0 withheld (the text-only fallback ceiling)."""
+        if not self.text_conditioning:
+            raise RuntimeError("text-only evaluation requires text conditioning")
+        self.model.eval()
+        top1 = np.zeros(8, dtype=np.float64)
+        total = 0
+        for _, tgt, text_feat, _ in self._batches(windows, shuffle=False, sched_p=0.0):
+            if text_feat is None:
+                raise RuntimeError("no text features for text-only evaluation")
+            null_cb0 = torch.full(
+                (tgt.shape[0], tgt.shape[2]), -1,
+                device=self.device, dtype=torch.long,
+            )
+            out = self.model(
+                cb0_tokens=null_cb0, sample=False,
+                text_features=text_feat,
+                cb0_confidence=torch.zeros(
+                    (tgt.shape[0], tgt.shape[2]), device=self.device
+                ),
+            )
+            pred = out.residual_codebooks
             top1 += (pred == tgt).float().sum(dim=(0, 2)).cpu().numpy()
             total += tgt.shape[0] * tgt.shape[2]
         return float(total), (top1 / max(1, total)).tolist()
@@ -1176,11 +1335,16 @@ class ResidualTrainer:
         # the explicit train() argument in sync.
         self.sched_target = target
         ramp_epochs = max(1, min(int(ramp_epochs or epochs), epochs))
-        draft_cb0 = self.precompute_draft_cb0(shards) if target > 0 else {}
+        need_draft = target > 0 or self.text_conditioning
+        draft_cb0 = self.precompute_draft_cb0(shards) if need_draft else {}
         train_shards = [s for i, s in enumerate(shards) if i % 10 != 9]
         val_shards = [s for i, s in enumerate(shards) if i % 10 == 9]
-        train_w = self.build_windows(train_shards, draft_cb0)
-        val_w = self.build_windows(val_shards, draft_cb0)
+        train_w = self.build_windows(
+            train_shards, draft_cb0, self._draft_confidence, self._draft_features
+        )
+        val_w = self.build_windows(
+            val_shards, draft_cb0, self._draft_confidence, self._draft_features
+        )
         if not val_w and train_w:
             # Degenerate corpus: keep at least one validation window rather than
             # dividing by zero. This is the only allowed train/val overlap.
@@ -1294,6 +1458,7 @@ class ResidualTrainer:
             self.model.load_state_dict(selected_state)
         _, top1_teacher = self.evaluate(val_w, sched_p=0.0)
         _, top1_draft = self.evaluate(val_w, sched_p=1.0) if draft_cb0 else (0.0, top1_teacher)
+        top1_text = self.evaluate_text_only(val_w)[1] if self.text_conditioning else None
         val_loss_teacher, _ = self._epoch(val_w, optimizer, scaler, train=False,
                                           sched_p=0.0, rng=val_rng)
         final_ramp_frac = (1.0 if ramp_epochs <= 1 else
@@ -1325,15 +1490,19 @@ class ResidualTrainer:
             cb_top1_teacher_mean=float(np.mean(top1_teacher)),
             cb_top1_draft=top1_draft,
             cb_top1_draft_mean=float(np.mean(top1_draft)),
+            cb_top1_text=top1_text,
+            cb_top1_text_mean=(float(np.mean(top1_text)) if top1_text is not None else None),
             train_seconds=float(_now() - t_start),
         )
         print(
             "[Residual] done | selected val {:.4f} @ epoch {} (sched {:.2f}, {}) | "
-            "mean CB1-8 top-1 teacher {:.2f}% draft {:.2f}%".format(
+            "mean CB1-8 top-1 teacher {:.2f}% draft {:.2f}%{}".format(
                 selected_val, selected_epoch, selected_sched_p,
                 "full-draft hold" if selected_full_draft else "pre-ramp fallback",
                 100 * float(np.mean(top1_teacher)),
                 100 * float(np.mean(top1_draft)),
+                (f" text-only {100 * float(np.mean(top1_text)):.2f}%"
+                 if top1_text is not None else ""),
             )
         )
         return stats
@@ -1545,6 +1714,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--residual-layers", type=int, default=0,
                    help="Override ResidualModelConfig.num_layers (0 keeps the 4 default; "
                         "the decoder supports up to 6 dilation rates).")
+    p.add_argument("--residual-text-conditioning", action="store_true",
+                   help="Condition the residual on the draft's frame-level text features. "
+                        "This is the w-term lever: on a wrong draft CB0 the residual can "
+                        "still see the text instead of only the wrong token.")
+    p.add_argument("--residual-confidence-conditioning", action="store_true",
+                   help="Feed the draft argmax probability into the residual fusion gate "
+                        "so it can down-weight an unreliable CB0. Requires text conditioning.")
+    p.add_argument("--residual-cb0-dropout", type=float, default=0.0,
+                   help="Per-frame probability of replacing CB0 with the learned null token "
+                        "during training (text fallback regularization).")
+    p.add_argument("--residual-cb0-corruption", type=float, default=0.0,
+                   help="Per-frame probability of replacing CB0 with a random token during "
+                        "training (wrong-CB0 robustness).")
     p.add_argument("--max-minutes-residual", type=float, default=6.0,
                    help="Wall-clock budget for residual training.")
     p.add_argument("--skip-teacher", action="store_true", help="Reuse cached shards only.")
@@ -1603,6 +1785,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("[Residual] --residual-layers must be between 1 and 6")
             return 2
         config.residual.num_layers = int(args.residual_layers)
+    if args.residual_text_conditioning:
+        config.residual.text_conditioning = True
+    if args.residual_confidence_conditioning:
+        if not args.residual_text_conditioning:
+            print("[Residual] --residual-confidence-conditioning requires "
+                  "--residual-text-conditioning")
+            return 2
+        config.residual.confidence_conditioning = True
+    if not 0.0 <= args.residual_cb0_dropout <= 1.0:
+        print("[Residual] --residual-cb0-dropout must be in [0, 1]")
+        return 2
+    if not 0.0 <= args.residual_cb0_corruption <= 1.0:
+        print("[Residual] --residual-cb0-corruption must be in [0, 1]")
+        return 2
 
     print("=" * 78)
     print("CodeSwitch-TTS · Draft/Residual Self-Distillation")
@@ -1752,11 +1948,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
     if not args.skip_residual:
+        if config.residual.text_conditioning:
+            config.residual.text_d_model = int(
+                getattr(getattr(draft, "config", None), "d_model", config.draft.d_model)
+            )
         residual = ResidualDecoder(config.residual).to(device)
         residual_stats = ResidualTrainer(
             residual, device, lr=args.residual_lr, batch_size=args.residual_batch, seed=args.seed,
             draft_model=draft,
             sched_target=args.residual_sched,
+            cb0_dropout=args.residual_cb0_dropout,
+            cb0_corruption=args.residual_cb0_corruption,
         ).train(shards, epochs=args.residual_epochs, max_minutes=args.max_minutes_residual,
                 sched_target=args.residual_sched, min_epochs=args.min_epochs,
                 ramp_epochs=args.residual_ramp_epochs)
@@ -1811,10 +2013,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             sanity_text = shards[-1].norm_text
             t_frames = length_model.predict(sanity_text)
             with torch.inference_mode():
-                draft_out = draft.generate_chunk(
+                draft_out = draft.generate_sequence(
                     text=sanity_text, num_frames=t_frames, temperature=1.0, device=device
                 )
-                res_out = residual(cb0_tokens=draft_out.tokens, sample=True)
+                res_kwargs = {}
+                if getattr(residual.config, "text_conditioning", False):
+                    if draft_out.frame_features is None:
+                        raise RuntimeError(
+                            "text-conditioned residual sanity render has no draft "
+                            "frame features"
+                        )
+                    res_kwargs["text_features"] = draft_out.frame_features
+                if getattr(residual.config, "confidence_conditioning", False):
+                    res_kwargs["cb0_confidence"] = (
+                        draft_out.probabilities.max(dim=-1).values
+                    )
+                res_out = residual(
+                    cb0_tokens=draft_out.tokens, sample=True, **res_kwargs
+                )
                 audio_enc = engine.ar_model.audio_encoder
                 wave, decode_err = _decode_codes_for_validation(
                     audio_enc, res_out.full_codebooks[0]

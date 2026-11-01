@@ -62,6 +62,14 @@ class ResidualModelConfig:
     codebook_size: int = 1024
     kernel_size: int = 5
     dropout: float = 0.1
+    # Optional text/confidence conditioning.  Defaults are false so every
+    # existing CB0-only checkpoint keeps loading byte-for-byte.
+    text_conditioning: bool = False
+    text_d_model: int = 512  # width of the draft's frame features
+    confidence_conditioning: bool = False
+    # A learned "unknown CB0" embedding for corruption/dropout training.
+    cb0_null_token: int = -1
+    confidence_bins: int = 16
 
 
 @dataclass
